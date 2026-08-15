@@ -2,3 +2,4 @@
 
 pub mod config;
 pub mod dag;
+pub mod paths;
