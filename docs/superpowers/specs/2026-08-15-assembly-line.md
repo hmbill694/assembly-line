@@ -81,7 +81,30 @@ Provider variants are separate config blocks (`claude`, `claude-yolo`) rather
 than an engine-modelled permission vocabulary. `args` bake in whatever flags
 make that agent run headless.
 
-## Isolation
+## Isolation: three separable questions
+
+Where the *run* executes, where each *agent* executes, and who owns the
+workspace are independent decisions. Conflating them pushes complexity into
+the engine that belongs in deployment.
+
+| Concern | Answer | When |
+|---|---|---|
+| Agents must not touch the host machine | Containerize the **whole run** — a Dockerfile, no engine code | now |
+| Nodes need different images or resource caps | A containerized agent is **just a provider** (`cmd = "docker"`) | when needed |
+| Agents must not affect each other mid-run | A real `AgentRunner` seam: runner-owned workspaces, work returned as a git bundle | deferred |
+
+The third is the only one that requires an abstraction in Rust, and it is
+**deliberately deferred** until a concrete use case exists — consistent with
+not defining a trait before a second implementor does.
+
+Note for whoever picks that up: a bind-mounted worktree is *not* a usable
+shortcut. A worktree's `.git` is a file holding an absolute path to
+`<repo>/.git/worktrees/<name>`, so making git work inside a container means
+mounting the real object store read-write — handing the container the ability
+to rewrite any ref. The isolating design is a read-only repo mount, a clone
+inside, and a bundle back.
+
+## Isolation between nodes
 
 Each agent node runs in its own `git worktree` at
 `~/.assembly/wt/<run-id>/<node>/`, on a branch off the run branch. The target
