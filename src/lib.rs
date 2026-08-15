@@ -5,5 +5,6 @@ pub mod dag;
 pub mod event;
 pub mod exec;
 pub mod paths;
+pub mod report;
 pub mod scheduler;
 pub mod state;
