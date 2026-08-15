@@ -19,6 +19,54 @@ cargo fmt
 
 All three must be clean before a commit.
 
+## Version control: a stack of always-compilable jj changes
+
+This repo uses **jj (Jujutsu)**, colocated with git. Work is organized as a
+stack of small changes, and **every change in the stack must build, test,
+lint, and format cleanly on its own** — not just the tip. A stack that only
+compiles at the end breaks `bisect` and makes per-change review meaningless.
+
+One concern per change, each carrying the tests for what it adds. A test file
+belongs to the change that introduces the module it *imports*, which is not
+always the change it feels related to.
+
+### Building a stack
+
+Split bottom-up by path, then walk it to fix up the declaration files:
+
+```
+JJ_EDITOR=true jj split -m "feat(x): ..." src/x.rs tests/x.rs
+```
+
+`lib.rs` grows one `pub mod` line per change. Path-based splitting puts the
+whole final file in one change, so afterwards `jj edit <rev>` each revision
+and write the module list correct for that point — jj auto-rebases
+descendants. When the manifest declares a binary, the scaffold change needs a
+stub `main.rs`; the real one lands with the CLI change.
+
+### Verifying the stack
+
+`just verify-stack`. It exports each revision with `git archive` into a temp
+directory and builds it there, which matters for two reasons learned the hard
+way:
+
+- **Never `jj edit` your way down the stack to verify.** As soon as a bookmark
+  points into the stack, those changes are immutable and `jj edit` fails — and
+  under `set -e` the loop dies silently with no output. Exporting touches
+  nothing.
+- **Never share one `CARGO_TARGET_DIR` across revisions without
+  `cargo clean -p <crate>` between them.** Cargo will reuse the previous
+  revision's artifacts for the same package and report a *correct* revision as
+  broken — an unresolved-import error for a module the revision plainly
+  declares. Cleaning only our package keeps the expensive dependency
+  artifacts.
+
+Build output must also live outside the repo: revisions below the one that
+adds `.gitignore` will otherwise snapshot `target/` into the change. `target/`,
+`.assembly/`, and `.devenv/` are in `.git/info/exclude` for the same reason.
+
+Test counts should climb monotonically up the stack.
+
 ## Style: functional by default
 
 Write declarative Rust. Describe *what* the result is, not the steps to
