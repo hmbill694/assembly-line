@@ -69,6 +69,24 @@ fn wall_clock_limit(task: &Task) -> anyhow::Result<Option<std::time::Duration>> 
     task.max_duration.as_deref().map(parse_duration).transpose()
 }
 
+/// Drive the graph to completion, recording every transition to the log.
+///
+/// # Errors
+///
+/// Returns an error only if the run cannot be *administered* — the event log
+/// cannot be appended to, a task's `max_duration` is unparseable, or a spawned
+/// task panicked. A node that fails, times out, or is cancelled is not an
+/// error: that is reflected in the returned [`RunStatus`], because a partial
+/// run is a normal outcome.
+///
+/// # Panics
+///
+/// Does not panic. A panic inside a node's task is surfaced as an error.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the launch/await/settle loop is one state machine; splitting it \
+              would scatter the event-log ordering that makes replay correct"
+)]
 pub async fn execute(
     graph: &Graph,
     dag: &Dag,

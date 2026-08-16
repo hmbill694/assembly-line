@@ -127,11 +127,13 @@ impl RunReport {
         }
     }
 
+    #[must_use]
     pub fn count_in_state(&self, want: NodeState) -> usize {
         self.nodes.iter().filter(|n| n.state == want).count()
     }
 
     /// A node tree plus a one-line summary, for `assembly status`.
+    #[must_use]
     pub fn to_terminal_tree(&self) -> String {
         let id_column = self.nodes.iter().map(|n| n.id.len()).max().unwrap_or(0);
 
@@ -151,11 +153,12 @@ impl RunReport {
     }
 
     /// The single line printed at the end of a run.
+    #[must_use]
     pub fn to_summary_line(&self) -> String {
         format!(
             "run {}: {} — {} done, {} failed, {} skipped",
             self.id,
-            self.status.map(RunStatus::label).unwrap_or("in progress"),
+            self.status.map_or("in progress", RunStatus::label),
             self.count_in_state(NodeState::Done),
             self.count_in_state(NodeState::Failed),
             self.count_in_state(NodeState::Skipped),

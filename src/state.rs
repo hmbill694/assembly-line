@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 pub type TaskMap<'a> = BTreeMap<&'a str, &'a Task>;
 
+#[must_use]
 pub fn task_map(tasks: &[Task]) -> TaskMap<'_> {
     tasks.iter().map(|t| (t.id.as_str(), t)).collect()
 }
@@ -39,6 +40,7 @@ pub struct RunState {
 }
 
 impl RunState {
+    #[must_use]
     pub fn new(ids: &[String]) -> Self {
         RunState {
             nodes: ids
@@ -49,6 +51,7 @@ impl RunState {
         }
     }
 
+    #[must_use]
     pub fn state(&self, id: &str) -> NodeState {
         self.nodes.get(id).copied().unwrap_or(NodeState::Pending)
     }
@@ -107,6 +110,7 @@ impl RunState {
         }
     }
 
+    #[must_use]
     pub fn ready(&self, dag: &Dag, tasks: &TaskMap) -> Vec<String> {
         dag.ids()
             .iter()
@@ -120,6 +124,7 @@ impl RunState {
             .collect()
     }
 
+    #[must_use]
     pub fn counts(&self) -> Counts {
         self.nodes
             .values()

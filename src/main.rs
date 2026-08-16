@@ -77,15 +77,12 @@ fn validate_graph_file(path: &Path) -> ExitCode {
     let validation = dag::validate(&graph);
     print_warnings(&validation);
 
-    match validation.errors.is_empty() {
-        true => {
-            println!("{}: ok ({} tasks)", path.display(), graph.tasks.len());
-            ExitCode::SUCCESS
-        }
-        false => {
-            print_errors(&validation);
-            ExitCode::from(EXIT_USAGE)
-        }
+    if validation.errors.is_empty() {
+        println!("{}: ok ({} tasks)", path.display(), graph.tasks.len());
+        ExitCode::SUCCESS
+    } else {
+        print_errors(&validation);
+        ExitCode::from(EXIT_USAGE)
     }
 }
 
@@ -217,7 +214,7 @@ async fn continue_existing_run(run_id: u64, jobs_override: Option<usize>) -> Exi
 
     let mut state = RunState::replay(&ids, &events);
     state.reset_running().iter().for_each(|node| {
-        eprintln!("note: '{node}' was in flight when the run stopped — running it again")
+        eprintln!("note: '{node}' was in flight when the run stopped — running it again");
     });
 
     let jobs = jobs_override.unwrap_or(meta.jobs);
@@ -233,19 +230,18 @@ async fn continue_existing_run(run_id: u64, jobs_override: Option<usize>) -> Exi
 /// Prefer the event log's own account; fall back to in-memory counts if the
 /// log cannot be re-read for any reason.
 fn print_run_outcome(run: &RunPaths, graph_path: &Path, status: RunStatus, state: &RunState) {
-    match report_for(run, graph_path) {
-        Ok(report) => println!("{}", report.to_summary_line()),
-        Err(_) => {
-            let counts = state.counts();
-            println!(
-                "run {}: {} — {} done, {} failed, {} skipped",
-                run.id,
-                status.label(),
-                counts.done,
-                counts.failed,
-                counts.skipped
-            );
-        }
+    if let Ok(report) = report_for(run, graph_path) {
+        println!("{}", report.to_summary_line());
+    } else {
+        let counts = state.counts();
+        println!(
+            "run {}: {} — {} done, {} failed, {} skipped",
+            run.id,
+            status.label(),
+            counts.done,
+            counts.failed,
+            counts.skipped
+        );
     }
 }
 

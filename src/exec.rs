@@ -13,11 +13,13 @@ pub enum ShellOutcome {
 }
 
 impl ShellOutcome {
+    #[must_use]
     pub fn succeeded(&self) -> bool {
         matches!(self, Self::Exited(0))
     }
 
     /// A human-readable reason, or `None` when the command succeeded.
+    #[must_use]
     pub fn failure_reason(&self) -> Option<String> {
         match self {
             Self::Exited(0) => None,
@@ -45,6 +47,12 @@ fn open_log_for_append(path: &Path) -> std::io::Result<std::fs::File> {
 /// The child gets two independent append-mode descriptors on the same file, so
 /// output goes straight through the kernel and survives a kill — nothing is
 /// buffered in this process and there are no reader tasks to drain.
+///
+/// # Errors
+///
+/// Returns an error if the log file cannot be opened or `sh` cannot be
+/// spawned. A command that runs and fails is *not* an error — that is a
+/// `ShellOutcome`, because a failing node is a normal part of a run.
 pub async fn run_shell(
     cmd: &str,
     cwd: impl AsRef<Path>,
@@ -74,11 +82,11 @@ pub async fn run_shell(
 
     tokio::select! {
         status = child.wait() => Ok(ShellOutcome::Exited(status?.code().unwrap_or(-1))),
-        _ = deadline => {
+        () = deadline => {
             let _ = child.kill().await;
             Ok(ShellOutcome::TimedOut)
         }
-        _ = cancel.cancelled() => {
+        () = cancel.cancelled() => {
             let _ = child.kill().await;
             Ok(ShellOutcome::Cancelled)
         }

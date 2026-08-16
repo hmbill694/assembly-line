@@ -13,6 +13,7 @@ pub enum RunStatus {
 }
 
 impl RunStatus {
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Self::Ok => "ok",
@@ -35,6 +36,7 @@ pub enum EventKind {
 
 impl EventKind {
     /// The node this event concerns, if any.
+    #[must_use]
     pub fn node(&self) -> Option<&str> {
         match self {
             Self::NodeStarted { node, .. }
@@ -58,6 +60,11 @@ pub struct Event {
 /// A line that does not parse is skipped, not fatal: the common cause is a
 /// torn final line from a crash mid-write, and the events before it are still
 /// the truth about what happened.
+///
+/// # Errors
+///
+/// Returns an error only if the underlying reader fails. Unparseable lines
+/// are logged and skipped rather than failing the read.
 pub fn read_events(src: impl BufRead) -> io::Result<Vec<Event>> {
     src.lines()
         .collect::<io::Result<Vec<String>>>()
@@ -91,6 +98,13 @@ impl<W: Write> EventLog<W> {
         EventLog { sink }
     }
 
+    /// Append one event and flush, so a crash cannot lose it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the event cannot be serialised, or if the write or
+    /// flush fails. The caller should treat this as fatal: state that is not
+    /// in the log cannot be replayed.
     pub fn append(&mut self, kind: EventKind) -> io::Result<Event> {
         let event = Event {
             at: Utc::now(),
@@ -109,6 +123,12 @@ impl<W: Write> EventLog<W> {
 }
 
 impl EventLog<File> {
+    /// Open a log for appending, creating it and its parent if needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the parent directory cannot be created or the file
+    /// cannot be opened for appending. The file is never truncated.
     pub fn open_append(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
         path.parent()
@@ -120,6 +140,11 @@ impl EventLog<File> {
 
     /// Read a log from disk. A missing file is an empty log, not an error —
     /// a run that has not written its first event yet is a legitimate state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file exists but cannot be read. Individual
+    /// unparseable lines are skipped rather than failing the whole read.
     pub fn read(path: impl AsRef<Path>) -> io::Result<Vec<Event>> {
         match File::open(path.as_ref()) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),

@@ -72,13 +72,10 @@ fn id_is_valid(id: &str) -> bool {
 /// Ids in declaration order, first occurrence winning.
 fn ids_in_declaration_order(tasks: &[Task]) -> Vec<String> {
     tasks.iter().fold(Vec::new(), |mut acc, t| {
-        match acc.iter().any(|id| id == &t.id) {
-            true => acc,
-            false => {
-                acc.push(t.id.clone());
-                acc
-            }
+        if !acc.contains(&t.id) {
+            acc.push(t.id.clone());
         }
+        acc
     })
 }
 
@@ -134,6 +131,15 @@ pub struct Dag {
 }
 
 impl Dag {
+    /// Validate `tasks` and index them into a graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns **every** problem found, not just the first: unusable or
+    /// duplicated ids, tasks missing the field their kind requires,
+    /// dependencies that point at nothing or at themselves, and dependency
+    /// cycles. Users want one pass over their graph file, not one error per
+    /// run.
     pub fn build(tasks: &[Task]) -> Result<Dag, Vec<ValidationError>> {
         let ids = ids_in_declaration_order(tasks);
         let known: BTreeSet<String> = ids.iter().cloned().collect();
@@ -191,14 +197,17 @@ impl Dag {
         }
     }
 
+    #[must_use]
     pub fn ids(&self) -> &[String] {
         &self.ids
     }
 
+    #[must_use]
     pub fn needs(&self, id: &str) -> &[String] {
         self.needs.get(id).map(Vec::as_slice).unwrap_or_default()
     }
 
+    #[must_use]
     pub fn dependents(&self, id: &str) -> &[String] {
         self.dependents
             .get(id)
@@ -207,6 +216,7 @@ impl Dag {
     }
 
     /// Transitive dependents of `id`, not including `id` itself.
+    #[must_use]
     pub fn descendants(&self, id: &str) -> BTreeSet<String> {
         // Peel outward one generation at a time: cheap, terminates on any
         // graph, and avoids the exponential re-walking a naive recursion does.

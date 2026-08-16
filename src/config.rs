@@ -103,10 +103,23 @@ pub struct Task {
     pub on_failure: OnFailure,
 }
 
+/// Parse a graph from TOML text, without touching the filesystem.
+///
+/// # Errors
+///
+/// Returns a TOML error for malformed syntax, a missing required field, or an
+/// unknown field — the last because every config struct denies unknown keys,
+/// so a typo is reported rather than silently defaulted.
 pub fn parse_graph(src: &str) -> Result<Graph, toml::de::Error> {
     toml::from_str(src)
 }
 
+/// Read and parse a graph file, resolving any `prompt_file` references.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read, the TOML is invalid, or a
+/// task's `prompt_file` is missing or conflicts with an inline `prompt`.
 pub fn load_graph(path: &Path) -> anyhow::Result<Graph> {
     let src = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
@@ -121,6 +134,12 @@ pub fn load_graph(path: &Path) -> anyhow::Result<Graph> {
 ///
 /// Paths resolve relative to the graph file's own directory, which makes a
 /// graph plus its prompts a self-contained, movable unit.
+///
+/// # Errors
+///
+/// Returns an error if a task sets both `prompt` and `prompt_file`, or if a
+/// referenced prompt file cannot be read. Both fail here, before a run
+/// directory is allocated, so a typo costs nothing.
 pub fn inline_prompt_files(graph: Graph, graph_dir: &Path) -> anyhow::Result<Graph> {
     let tasks = graph
         .tasks
@@ -152,6 +171,11 @@ pub fn inline_prompt_files(graph: Graph, graph_dir: &Path) -> anyhow::Result<Gra
     Ok(Graph { tasks, ..graph })
 }
 
+/// Parse a human-written duration such as `"20m"` or `"1h 30m"`.
+///
+/// # Errors
+///
+/// Returns an error if the text is not a recognisable duration.
 pub fn parse_duration(s: &str) -> anyhow::Result<Duration> {
     humantime::parse_duration(s).map_err(|e| anyhow::anyhow!("invalid duration {s:?}: {e}"))
 }

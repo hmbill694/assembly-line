@@ -78,6 +78,10 @@ fn rejects_unknown_fields() {
 }
 
 #[test]
+#[allow(
+    clippy::duration_suboptimal_units,
+    reason = "seconds are the point: the assertion shows what the text converts to"
+)]
 fn parses_durations() {
     assert_eq!(parse_duration("20m").unwrap(), Duration::from_secs(1200));
     assert_eq!(parse_duration("1h 30m").unwrap(), Duration::from_secs(5400));
