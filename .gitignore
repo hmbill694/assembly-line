@@ -1,2 +1,7 @@
 /target
 .assembly/
+
+# devenv / direnv working state. `devenv.lock` IS committed — it pins the
+# toolchain inputs — but everything under .devenv/ is a local cache.
+.devenv/
+.direnv/
