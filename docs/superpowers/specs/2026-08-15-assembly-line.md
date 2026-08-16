@@ -110,6 +110,21 @@ Each agent node runs in its own `git worktree` at
 `~/.assembly/wt/<run-id>/<node>/`, on a branch off the run branch. The target
 repository is never modified and needs no `.gitignore` entry.
 
+The run branch is also checked out into a worktree of its own — the
+*integration worktree* — so merges never touch the branch you have checked out.
+
+**Branch naming.** Node branches are siblings of the run branch, not children:
+
+```
+al/run-42               run branch (integration worktree)
+al/run-42-impl-auth     node branches
+al/run-42-impl-api
+```
+
+Git refs are paths, and a ref cannot be both a file and a directory — so
+`al/run-42` and `al/run-42/impl-auth` **cannot coexist**. The flat form still
+groups under `al/run-42*` for cleanup.
+
 Worktrees are removed on success and **kept on failure**, so a failed node can
 be inspected. `assembly gc` prunes old ones and runs `git worktree prune`.
 
