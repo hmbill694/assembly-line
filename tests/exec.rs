@@ -1,6 +1,14 @@
-use assembly_line::exec::{ShellOutcome, run_shell};
+use assembly_line::exec::{ShellOutcome, run_command, run_shell};
+use assembly_line::provider::CommandSpec;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+
+fn spec(program: &str, args: &[&str]) -> CommandSpec {
+    CommandSpec {
+        program: program.to_string(),
+        args: args.iter().map(|a| (*a).to_string()).collect(),
+    }
+}
 
 #[tokio::test]
 async fn captures_stdout_and_stderr_and_reports_exit_zero() {
@@ -130,4 +138,81 @@ async fn appends_rather_than_truncating_across_runs() {
 
     let body = std::fs::read_to_string(&log).unwrap();
     assert!(body.contains("first") && body.contains("second"), "{body}");
+}
+
+#[tokio::test]
+async fn run_command_captures_output_and_exit_code() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("node.log");
+
+    let outcome = run_command(
+        &spec("sh", &["-c", "echo hello; echo oops 1>&2; exit 2"]),
+        tmp.path(),
+        &log,
+        None,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome, ShellOutcome::Exited(2));
+    let body = std::fs::read_to_string(&log).unwrap();
+    assert!(body.contains("hello") && body.contains("oops"), "{body}");
+}
+
+#[tokio::test]
+async fn run_command_passes_arguments_without_shell_interpretation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("node.log");
+
+    // If this went through a shell, the backticks and `$HOME` would expand
+    // and the semicolon would split the command.
+    let literal = "a `b` ; c $HOME";
+    run_command(
+        &spec("printf", &["%s", literal]),
+        tmp.path(),
+        &log,
+        None,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), literal);
+}
+
+#[tokio::test]
+async fn run_command_honours_the_timeout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outcome = run_command(
+        &spec("sleep", &["30"]),
+        tmp.path(),
+        tmp.path().join("l.log"),
+        Some(Duration::from_millis(150)),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome, ShellOutcome::TimedOut);
+}
+
+#[tokio::test]
+async fn run_command_reports_a_missing_program_as_an_error_not_an_exit_code() {
+    let tmp = tempfile::tempdir().unwrap();
+    let err = run_command(
+        &spec("definitely-not-a-real-program-xyz", &[]),
+        tmp.path(),
+        tmp.path().join("l.log"),
+        None,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+
+    assert!(
+        err.contains("definitely-not-a-real-program-xyz"),
+        "the error must name the program so a bad provider config is obvious: {err}"
+    );
 }

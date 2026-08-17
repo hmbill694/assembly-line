@@ -1,3 +1,4 @@
+use crate::provider::CommandSpec;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -43,10 +44,8 @@ fn open_log_for_append(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// Run `cmd` under `sh -c`, appending both stdout and stderr to `log_path`.
-///
-/// The child gets two independent append-mode descriptors on the same file, so
-/// output goes straight through the kernel and survives a kill — nothing is
-/// buffered in this process and there are no reader tasks to drain.
+/// Used for `run` and `verify`, where the user wrote a shell line and expects
+/// pipes and redirection to work.
 ///
 /// # Errors
 ///
@@ -60,18 +59,58 @@ pub async fn run_shell(
     timeout: Option<Duration>,
     cancel: CancellationToken,
 ) -> anyhow::Result<ShellOutcome> {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(cmd);
+    supervise(command, cmd, cwd, log_path, timeout, cancel).await
+}
+
+/// Run a program with an explicit argument vector, bypassing the shell.
+///
+/// Agent commands take this path: a prompt contains quotes, newlines and `$`,
+/// and must reach the program as one argument rather than being re-parsed.
+///
+/// # Errors
+///
+/// Returns an error if the log file cannot be opened or the program cannot be
+/// spawned — a missing binary means the provider config is wrong, which is
+/// worth distinguishing from an agent that ran and failed.
+pub async fn run_command(
+    spec: &CommandSpec,
+    cwd: impl AsRef<Path>,
+    log_path: impl AsRef<Path>,
+    timeout: Option<Duration>,
+    cancel: CancellationToken,
+) -> anyhow::Result<ShellOutcome> {
+    let mut command = Command::new(&spec.program);
+    command.args(&spec.args);
+    supervise(command, &spec.program, cwd, log_path, timeout, cancel).await
+}
+
+/// Spawn `command`, then wait for whichever comes first: exit, deadline, or
+/// cancellation. Shared so the timeout and kill semantics cannot drift between
+/// the two entry points.
+///
+/// The child gets two independent append-mode descriptors on the same file, so
+/// output goes straight through the kernel and survives a kill — nothing is
+/// buffered in this process and there are no reader tasks to drain.
+async fn supervise(
+    mut command: Command,
+    described_as: &str,
+    cwd: impl AsRef<Path>,
+    log_path: impl AsRef<Path>,
+    timeout: Option<Duration>,
+    cancel: CancellationToken,
+) -> anyhow::Result<ShellOutcome> {
     let log_path = log_path.as_ref();
 
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
+    let mut child = command
         .current_dir(cwd.as_ref())
         .stdin(Stdio::null())
         .stdout(Stdio::from(open_log_for_append(log_path)?))
         .stderr(Stdio::from(open_log_for_append(log_path)?))
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| anyhow::anyhow!("spawning `{cmd}`: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("spawning `{described_as}`: {e}"))?;
 
     let deadline = async {
         match timeout {
