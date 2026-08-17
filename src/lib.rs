@@ -7,6 +7,7 @@ pub mod event;
 pub mod exec;
 pub mod git;
 pub mod paths;
+pub mod provider;
 pub mod report;
 pub mod scheduler;
 pub mod state;
