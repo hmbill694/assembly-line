@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub enum ValidationError {
     DuplicateId(String),
     InvalidId(String),
+    ReservedId(String),
     SelfDep(String),
     UnknownDep { task: String, dep: String },
     Cycle(Vec<String>),
@@ -21,6 +22,10 @@ impl std::fmt::Display for ValidationError {
             Self::InvalidId(id) => write!(
                 f,
                 "invalid task id '{id}': ids must match [A-Za-z0-9_-]+ (they become filenames and branch names)"
+            ),
+            Self::ReservedId(id) => write!(
+                f,
+                "task id '{id}' is reserved: ids may not start with '_', which assembly-line uses for its own worktrees"
             ),
             Self::SelfDep(id) => write!(f, "task '{id}' depends on itself"),
             Self::UnknownDep { task, dep } => {
@@ -79,7 +84,8 @@ fn ids_in_declaration_order(tasks: &[Task]) -> Vec<String> {
     })
 }
 
-/// Ids that are unusable as filenames, and ids declared more than once.
+/// Ids that are unusable as filenames, ids assembly-line has claimed for
+/// itself, and ids declared more than once.
 fn id_naming_errors(tasks: &[Task]) -> impl Iterator<Item = ValidationError> + '_ {
     let invalid = tasks
         .iter()
@@ -92,7 +98,14 @@ fn id_naming_errors(tasks: &[Task]) -> impl Iterator<Item = ValidationError> + '
         .filter(|(i, t)| tasks[..*i].iter().any(|prior| prior.id == t.id))
         .map(|(_, t)| ValidationError::DuplicateId(t.id.clone()));
 
-    invalid.chain(duplicated)
+    // Ids become directory names beside the integration worktree, whose name
+    // starts with `_`. Reserving the whole prefix keeps that space ours.
+    let reserved = tasks
+        .iter()
+        .filter(|t| t.id.starts_with('_'))
+        .map(|t| ValidationError::ReservedId(t.id.clone()));
+
+    invalid.chain(duplicated).chain(reserved)
 }
 
 /// A task must carry the field its kind needs to be runnable at all. An agent

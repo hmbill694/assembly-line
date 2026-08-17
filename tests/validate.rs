@@ -242,3 +242,13 @@ fn rejects_invalid_max_duration() {
         v.errors
     );
 }
+
+#[test]
+fn rejects_an_id_that_would_collide_with_the_integration_worktree() {
+    let src = "[[task]]\nid=\"_integration\"\nkind=\"shell\"\nrun=\"true\"\n";
+    let errs = Dag::build(&tasks(src)).unwrap_err();
+    assert!(
+        errs.contains(&ValidationError::ReservedId("_integration".into())),
+        "{errs:?}"
+    );
+}

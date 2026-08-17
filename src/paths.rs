@@ -24,6 +24,137 @@ pub fn runs_root(git_root: &Path) -> PathBuf {
     git_root.join(".assembly").join("runs")
 }
 
+/// Directory name for the worktree holding the run branch. Task ids may not
+/// start with `_`, so this cannot collide with a node.
+pub const INTEGRATION_WORKTREE: &str = "_integration";
+
+/// File inside a repository's worktree directory naming the repository it
+/// belongs to.
+const REPOSITORY_MARKER: &str = "repo";
+
+/// FNV-1a, written out rather than taken from `DefaultHasher`, whose output is
+/// explicitly unspecified across Rust releases. A worktree path that moved
+/// under a toolchain upgrade would orphan every run already on disk.
+fn stable_hash(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// A directory name identifying one repository.
+///
+/// Run ids restart at 1 in every repository, so a run id alone cannot key a
+/// worktree directory — the first run of two different repos would claim the
+/// same path. The slug leads with the repository's own directory name so the
+/// tree stays browsable, and ends with a hash of its absolute path so two
+/// repositories sharing a name stay apart.
+#[must_use]
+pub fn repo_slug(repo: &Path) -> String {
+    let name: String = repo
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("repo")
+        .chars()
+        .map(
+            |c| match c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                true => c,
+                false => '-',
+            },
+        )
+        .collect();
+
+    format!(
+        "{name}-{:016x}",
+        stable_hash(repo.as_os_str().as_encoded_bytes())
+    )
+}
+
+/// Environment variable that moves every worktree somewhere other than
+/// `$HOME` — a faster disk, or a directory a test owns outright.
+pub const WORKTREE_ROOT_VAR: &str = "ASSEMBLY_WORKTREE_ROOT";
+
+/// Where worktrees go, given what the environment says.
+///
+/// The override wins outright and is used verbatim; otherwise they live under
+/// `$HOME`, never inside the repository — the target repo must stay untouched,
+/// and a worktree inside it would need a `.gitignore` entry we are not
+/// entitled to add.
+///
+/// Split from the lookup below because reading the environment is not
+/// something a test can do twice: `set_var` is process-global and unsafe under
+/// edition 2024, so the rule is testable only while it stays a function of its
+/// arguments.
+#[must_use]
+pub fn worktrees_root_given(
+    override_root: Option<impl Into<PathBuf>>,
+    home: Option<impl Into<PathBuf>>,
+) -> Option<PathBuf> {
+    match override_root {
+        Some(elsewhere) => Some(elsewhere.into()),
+        None => home.map(|home| home.into().join(".assembly").join("wt")),
+    }
+}
+
+/// Every repository's worktrees.
+///
+/// `None` only when neither [`WORKTREE_ROOT_VAR`] nor `$HOME` is set, which
+/// the caller should report rather than guessing a location.
+#[must_use]
+pub fn worktrees_root() -> Option<PathBuf> {
+    worktrees_root_given(
+        std::env::var_os(WORKTREE_ROOT_VAR),
+        std::env::var_os("HOME"),
+    )
+}
+
+/// One repository's worktrees, across all of its runs. This is the level `gc`
+/// walks, and where the repository marker lives.
+#[must_use]
+pub fn repo_worktrees_root(repo: &Path) -> Option<PathBuf> {
+    worktrees_root().map(|root| root.join(repo_slug(repo)))
+}
+
+/// One run's worktrees.
+///
+/// Worktrees live under `$HOME`, never inside the repository — the target repo
+/// must stay untouched, and a worktree inside it would need a `.gitignore`
+/// entry we are not entitled to add.
+#[must_use]
+pub fn worktree_root(repo: &Path, run_id: u64) -> Option<PathBuf> {
+    repo_worktrees_root(repo).map(|root| root.join(run_id.to_string()))
+}
+
+/// Record which repository a worktree directory belongs to, returning that
+/// directory.
+///
+/// The slug carries a hash, so it cannot be read backwards. Without this
+/// marker `gc` could only collect leftovers for the repository it happens to
+/// be run from; with it, every repository's are reachable from one place.
+///
+/// # Errors
+///
+/// Returns an error if `$HOME` is unset, or if the directory or marker cannot
+/// be written.
+pub fn record_repository_for_worktrees(repo: &Path) -> io::Result<PathBuf> {
+    let dir = repo_worktrees_root(repo)
+        .ok_or_else(|| io::Error::other("HOME is unset, so worktrees have nowhere to live"))?;
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(
+        dir.join(REPOSITORY_MARKER),
+        repo.as_os_str().as_encoded_bytes(),
+    )?;
+    Ok(dir)
+}
+
+/// The repository a worktree directory belongs to, or `None` when it carries
+/// no marker — an empty or hand-made directory, which `gc` leaves alone.
+#[must_use]
+pub fn repository_owning_worktrees(repo_worktrees_root: &Path) -> Option<PathBuf> {
+    std::fs::read_to_string(repo_worktrees_root.join(REPOSITORY_MARKER))
+        .ok()
+        .map(|path| PathBuf::from(path.trim_end_matches('\n')))
+}
+
 /// Run directories are named by integer. Anything else in there is ignored.
 fn existing_run_ids(runs_root: &Path) -> io::Result<Vec<u64>> {
     match std::fs::read_dir(runs_root) {
@@ -81,6 +212,21 @@ impl RunPaths {
     pub fn log(&self, node: &str) -> PathBuf {
         self.logs_dir().join(format!("{node}.log"))
     }
+
+    /// Where `node`'s sandbox lives. `repo` is the repository this run belongs
+    /// to; it keys the path so concurrent runs in two repositories cannot
+    /// claim the same directory.
+    #[must_use]
+    pub fn node_worktree(&self, repo: &Path, node: &str) -> Option<PathBuf> {
+        worktree_root(repo, self.id).map(|root| root.join(node))
+    }
+
+    /// Where the run branch is checked out, so merges never target the user's
+    /// own working tree.
+    #[must_use]
+    pub fn integration_worktree(&self, repo: &Path) -> Option<PathBuf> {
+        worktree_root(repo, self.id).map(|root| root.join(INTEGRATION_WORKTREE))
+    }
 }
 
 /// Create the directory layout for a new run.
@@ -119,6 +265,13 @@ pub struct RunMeta {
     /// Path to the graph file, exactly as given on the command line.
     pub graph: PathBuf,
     pub jobs: usize,
+    /// Set once the run creates a branch, which only happens when the graph
+    /// contains at least one agent node. Defaulted so a `meta.json` written
+    /// before branches existed still reads back.
+    #[serde(default)]
+    pub run_branch: Option<String>,
+    #[serde(default)]
+    pub base_sha: Option<String>,
 }
 
 /// # Errors

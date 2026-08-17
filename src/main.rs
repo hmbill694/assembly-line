@@ -179,6 +179,8 @@ async fn start_new_run(graph_path: PathBuf, jobs: usize) -> ExitCode {
     let meta = RunMeta {
         graph: graph_path.clone(),
         jobs,
+        run_branch: None,
+        base_sha: None,
     };
     if let Err(e) = paths::write_meta(&run, &meta) {
         return fail_with_usage_error(format!("writing meta.json: {e}"));
