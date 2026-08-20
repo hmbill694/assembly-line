@@ -39,6 +39,16 @@ pub enum Command {
         run_id: Option<u64>,
     },
 
+    /// Remove worktrees left behind by failed nodes
+    Gc {
+        /// Also remove worktrees untouched for this long, e.g. "7d"
+        #[arg(long)]
+        older_than: Option<String>,
+        /// Report what would be removed, and remove nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Print a node's captured output
     Logs {
         run_id: u64,
