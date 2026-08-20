@@ -84,7 +84,12 @@ verify-stack:
     set -uo pipefail
     failed=0
     work=$(mktemp -d)
-    trap 'rm -rf "$work"' EXIT
+    # The last revision built leaves artifacts in the shared target dir that
+    # were compiled from `$work`, which is about to vanish — and `env!(
+    # "CARGO_MANIFEST_DIR")` is baked in at compile time. A later `just test`
+    # would reuse them and every test that resolves a fixture path would fail
+    # with a mystifying "no such file". Drop them on the way out.
+    trap 'rm -rf "$work"; cargo clean -p assembly-line --quiet 2>/dev/null || true' EXIT
 
     while IFS=' ' read -r sha rev desc; do
       [ -n "$sha" ] || continue

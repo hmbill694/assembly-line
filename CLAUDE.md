@@ -4,7 +4,7 @@ A Rust CLI that executes a DAG of tasks — shell commands and coding-agent
 sessions — in parallel, supervised or unsupervised.
 
 - Design decisions: `docs/superpowers/specs/2026-08-15-assembly-line.md`
-- Current milestone: `docs/superpowers/plans/2026-08-15-assembly-line-m1.md`
+- Current milestone: `docs/superpowers/plans/2026-08-15-assembly-line-m2.md`
 
 ## Toolchain
 
@@ -59,7 +59,10 @@ way:
   revision's artifacts for the same package and report a *correct* revision as
   broken — an unresolved-import error for a module the revision plainly
   declares. Cleaning only our package keeps the expensive dependency
-  artifacts.
+  artifacts. It cleans on the way *out* too: the last revision's test binaries
+  have `env!("CARGO_MANIFEST_DIR")` baked in pointing at the temp tree
+  `verify-stack` just deleted, and a later `just test` that reused them fails
+  on every fixture path with a mystifying "no such file".
 
 Build output must also live outside the repo: revisions below the one that
 adds `.gitignore` will otherwise snapshot `target/` into the change. `target/`,
