@@ -174,6 +174,30 @@ pub async fn delete_branch(repo: impl AsRef<Path>, branch: &str) -> anyhow::Resu
     .map(|_| ())
 }
 
+/// Whether `remote` is configured.
+///
+/// A repository with no remote is an ordinary local run, not a fault: the
+/// caller keeps the node's branch as a local ref instead of publishing it.
+pub async fn remote_exists(repo: impl AsRef<Path>, remote: &str) -> anyhow::Result<bool> {
+    let configured = run_expecting_success(repo, &["remote"], "remote").await?;
+    Ok(configured.lines().map(str::trim).any(|name| name == remote))
+}
+
+/// Push `branch` to `remote`.
+///
+/// Deliberately without `--set-upstream`: that writes `branch.*.remote` into
+/// the repository's config, and the target repository is never modified. A
+/// later round pushes the same branch name again and fast-forwards without it.
+pub async fn push_branch(repo: impl AsRef<Path>, remote: &str, branch: &str) -> anyhow::Result<()> {
+    run_expecting_success(
+        repo,
+        &["push", remote, branch],
+        &format!("push {remote} {branch}"),
+    )
+    .await
+    .map(|_| ())
+}
+
 /// Remove a worktree and its administrative entry. Forcing is deliberate: the
 /// worktree is assembly-line's to discard, and it routinely holds untracked
 /// build output.

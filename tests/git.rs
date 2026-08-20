@@ -49,6 +49,22 @@ impl Fixture {
         head_sha(&self.repo).await.unwrap()
     }
 
+    /// Add a bare repository as `origin`. A push then exercises the real git
+    /// path with no network and no credentials.
+    async fn with_origin(&self) -> PathBuf {
+        let origin = self.repo.parent().expect("a parent").join("origin.git");
+        let origin_arg = origin.to_string_lossy().into_owned();
+
+        for args in [
+            vec!["init", "--bare", "--initial-branch=main", &origin_arg],
+            vec!["remote", "add", "origin", &origin_arg],
+        ] {
+            let out = git::run_allowing_failure(&self.repo, &args).await.unwrap();
+            assert!(out.succeeded(), "git {args:?} failed: {}", out.stderr);
+        }
+        origin
+    }
+
     /// Check `branch` out into a fresh worktree started at the repo's HEAD.
     async fn worktree(&self, name: &str, branch: &str) -> PathBuf {
         let path = self.worktrees.join(name);
@@ -418,4 +434,87 @@ async fn deleting_a_branch_that_does_not_exist_is_an_error_not_a_silent_success(
             .await
             .is_err()
     );
+}
+
+/// Whether a bare repository carries `branch`, asked of the remote itself
+/// rather than of the pushing side's tracking refs.
+async fn remote_carries(origin: &Path, branch: &str) -> bool {
+    git::run_allowing_failure(
+        origin,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .await
+    .unwrap()
+    .succeeded()
+}
+
+#[tokio::test]
+async fn a_repository_with_no_remote_says_so() {
+    let fx = Fixture::new().await;
+    assert!(!git::remote_exists(&fx.repo, "origin").await.unwrap());
+}
+
+#[tokio::test]
+async fn a_configured_remote_is_visible() {
+    let fx = Fixture::new().await;
+    fx.with_origin().await;
+    assert!(git::remote_exists(&fx.repo, "origin").await.unwrap());
+    // Only the remote that was added — not any name at all.
+    assert!(!git::remote_exists(&fx.repo, "upstream").await.unwrap());
+}
+
+#[tokio::test]
+async fn pushing_a_branch_puts_it_on_the_remote() {
+    let fx = Fixture::new().await;
+    let origin = fx.with_origin().await;
+    let node = fx.worktree("node", "al/run-1-node").await;
+    write_and_commit(&node, "work.txt", "done\n", "node work").await;
+
+    assert!(!remote_carries(&origin, "al/run-1-node").await);
+    git::push_branch(&fx.repo, "origin", "al/run-1-node")
+        .await
+        .unwrap();
+    assert!(remote_carries(&origin, "al/run-1-node").await);
+}
+
+/// A revise round appends a commit to a branch that was already published, so
+/// the second push must fast-forward rather than be rejected.
+#[tokio::test]
+async fn pushing_a_branch_again_after_another_commit_fast_forwards() {
+    let fx = Fixture::new().await;
+    let origin = fx.with_origin().await;
+    let node = fx.worktree("node", "al/run-1-node").await;
+
+    write_and_commit(&node, "work.txt", "round one\n", "round 1").await;
+    git::push_branch(&fx.repo, "origin", "al/run-1-node")
+        .await
+        .unwrap();
+
+    let second = write_and_commit(&node, "work.txt", "round two\n", "round 2").await;
+    git::push_branch(&fx.repo, "origin", "al/run-1-node")
+        .await
+        .unwrap();
+
+    let on_remote = git::run_allowing_failure(&origin, &["rev-parse", "al/run-1-node"])
+        .await
+        .unwrap();
+    assert_eq!(on_remote.stdout.trim(), second);
+}
+
+#[tokio::test]
+async fn pushing_to_a_remote_that_does_not_exist_names_it() {
+    let fx = Fixture::new().await;
+    let node = fx.worktree("node", "al/run-1-node").await;
+    write_and_commit(&node, "work.txt", "done\n", "node work").await;
+
+    let err = git::push_branch(&fx.repo, "origin", "al/run-1-node")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("origin"), "{err}");
 }
