@@ -11,3 +11,4 @@ pub mod provider;
 pub mod report;
 pub mod scheduler;
 pub mod state;
+pub mod workspace;
