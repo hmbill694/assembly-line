@@ -24,6 +24,8 @@ async fn run(src: &str) -> Outcome {
         jobs: 4,
         cwd: tmp.path().to_path_buf(),
         cancel: CancellationToken::new(),
+        repo: None,
+        seed_from: tmp.path().to_path_buf(),
     };
 
     let status = execute(&graph, &dag, &paths, &mut log, &mut state, &opts)

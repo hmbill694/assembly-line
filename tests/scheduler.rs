@@ -33,6 +33,8 @@ impl Harness {
             jobs,
             cwd: self.tmp.path().to_path_buf(),
             cancel: CancellationToken::new(),
+            repo: None,
+            seed_from: self.tmp.path().to_path_buf(),
         };
 
         let status = execute(&graph, &dag, &paths, &mut log, &mut state, &opts)
@@ -191,6 +193,8 @@ async fn writes_a_log_file_per_node() {
         jobs: 1,
         cwd: h.tmp.path().to_path_buf(),
         cancel: CancellationToken::new(),
+        repo: None,
+        seed_from: h.tmp.path().to_path_buf(),
     };
 
     execute(&graph, &dag, &paths, &mut log, &mut state, &opts)
@@ -227,8 +231,11 @@ async fn emits_started_and_finished_events_for_every_node() {
     ));
 }
 
+/// Agent execution itself is covered in `tests/agent_nodes.rs`, against a real
+/// repository. This harness deliberately has none, which is the case that must
+/// fail rather than half-run.
 #[tokio::test]
-async fn an_agent_node_fails_with_a_clear_not_yet_supported_reason() {
+async fn an_agent_node_without_a_repository_fails_saying_so() {
     let h = Harness::new();
     let src = "[providers.p]\ncmd=\"true\"\n\
                [[task]]\nid=\"a\"\nkind=\"agent\"\nprompt=\"hi\"\nprovider=\"p\"\nverify=\"true\"\n";
@@ -237,9 +244,9 @@ async fn an_agent_node_fails_with_a_clear_not_yet_supported_reason() {
     assert_eq!(out.status, RunStatus::Partial);
     assert_eq!(out.state.state("a"), NodeState::Failed);
     assert!(
-        out.events
-            .iter()
-            .any(|k| matches!(k, EventKind::NodeFailed { reason, .. } if reason.contains("M2"))),
+        out.events.iter().any(
+            |k| matches!(k, EventKind::NodeFailed { reason, .. } if reason.contains("repository"))
+        ),
         "{:?}",
         out.events
     );

@@ -1,37 +1,142 @@
 use crate::config::{Graph, OnFailure, Task, TaskKind, parse_duration};
 use crate::dag::Dag;
 use crate::event::{EventKind, EventLog, RunStatus};
-use crate::exec::{ShellOutcome, run_shell};
-use crate::paths::RunPaths;
+use crate::exec::{ShellOutcome, run_command, run_shell};
+use crate::git::{self, MergeOutcome};
+use crate::paths::{self, RunPaths};
+use crate::provider::{CommandSpec, render_command};
 use crate::state::{NodeState, RunState, TaskMap, task_map};
+use crate::workspace::{self, node_branch_name, run_branch_name};
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-
-pub const AGENT_UNSUPPORTED: &str = "agent nodes are not supported yet (M2)";
 
 #[derive(Debug, Clone)]
 pub struct RunOpts {
     pub jobs: usize,
     pub cwd: PathBuf,
     pub cancel: CancellationToken,
+    /// The repository worktrees are created from. `None` disables agent
+    /// nodes, which is how shell-only runs keep M1 behaviour exactly.
+    pub repo: Option<PathBuf>,
+    /// Where `copy` paths resolve from — the CLI's working directory.
+    pub seed_from: PathBuf,
+}
+
+/// The branch every agent node's work merges into, and the checkout it lives
+/// in. Kept out of the user's own working tree, which is never a merge target.
+#[derive(Debug, Clone)]
+struct RunBranch {
+    repo: PathBuf,
+    name: String,
+    /// The commit the branch was cut from, or `None` when this run re-opened a
+    /// branch an earlier attempt created — there is nothing new to record.
+    branched_from_sha: Option<String>,
+    worktree: PathBuf,
+    /// Every merge targets the one worktree above, so they cannot overlap.
+    /// Held only around a merge; holding it while an agent runs would make
+    /// the whole run serial.
+    merge_lock: Arc<Mutex<()>>,
+}
+
+impl RunBranch {
+    /// The branch's current tip, so each node starts from everything merged
+    /// before it rather than from the run's original base.
+    async fn current_tip(&self) -> anyhow::Result<String> {
+        let _merging = self.merge_lock.lock().await;
+        git::head_sha(&self.worktree).await
+    }
+
+    /// Merge a node's branch in, serialized against every other merge.
+    ///
+    /// A conflict is backed out before the lock is released: git leaves the
+    /// worktree mid-merge, and the next node to merge would inherit it.
+    async fn merge(&self, node: &str, branch: &str) -> anyhow::Result<MergeOutcome> {
+        let _merging = self.merge_lock.lock().await;
+
+        let outcome =
+            git::merge_branch(&self.worktree, branch, &format!("merge node '{node}'")).await?;
+        if matches!(outcome, MergeOutcome::Conflicted(_)) {
+            git::abort_merge(&self.worktree).await?;
+        }
+        Ok(outcome)
+    }
+}
+
+/// What a finished node reports back to the loop. Events are written by the
+/// loop, not the task, so their order in the log is the order things settled.
+#[derive(Debug)]
+enum NodeResult {
+    /// A shell node, or an agent that correctly decided nothing needed doing.
+    Succeeded,
+    /// An agent left work, which was committed and then offered to the run
+    /// branch — successfully or not.
+    Committed {
+        sha: String,
+        stat: git::DiffStat,
+        merge: MergeOutcome,
+    },
+    Failed {
+        reason: String,
+    },
+}
+
+impl NodeResult {
+    /// A command's outcome, where an unspawnable program and a non-zero exit
+    /// both mean the node failed — but with different reasons.
+    fn from_command(outcome: anyhow::Result<ShellOutcome>) -> Self {
+        match outcome.map(|o| o.failure_reason()) {
+            Err(unspawnable) => NodeResult::Failed {
+                reason: unspawnable.to_string(),
+            },
+            Ok(Some(reason)) => NodeResult::Failed { reason },
+            Ok(None) => NodeResult::Succeeded,
+        }
+    }
+}
+
+/// What reached the run branch, from the node's point of view.
+enum MergeRecord {
+    /// The run branch now carries this commit.
+    Landed(String),
+    Blocked(Vec<String>),
+}
+
+impl MergeRecord {
+    /// `AlreadyUpToDate` produces no merge commit, so the node's own commit is
+    /// what the run branch carries.
+    fn of(merge: MergeOutcome, committed: &str) -> Self {
+        match merge {
+            MergeOutcome::Merged(sha) => Self::Landed(sha),
+            MergeOutcome::AlreadyUpToDate => Self::Landed(committed.to_string()),
+            MergeOutcome::Conflicted(paths) => Self::Blocked(paths),
+        }
+    }
 }
 
 /// What a finished node reports back to the loop.
 struct NodeCompletion {
     node: String,
     resource: Option<String>,
-    outcome: Result<ShellOutcome, String>,
+    result: NodeResult,
 }
 
-impl NodeCompletion {
-    fn failure_reason(&self) -> Option<String> {
-        match &self.outcome {
-            Err(spawn_error) => Some(spawn_error.clone()),
-            Ok(outcome) => outcome.failure_reason(),
-        }
-    }
+/// Everything an agent node needs, resolved before the node is spawned so a
+/// config mistake becomes a failed node with a clear reason rather than a
+/// panic inside a task.
+struct AgentNodePlan {
+    node: String,
+    run_branch: RunBranch,
+    workspace_path: PathBuf,
+    branch: String,
+    seed_from: PathBuf,
+    copy_paths: Vec<String>,
+    command: CommandSpec,
+    commit_message: String,
 }
 
 /// Nodes that may start right now: dependency-ready, within the job cap, and
@@ -65,8 +170,246 @@ fn nodes_clear_to_launch(
         .collect()
 }
 
-fn wall_clock_limit(task: &Task) -> anyhow::Result<Option<std::time::Duration>> {
+fn wall_clock_limit(task: &Task) -> anyhow::Result<Option<Duration>> {
     task.max_duration.as_deref().map(parse_duration).transpose()
+}
+
+/// Files a node's workspace is seeded with: the graph-wide list plus the
+/// task's own, first occurrence winning.
+fn declared_copy_paths(graph: &Graph, task: &Task) -> Vec<String> {
+    graph
+        .workspace
+        .copy
+        .iter()
+        .chain(&task.copy)
+        .fold(Vec::new(), |mut acc, path| {
+            if !acc.contains(path) {
+                acc.push(path.clone());
+            }
+            acc
+        })
+}
+
+/// A commit subject a human can scan in `git log`: the node, then the first
+/// non-blank line of what it was asked to do.
+fn commit_message(node: &str, prompt: &str) -> String {
+    match prompt.lines().find(|line| !line.trim().is_empty()) {
+        Some(first) => format!("{node}: {}", first.trim()),
+        None => format!("{node}: agent work"),
+    }
+}
+
+/// Resolve an agent node against its graph, or say why it cannot run.
+///
+/// The error is a message rather than a typed value because its only
+/// destination is the node's `NodeFailed` reason.
+fn agent_node_plan(
+    graph: &Graph,
+    task: &Task,
+    paths: &RunPaths,
+    opts: &RunOpts,
+    run_branch: Option<&RunBranch>,
+) -> Result<AgentNodePlan, String> {
+    let run_branch = run_branch.ok_or(
+        "agent nodes need a git repository to create worktrees from, and this run has none",
+    )?;
+
+    let provider_name = task
+        .provider
+        .as_deref()
+        .ok_or_else(|| format!("agent task '{}' names no provider", task.id))?;
+    let provider = graph
+        .providers
+        .get(provider_name)
+        .ok_or_else(|| format!("undefined provider '{provider_name}'"))?;
+
+    let workspace_path = paths
+        .node_worktree(&run_branch.repo, &task.id)
+        .ok_or("HOME is unset, so assembly-line has nowhere to put worktrees")?;
+
+    let prompt = task.prompt.clone().unwrap_or_default();
+
+    Ok(AgentNodePlan {
+        node: task.id.clone(),
+        run_branch: run_branch.clone(),
+        workspace_path,
+        branch: node_branch_name(paths.id, &task.id),
+        seed_from: opts.seed_from.clone(),
+        copy_paths: declared_copy_paths(graph, task),
+        command: render_command(provider, &prompt),
+        commit_message: commit_message(&task.id, &prompt),
+    })
+}
+
+/// Run one agent node end to end: sandbox, agent, commit, merge.
+///
+/// The workspace is discarded only when the node fully succeeds. On any
+/// failure it stays on disk, because it is the sole record of what the agent
+/// actually did.
+async fn agent_node_result(
+    plan: &AgentNodePlan,
+    log_path: &Path,
+    timeout: Option<Duration>,
+    cancel: CancellationToken,
+) -> anyhow::Result<NodeResult> {
+    let base_sha = plan.run_branch.current_tip().await?;
+    let ws = workspace::create(
+        &plan.run_branch.repo,
+        &plan.workspace_path,
+        &plan.branch,
+        &base_sha,
+        &plan.seed_from,
+        &plan.copy_paths,
+    )
+    .await?;
+
+    let ran = NodeResult::from_command(
+        run_command(&plan.command, &ws.path, log_path, timeout, cancel).await,
+    );
+    if matches!(ran, NodeResult::Failed { .. }) {
+        return Ok(ran);
+    }
+
+    let Some(sha) = workspace::commit(&ws, &plan.commit_message).await? else {
+        workspace::discard(&plan.run_branch.repo, &ws).await?;
+        return Ok(NodeResult::Succeeded);
+    };
+
+    let stat = git::diff_stat_against(&ws.path, &base_sha).await?;
+    let merge = plan.run_branch.merge(&plan.node, &ws.branch).await?;
+    if !matches!(merge, MergeOutcome::Conflicted(_)) {
+        workspace::discard(&plan.run_branch.repo, &ws).await?;
+    }
+
+    Ok(NodeResult::Committed { sha, stat, merge })
+}
+
+/// Create, or on resume re-open, the branch agent work merges into.
+///
+/// # Errors
+///
+/// Returns an error if the repository has no commits to branch from, if
+/// `$HOME` is unset, or if git cannot produce the worktree.
+async fn prepare_run_branch(repo: &Path, paths: &RunPaths) -> anyhow::Result<RunBranch> {
+    anyhow::ensure!(
+        git::has_commits(repo).await?,
+        "the repository has no commits, so an agent node has nothing to branch from"
+    );
+
+    let worktree = paths.integration_worktree(repo).ok_or_else(|| {
+        anyhow::anyhow!("HOME is unset, so assembly-line has nowhere to put worktrees")
+    })?;
+    let name = run_branch_name(paths.id);
+
+    // Records which repository these worktrees belong to, so `gc` can collect
+    // them without being run from the repository itself.
+    paths::record_repository_for_worktrees(repo)?;
+    // A checkout whose directory is gone still holds its administrative entry,
+    // which is enough to make the path unusable.
+    git::prune_worktrees(repo).await?;
+
+    let branched_from_sha = check_out_run_branch(repo, &worktree, &name).await?;
+
+    Ok(RunBranch {
+        repo: repo.to_path_buf(),
+        name,
+        branched_from_sha,
+        worktree,
+        merge_lock: Arc::new(Mutex::new(())),
+    })
+}
+
+/// Put `branch` in a worktree at `path`, reusing whatever an earlier attempt
+/// left. Returns the commit the branch was cut from, or `None` when it already
+/// existed and this run is only re-opening it.
+async fn check_out_run_branch(
+    repo: &Path,
+    path: &Path,
+    branch: &str,
+) -> anyhow::Result<Option<String>> {
+    match (path.exists(), git::branch_exists(repo, branch).await?) {
+        // Resuming: the checkout survived, and it is still ours.
+        (true, _) => Ok(None),
+        // The branch outlived its checkout — `gc` removed it, or a crash did.
+        (false, true) => {
+            git::add_worktree_for_existing_branch(repo, path, branch).await?;
+            Ok(None)
+        }
+        (false, false) => {
+            let base_sha = git::head_sha(repo).await?;
+            git::add_worktree(repo, path, branch, &base_sha).await?;
+            Ok(Some(base_sha))
+        }
+    }
+}
+
+/// Write every event a completion implies, in order, and report whether the
+/// node ended up failed.
+///
+/// All log writes stay on the loop's own task, so the log's order is the order
+/// in which things actually settled.
+fn record_completion(
+    log: &mut EventLog,
+    state: &mut RunState,
+    node: &str,
+    result: NodeResult,
+) -> anyhow::Result<bool> {
+    let mut append = |kind| -> anyhow::Result<()> {
+        let ev = log.append(kind)?;
+        state.apply(&ev.kind);
+        Ok(())
+    };
+
+    let finished = EventKind::NodeFinished {
+        node: node.to_string(),
+        exit_code: 0,
+    };
+
+    match result {
+        NodeResult::Succeeded => {
+            append(finished)?;
+            Ok(false)
+        }
+        NodeResult::Failed { reason } => {
+            append(EventKind::NodeFailed {
+                node: node.to_string(),
+                reason,
+            })?;
+            Ok(true)
+        }
+        NodeResult::Committed { sha, stat, merge } => {
+            append(EventKind::NodeCommitted {
+                node: node.to_string(),
+                sha: sha.clone(),
+                files: stat.files,
+                insertions: stat.insertions,
+                deletions: stat.deletions,
+            })?;
+
+            match MergeRecord::of(merge, &sha) {
+                MergeRecord::Landed(sha) => {
+                    append(EventKind::NodeMerged {
+                        node: node.to_string(),
+                        sha,
+                    })?;
+                    append(finished)?;
+                    Ok(false)
+                }
+                MergeRecord::Blocked(paths) => {
+                    let reason = format!("merge conflict in {}", paths.join(", "));
+                    append(EventKind::NodeMergeConflicted {
+                        node: node.to_string(),
+                        paths,
+                    })?;
+                    append(EventKind::NodeFailed {
+                        node: node.to_string(),
+                        reason,
+                    })?;
+                    Ok(true)
+                }
+            }
+        }
+    }
 }
 
 /// Drive the graph to completion, recording every transition to the log.
@@ -74,10 +417,10 @@ fn wall_clock_limit(task: &Task) -> anyhow::Result<Option<std::time::Duration>> 
 /// # Errors
 ///
 /// Returns an error only if the run cannot be *administered* — the event log
-/// cannot be appended to, a task's `max_duration` is unparseable, or a spawned
-/// task panicked. A node that fails, times out, or is cancelled is not an
-/// error: that is reflected in the returned [`RunStatus`], because a partial
-/// run is a normal outcome.
+/// cannot be appended to, a task's `max_duration` is unparseable, the run
+/// branch cannot be created, or a spawned task panicked. A node that fails,
+/// times out, or is cancelled is not an error: that is reflected in the
+/// returned [`RunStatus`], because a partial run is a normal outcome.
 ///
 /// # Panics
 ///
@@ -106,6 +449,30 @@ pub async fn execute(
     })?;
     state.apply(&ev.kind);
 
+    let graph_has_agent_nodes = graph.tasks.iter().any(|t| t.kind == TaskKind::Agent);
+    let run_branch = match (graph_has_agent_nodes, &opts.repo) {
+        // A shell-only graph touches git not at all — M1 behaviour, exactly.
+        (false, _) | (true, None) => None,
+        (true, Some(repo)) => Some(prepare_run_branch(repo, paths).await?),
+    };
+
+    if let Some(branch) = &run_branch
+        && let Some(base_sha) = branch.branched_from_sha.clone()
+    {
+        let ev = log.append(EventKind::RunBranchCreated {
+            branch: branch.name.clone(),
+            base_sha,
+        })?;
+        state.apply(&ev.kind);
+    }
+
+    // Shell nodes run against the run branch too, so a dependent sees what the
+    // agents before it merged. Without agents there is no branch, and they run
+    // where the user invoked assembly.
+    let shell_cwd = run_branch
+        .as_ref()
+        .map_or_else(|| opts.cwd.clone(), |b| b.worktree.clone());
+
     // A state machine over time: launch what fits, await one completion,
     // re-derive readiness. Not expressible as an iterator chain.
     loop {
@@ -128,29 +495,46 @@ pub async fn execute(
 
                 let resource = task.resource.clone();
                 let log_path = paths.log(&id);
-                let cwd = opts.cwd.clone();
                 let cancel = opts.cancel.clone();
 
                 match task.kind {
-                    TaskKind::Agent => {
-                        in_flight.spawn(async move {
-                            NodeCompletion {
-                                node: id,
-                                resource,
-                                outcome: Err(AGENT_UNSUPPORTED.to_string()),
-                            }
-                        });
-                    }
                     TaskKind::Shell => {
                         let cmd = task.run.clone().unwrap_or_default();
+                        let cwd = shell_cwd.clone();
                         in_flight.spawn(async move {
                             let outcome = run_shell(&cmd, &cwd, &log_path, timeout, cancel).await;
                             NodeCompletion {
                                 node: id,
                                 resource,
-                                outcome: outcome.map_err(|e| e.to_string()),
+                                result: NodeResult::from_command(outcome),
                             }
                         });
+                    }
+                    TaskKind::Agent => {
+                        match agent_node_plan(graph, task, paths, opts, run_branch.as_ref()) {
+                            Err(reason) => {
+                                in_flight.spawn(async move {
+                                    NodeCompletion {
+                                        node: id,
+                                        resource,
+                                        result: NodeResult::Failed { reason },
+                                    }
+                                });
+                            }
+                            Ok(plan) => {
+                                in_flight.spawn(async move {
+                                    let result =
+                                        agent_node_result(&plan, &log_path, timeout, cancel).await;
+                                    NodeCompletion {
+                                        node: id,
+                                        resource,
+                                        result: result.unwrap_or_else(|e| NodeResult::Failed {
+                                            reason: e.to_string(),
+                                        }),
+                                    }
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -165,37 +549,23 @@ pub async fn execute(
             resources_in_use.remove(r);
         }
 
-        match completion.failure_reason() {
-            None => {
-                let ev = log.append(EventKind::NodeFinished {
-                    node: completion.node.clone(),
-                    exit_code: 0,
-                })?;
-                state.apply(&ev.kind);
-            }
-            Some(reason) => {
-                let ev = log.append(EventKind::NodeFailed {
-                    node: completion.node.clone(),
-                    reason,
-                })?;
-                state.apply(&ev.kind);
-
-                match tasks
-                    .get(completion.node.as_str())
-                    .map(|t| t.on_failure)
-                    .unwrap_or_default()
-                {
-                    OnFailure::Continue => {}
-                    OnFailure::Skip => mark_pending_as_skipped(
-                        log,
-                        state,
-                        dag.descendants(&completion.node),
-                        &format!("needs {}", completion.node),
-                    )?,
-                    OnFailure::Abort => {
-                        aborting = true;
-                        opts.cancel.cancel();
-                    }
+        let node_failed = record_completion(log, state, &completion.node, completion.result)?;
+        if node_failed {
+            match tasks
+                .get(completion.node.as_str())
+                .map(|t| t.on_failure)
+                .unwrap_or_default()
+            {
+                OnFailure::Continue => {}
+                OnFailure::Skip => mark_pending_as_skipped(
+                    log,
+                    state,
+                    dag.descendants(&completion.node),
+                    &format!("needs {}", completion.node),
+                )?,
+                OnFailure::Abort => {
+                    aborting = true;
+                    opts.cancel.cancel();
                 }
             }
         }

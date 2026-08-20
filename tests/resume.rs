@@ -69,6 +69,8 @@ async fn resume_does_not_rerun_completed_nodes() {
         jobs: 4,
         cwd: tmp.path().to_path_buf(),
         cancel: CancellationToken::new(),
+        repo: None,
+        seed_from: tmp.path().to_path_buf(),
     };
     let status = execute(&graph, &dag, &paths, &mut log, &mut state, &opts)
         .await
@@ -109,6 +111,8 @@ async fn resume_appends_to_the_same_log() {
         jobs: 4,
         cwd: tmp.path().to_path_buf(),
         cancel: CancellationToken::new(),
+        repo: None,
+        seed_from: tmp.path().to_path_buf(),
     };
     execute(&graph, &dag, &paths, &mut log, &mut state, &opts)
         .await
