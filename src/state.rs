@@ -62,7 +62,15 @@ impl RunState {
             EventKind::NodeFinished { .. } => Some(NodeState::Done),
             EventKind::NodeFailed { .. } => Some(NodeState::Failed),
             EventKind::NodeSkipped { .. } => Some(NodeState::Skipped),
-            EventKind::RunStarted { .. } => None,
+            // Progress markers, not transitions: a node stays Running until it
+            // finishes or fails. Listed one by one rather than behind a
+            // catch-all arm, so a new event type is a compile error here
+            // instead of a silent omission.
+            EventKind::RunStarted { .. }
+            | EventKind::RunBranchCreated { .. }
+            | EventKind::NodeCommitted { .. }
+            | EventKind::NodeMerged { .. }
+            | EventKind::NodeMergeConflicted { .. } => None,
             EventKind::RunFinished { status } => {
                 self.status = Some(*status);
                 None

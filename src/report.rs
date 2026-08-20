@@ -5,12 +5,39 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::time::Duration;
 
+/// How much a node changed, as recorded when its work was committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiffSummary {
+    pub files: usize,
+    pub insertions: usize,
+    pub deletions: usize,
+}
+
+impl std::fmt::Display for DiffSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} file{} +{}/-{}",
+            self.files,
+            match self.files == 1 {
+                true => "",
+                false => "s",
+            },
+            self.insertions,
+            self.deletions
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeReport {
     pub id: String,
     pub state: NodeState,
     /// Wall time of the node's most recent attempt.
     pub duration: Option<Duration>,
+    /// What the node committed, for nodes that produced work. `None` for a
+    /// shell node, or an agent that correctly decided nothing needed changing.
+    pub diff: Option<DiffSummary>,
     /// Failure reason or skip cause, when there is one.
     pub detail: Option<String>,
 }
@@ -28,6 +55,7 @@ struct NodeProgress {
     state: Option<NodeState>,
     attempt_started_at: Option<DateTime<Utc>>,
     last_attempt_duration: Option<Duration>,
+    committed_diff: Option<DiffSummary>,
     detail: Option<String>,
 }
 
@@ -62,12 +90,26 @@ impl RunProgress {
 impl NodeProgress {
     fn after_node_event(self, event: &Event) -> Self {
         match &event.kind {
-            // A new attempt restarts the clock and clears the previous
-            // reason, so a retried node reports its final attempt.
+            // A new attempt restarts the clock and clears the previous reason
+            // and diff, so a retried node reports its final attempt.
             EventKind::NodeStarted { .. } => NodeProgress {
                 state: Some(NodeState::Running),
                 attempt_started_at: Some(event.at),
+                committed_diff: None,
                 detail: None,
+                ..self
+            },
+            EventKind::NodeCommitted {
+                files,
+                insertions,
+                deletions,
+                ..
+            } => NodeProgress {
+                committed_diff: Some(DiffSummary {
+                    files: *files,
+                    insertions: *insertions,
+                    deletions: *deletions,
+                }),
                 ..self
             },
             EventKind::NodeFinished { .. } => NodeProgress {
@@ -87,7 +129,12 @@ impl NodeProgress {
                 detail: Some(because.clone()),
                 ..self
             },
-            EventKind::RunStarted { .. } | EventKind::RunFinished { .. } => self,
+            // A merge moves the run branch, not the node's own progress.
+            EventKind::RunStarted { .. }
+            | EventKind::RunBranchCreated { .. }
+            | EventKind::NodeMerged { .. }
+            | EventKind::NodeMergeConflicted { .. }
+            | EventKind::RunFinished { .. } => self,
         }
     }
 
@@ -120,6 +167,7 @@ impl RunReport {
                         id: id.clone(),
                         state: node.state.unwrap_or(NodeState::Pending),
                         duration: node.last_attempt_duration,
+                        diff: node.committed_diff,
                         detail: node.detail,
                     }
                 })
@@ -136,14 +184,23 @@ impl RunReport {
     #[must_use]
     pub fn to_terminal_tree(&self) -> String {
         let id_column = self.nodes.iter().map(|n| n.id.len()).max().unwrap_or(0);
+        // `None` for a run that committed nothing — a shell-only graph should
+        // not pay for a column it never fills.
+        let diff_column = self
+            .nodes
+            .iter()
+            .filter_map(|n| n.diff)
+            .map(|d| d.to_string().len())
+            .max();
 
         let rows = self.nodes.iter().fold(String::new(), |mut out, node| {
             let _ = writeln!(
                 out,
-                "  {} {:<id_column$}  {:>7}  {}",
+                "  {} {:<id_column$}  {:>7}{}  {}",
                 state_glyph(node.state),
                 node.id,
                 format_duration(node.duration),
+                format_diff_column(node.diff, diff_column),
                 node.detail.as_deref().unwrap_or(""),
             );
             out
@@ -174,6 +231,15 @@ fn state_glyph(state: NodeState) -> char {
         NodeState::Running => '⠙',
         NodeState::Pending => '·',
     }
+}
+
+/// The diff cell, padded to `width`, or nothing at all when the run has no
+/// diff column.
+fn format_diff_column(diff: Option<DiffSummary>, width: Option<usize>) -> String {
+    width.map_or_else(String::new, |width| {
+        let cell = diff.map(|d| d.to_string()).unwrap_or_default();
+        format!("  {cell:<width$}")
+    })
 }
 
 fn format_duration(duration: Option<Duration>) -> String {

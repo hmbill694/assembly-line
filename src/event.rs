@@ -26,12 +26,54 @@ impl RunStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum EventKind {
-    RunStarted { run_id: u64, jobs: usize },
-    NodeStarted { node: String, round: u32 },
-    NodeFinished { node: String, exit_code: i32 },
-    NodeFailed { node: String, reason: String },
-    NodeSkipped { node: String, because: String },
-    RunFinished { status: RunStatus },
+    RunStarted {
+        run_id: u64,
+        jobs: usize,
+    },
+    /// The run needs somewhere for agent work to land, so it branched off HEAD.
+    /// Only emitted when the graph contains an agent node.
+    RunBranchCreated {
+        branch: String,
+        base_sha: String,
+    },
+    NodeStarted {
+        node: String,
+        round: u32,
+    },
+    /// The node's worktree had changes, now recorded on its own branch.
+    NodeCommitted {
+        node: String,
+        sha: String,
+        files: usize,
+        insertions: usize,
+        deletions: usize,
+    },
+    /// The node's branch reached the run branch.
+    NodeMerged {
+        node: String,
+        sha: String,
+    },
+    /// The node's branch could not be merged. The scheduler decides what that
+    /// means for the node; this only records what git reported.
+    NodeMergeConflicted {
+        node: String,
+        paths: Vec<String>,
+    },
+    NodeFinished {
+        node: String,
+        exit_code: i32,
+    },
+    NodeFailed {
+        node: String,
+        reason: String,
+    },
+    NodeSkipped {
+        node: String,
+        because: String,
+    },
+    RunFinished {
+        status: RunStatus,
+    },
 }
 
 impl EventKind {
@@ -40,10 +82,15 @@ impl EventKind {
     pub fn node(&self) -> Option<&str> {
         match self {
             Self::NodeStarted { node, .. }
+            | Self::NodeCommitted { node, .. }
+            | Self::NodeMerged { node, .. }
+            | Self::NodeMergeConflicted { node, .. }
             | Self::NodeFinished { node, .. }
             | Self::NodeFailed { node, .. }
             | Self::NodeSkipped { node, .. } => Some(node),
-            Self::RunStarted { .. } | Self::RunFinished { .. } => None,
+            Self::RunStarted { .. } | Self::RunBranchCreated { .. } | Self::RunFinished { .. } => {
+                None
+            }
         }
     }
 }

@@ -207,3 +207,49 @@ fn an_in_progress_run_says_so() {
     let report = RunReport::from_events(4, &ids(), &[]);
     assert!(report.to_summary_line().contains("in progress"));
 }
+
+#[test]
+fn a_node_reports_the_diff_it_committed() {
+    let events = timeline(vec![
+        (0, started("build", 1)),
+        (
+            1,
+            EventKind::NodeCommitted {
+                node: "build".into(),
+                sha: "abc".into(),
+                files: 3,
+                insertions: 120,
+                deletions: 4,
+            },
+        ),
+        (
+            2,
+            EventKind::NodeFinished {
+                node: "build".into(),
+                exit_code: 0,
+            },
+        ),
+    ]);
+
+    let report = RunReport::from_events(1, &ids(), &events);
+    let diff = report.nodes[0].diff.expect("a diff summary");
+    assert_eq!((diff.files, diff.insertions, diff.deletions), (3, 120, 4));
+    assert!(report.to_terminal_tree().contains("+120"));
+}
+
+#[test]
+fn a_node_that_committed_nothing_reports_no_diff() {
+    let events = timeline(vec![
+        (0, started("build", 1)),
+        (
+            1,
+            EventKind::NodeFinished {
+                node: "build".into(),
+                exit_code: 0,
+            },
+        ),
+    ]);
+
+    let report = RunReport::from_events(1, &ids(), &events);
+    assert!(report.nodes[0].diff.is_none());
+}

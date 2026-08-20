@@ -212,3 +212,72 @@ fn run_finished_is_recorded() {
     });
     assert_eq!(st.status, Some(RunStatus::Partial));
 }
+
+#[test]
+fn commit_and_merge_events_do_not_change_node_state() {
+    let g = parse_graph(DIAMOND).unwrap();
+    let dag = Dag::build(&g.tasks).unwrap();
+    let mut st = RunState::new(dag.ids());
+
+    st.apply(&started("build"));
+    st.apply(&EventKind::NodeCommitted {
+        node: "build".into(),
+        sha: "abc".into(),
+        files: 2,
+        insertions: 10,
+        deletions: 1,
+    });
+    assert_eq!(
+        st.state("build"),
+        NodeState::Running,
+        "a commit is not completion"
+    );
+
+    st.apply(&EventKind::NodeMerged {
+        node: "build".into(),
+        sha: "def".into(),
+    });
+    assert_eq!(
+        st.state("build"),
+        NodeState::Running,
+        "a merge is not completion"
+    );
+
+    st.apply(&finished("build"));
+    assert_eq!(st.state("build"), NodeState::Done);
+}
+
+#[test]
+fn a_conflict_alone_does_not_fail_a_node() {
+    let g = parse_graph(DIAMOND).unwrap();
+    let dag = Dag::build(&g.tasks).unwrap();
+    let mut st = RunState::new(dag.ids());
+
+    st.apply(&started("build"));
+    st.apply(&EventKind::NodeMergeConflicted {
+        node: "build".into(),
+        paths: vec!["src/lib.rs".into()],
+    });
+    assert_eq!(
+        st.state("build"),
+        NodeState::Running,
+        "the scheduler decides; the conflict event only records what happened"
+    );
+}
+
+#[test]
+fn creating_the_run_branch_touches_no_node() {
+    let g = parse_graph(DIAMOND).unwrap();
+    let dag = Dag::build(&g.tasks).unwrap();
+    let mut st = RunState::new(dag.ids());
+
+    st.apply(&EventKind::RunBranchCreated {
+        branch: "al/run-1".into(),
+        base_sha: "abc".into(),
+    });
+    assert!(
+        dag.ids()
+            .iter()
+            .all(|id| st.state(id) == NodeState::Pending)
+    );
+}
