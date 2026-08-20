@@ -66,7 +66,7 @@ Read `CLAUDE.md` first — it is binding. In particular:
 
 **Why argv, not a shell string:** a prompt routinely contains quotes, newlines, and `$`. Substituting it into a shell string is an injection bug waiting to happen. `{prompt}` is replaced *inside an argument*, and the argument vector is passed to the OS directly.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `tests/provider.rs`:
 
@@ -124,12 +124,12 @@ fn a_provider_without_the_placeholder_is_rendered_unchanged() {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test --test provider`
 Expected: FAIL to compile — `unresolved import assembly_line::provider`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Create `src/provider.rs`:
 
@@ -170,12 +170,12 @@ Add to `src/lib.rs`, in alphabetical position:
 pub mod provider;
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test --test provider`
 Expected: PASS, 5 tests.
 
-- [ ] **Step 5: Commit as its own change**
+- [x] **Step 5: Commit as its own change**
 
 ```bash
 just check
@@ -199,7 +199,7 @@ Return type is the existing `ShellOutcome`, so the scheduler treats agent and sh
 
 **Refactor note:** `run_shell` and `run_command` differ only in how the child is constructed. Extract the shared spawn-and-await logic rather than duplicating the `tokio::select!` block — a second copy of the timeout and cancellation handling will drift.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/exec.rs`:
 
@@ -292,12 +292,12 @@ async fn run_command_reports_a_missing_program_as_an_error_not_an_exit_code() {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test --test exec`
 Expected: FAIL to compile — `run_command` is undefined.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 In `src/exec.rs`, replace the body of `run_shell` and add `run_command`, sharing one supervision path:
 
@@ -393,12 +393,12 @@ async fn supervise(
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test --test exec`
 Expected: PASS, 11 tests (7 existing + 4 new).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 just check
@@ -424,7 +424,7 @@ The integration worktree is named `_integration`. A leading underscore cannot co
 
 `RunMeta`'s new fields are `Option` so existing `meta.json` files (written by M1) still deserialize. Add `#[serde(default)]`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/paths.rs`:
 
@@ -505,12 +505,12 @@ fn rejects_an_id_that_would_collide_with_the_integration_worktree() {
 
 Existing `RunMeta` constructions in `tests/resume.rs` and `src/main.rs` must gain the two new fields; update them in this task so the suite compiles.
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test --test paths --test validate`
 Expected: FAIL to compile — `worktree_root`, `node_worktree`, `ReservedId` undefined.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 In `src/paths.rs`:
 
@@ -591,12 +591,12 @@ In `id_naming_errors`, chain a third iterator:
     invalid.chain(duplicated).chain(reserved)
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test`
 Expected: PASS. Fix any `RunMeta` construction sites the compiler flags.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 just check
@@ -622,7 +622,7 @@ JJ_EDITOR=true jj new
 
 **Critical:** none of the new events change `NodeState`. A node stays `Running` until `NodeFinished` or `NodeFailed`. Add them to `EventKind::node()` where applicable, and to `RunState::apply`'s match as explicit no-ops — do **not** add a `_ => {}` arm, or the next event type will be silently ignored.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/state.rs`:
 
@@ -724,12 +724,12 @@ fn a_node_reports_the_diff_it_committed() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test --test state --test event_log --test report`
 Expected: FAIL to compile — the new variants do not exist.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 In `src/event.rs`, extend `EventKind` and `node()`:
 
@@ -777,12 +777,12 @@ In `src/state.rs`, extend the `apply` match with explicit no-ops and a comment:
 
 In `src/report.rs`, add `DiffSummary`, put it on `NodeProgress` and `NodeReport`, record it in `after_node_event` for `NodeCommitted`, and render it in the tree row (e.g. `+120/-4` in a new column). Keep `state_glyph` and column alignment intact.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 just check
@@ -814,7 +814,7 @@ a run id, so the scheduler owns naming (via `paths::` and the two
 
 `seed_from` is the directory `copy` paths resolve against — the CLI's working directory, so a cloned run behaves the same. `seeded` carries the relative paths, which `commit` hands to `git::commit_all_except`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `tests/workspace.rs`:
 
@@ -994,12 +994,12 @@ async fn discarding_a_workspace_removes_it_but_keeps_the_branch() {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test --test workspace`
 Expected: FAIL to compile — `unresolved import assembly_line::workspace`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Create `src/workspace.rs`. Keep it declarative; `create` is: validate seeds exist → add worktree → copy seeds → return.
 
@@ -1100,12 +1100,12 @@ pub async fn discard(repo: impl AsRef<Path>, ws: &NodeWorkspace) -> anyhow::Resu
 
 Add `pub mod workspace;` to `src/lib.rs`.
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test --test workspace`
 Expected: PASS, 8 tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 just check
@@ -1152,7 +1152,7 @@ JJ_EDITOR=true jj new
 
 **Known limitation to record, not fix:** a merge lands in the integration worktree while shell nodes may be running there. M3 routes merges through the approval queue, which serializes them against everything else. Note this in the spec under "Accepted risks"; do not attempt a fix here.
 
-- [ ] **Step 1: Write the fake agents**
+- [x] **Step 1: Write the fake agents**
 
 Create `tests/fixtures/fake-agent.sh` (mark executable, `chmod +x`):
 
@@ -1196,7 +1196,7 @@ set -euo pipefail
 printf 'written by %s\n' "${2:-unknown}" > shared.txt
 ```
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 Create `tests/agent_nodes.rs`:
 
@@ -1482,12 +1482,12 @@ async fn a_missing_provider_binary_fails_the_node_with_a_useful_message() {
 }
 ```
 
-- [ ] **Step 3: Run the test to verify it fails**
+- [x] **Step 3: Run the test to verify it fails**
 
 Run: `cargo test --test agent_nodes`
 Expected: FAIL — `RunOpts` has no `repo` field, and agent nodes still report `AGENT_UNSUPPORTED`.
 
-- [ ] **Step 4: Write the implementation**
+- [x] **Step 4: Write the implementation**
 
 In `src/scheduler.rs`:
 
@@ -1511,7 +1511,7 @@ enum NodeResult {
 
 In `src/main.rs`, populate the new `RunOpts` fields: `repo: Some(repo_root.clone())` and `seed_from: std::env::current_dir()?`. Record `run_branch` and `base_sha` in `RunMeta` once the branch exists — write meta again after the run branch is created, since the id is not known before.
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test --test agent_nodes`
 Expected: PASS, 9 tests.
@@ -1521,7 +1521,7 @@ Then remove the obsolete M1 test `an_agent_node_fails_with_a_clear_not_yet_suppo
 Run: `cargo test`
 Expected: PASS across all files.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 just check
@@ -1543,7 +1543,7 @@ JJ_EDITOR=true jj new
 
 `gc` removes worktree directories under `~/.assembly/wt/` for runs whose state directory no longer exists or that are older than the given duration, then runs `git worktree prune`. Successful nodes already discard their own worktrees; `gc` collects what failures left behind.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/cli.rs`:
 
@@ -1617,21 +1617,21 @@ fn meta_records_the_run_branch_only_when_the_graph_has_agent_nodes() {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test --test cli`
 Expected: FAIL — `gc` is not a subcommand.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Add the `Gc` variant to `cli::Command`, and a handler in `main.rs` that lists `~/.assembly/wt/*`, matches each against `<git-root>/.assembly/runs/<id>`, removes orphans (respecting `--dry-run`), and calls `git::prune_worktrees`.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test`
 Expected: PASS.
 
-- [ ] **Step 5: Verify end to end by hand**
+- [x] **Step 5: Verify end to end by hand**
 
 ```bash
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/tmp/assembly-line-target}
@@ -1665,7 +1665,7 @@ git status --porcelain   # must be empty: your tree was never touched
 
 Expected: exit 0; `status` shows both nodes done with a diff stat on `write-docs`; `al/run-1` exists with the agent's commit merged; the working tree is clean and still on the original branch.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 just check
@@ -1681,7 +1681,7 @@ JJ_EDITOR=true jj new
 - Modify: `docs/superpowers/specs/2026-08-15-assembly-line.md`
 - Create: `docs/superpowers/plans/2026-08-15-assembly-line-m2.md` progress notes at the bottom of this file
 
-- [ ] **Step 1: Record what shipped and what did not**
+- [x] **Step 1: Record what shipped and what did not**
 
 In the spec:
 
@@ -1690,7 +1690,7 @@ In the spec:
 - Under "Accepted risks", add: *an agent node with no `verify` and no gate has nothing checking its output in M2; `validate` warns.*
 - Confirm the branch-naming section matches the implementation.
 
-- [ ] **Step 2: Final verification**
+- [x] **Step 2: Final verification**
 
 ```bash
 just check
@@ -1699,7 +1699,7 @@ just verify-stack
 
 Expected: every change reports `ok`; no `FAILED`.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 JJ_EDITOR=true jj describe -m "docs: record M2 scope, limitations, and accepted risks"
@@ -1709,15 +1709,83 @@ JJ_EDITOR=true jj describe -m "docs: record M2 scope, limitations, and accepted 
 
 ## M2 Definition of Done
 
-- [ ] `just check` clean: tests, clippy pedantic, formatting.
-- [ ] `just verify-stack` reports `ok` for every change.
-- [ ] An agent node runs a provider command in its own worktree and its work reaches the run branch.
-- [ ] A prompt containing quotes, `$`, and `;` reaches the agent as one argument, unexpanded.
-- [ ] A dependent node sees its upstream's merged work.
-- [ ] A failing agent fails the node and **keeps** its worktree; a successful one discards it.
-- [ ] An agent that changes nothing succeeds without a commit or merge.
-- [ ] Two agents touching the same file produce a recorded conflict and one failed node.
-- [ ] Seeded `copy` files reach the agent and never reach a branch.
-- [ ] A shell-only graph creates no branch and no worktrees — M1 behaviour is unchanged.
-- [ ] After any run, `git status --porcelain` in the target repo is empty and HEAD is unmoved.
-- [ ] No `AgentRunner` trait exists.
+- [x] `just check` clean: tests, clippy pedantic, formatting.
+- [x] `just verify-stack` reports `ok` for every change.
+- [x] An agent node runs a provider command in its own worktree and its work reaches the run branch.
+- [x] A prompt containing quotes, `$`, and `;` reaches the agent as one argument, unexpanded.
+- [x] A dependent node sees its upstream's merged work.
+- [x] A failing agent fails the node and **keeps** its worktree; a successful one discards it.
+- [x] An agent that changes nothing succeeds without a commit or merge.
+- [x] Two agents touching the same file produce a recorded conflict and one failed node.
+- [x] Seeded `copy` files reach the agent and never reach a branch.
+- [x] A shell-only graph creates no branch and no worktrees — M1 behaviour is unchanged.
+- [x] After any run, `git status --porcelain` in the target repo is empty and HEAD is unmoved.
+- [x] No `AgentRunner` trait exists.
+
+---
+
+## What shipped
+
+Every task above, plus two deviations recorded here rather than left implicit.
+
+### The stack
+
+Grouped by module, bottom-up, so each change is reviewable on its own. Every
+one builds, tests, lints, and formats independently (`just verify-stack`), and
+the test count climbs at each of them — 115 before M2, 174 after.
+
+| Change | Adds |
+|---|---|
+| `feat(provider)` | rendering a provider command with the node's prompt |
+| `feat(exec)` | `run_command`, argv-style, sharing one supervision path with `run_shell` |
+| `feat(paths)` | repo-scoped worktree locations, the root override, run-branch metadata |
+| `feat(event)` | commit / merge / conflict events, and the diff column they feed |
+| `feat(git)` | checking out an existing branch, and deleting a superseded one |
+| `feat(workspace)` | per-node worktrees: seed, commit, discard, supersede |
+| `feat(scheduler)` | agent-node execution and merge serialization |
+| `feat(cli)` | `gc` |
+
+The two `git`/`workspace` changes sit below `scheduler` because they are what
+it is built out of. Reading them in order is the intended way in: primitives,
+then the sandbox they compose into, then the loop that drives it.
+
+### Worktree paths are keyed by repository, not by run id alone
+
+The plan specified `~/.assembly/wt/<run-id>/<node>/`. Run ids restart at 1 in
+every repository, so the first run of two different repositories would have
+claimed the same directory and fought over it. The layout is now:
+
+```
+~/.assembly/wt/<repo-slug>/<run-id>/<node>/
+~/.assembly/wt/<repo-slug>/repo          marker naming the repository
+```
+
+`<repo-slug>` is the repository's directory name plus a 64-bit FNV-1a hash of
+its absolute path — written out rather than taken from `DefaultHasher`, whose
+output is explicitly unstable across Rust releases, which would have orphaned
+every worktree on disk at a toolchain upgrade. The hash cannot be inverted, so
+the `repo` marker is what lets `gc` collect a repository's leftovers without
+being run from inside it.
+
+`$ASSEMBLY_WORKTREE_ROOT` overrides the root. It exists because `gc` is
+inherently global — it walks every repository it can see — so tests sharing one
+default root collected each other's work mid-run.
+
+### Resume after a run died inside an agent node
+
+Not in the plan, but `resume` is M1 behaviour that agent nodes would otherwise
+have broken: the integration worktree, the node worktree, and the node branch
+all still exist, and git refuses to reuse any of those names.
+
+- `prepare_run_branch` re-opens an existing integration worktree, and re-checks
+  out the run branch if only the checkout was lost. `RunBranchCreated` is
+  emitted only when the branch is genuinely new.
+- `workspace::create` clears a previous attempt — prune, remove the checkout,
+  delete the branch — before creating the new one. Recorded as accepted risk 7
+  in the spec: a failed attempt is inspectable only until the next one starts.
+
+### Deferred, as planned
+
+Retries, `verify`, gates, and conflict resolution are M3. A conflict fails the
+node, after `git merge --abort` returns the integration worktree to a clean
+state so the next merge is not poisoned by it.

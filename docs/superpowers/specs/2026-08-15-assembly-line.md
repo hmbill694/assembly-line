@@ -107,8 +107,14 @@ inside, and a bundle back.
 ## Isolation between nodes
 
 Each agent node runs in its own `git worktree` at
-`~/.assembly/wt/<run-id>/<node>/`, on a branch off the run branch. The target
-repository is never modified and needs no `.gitignore` entry.
+`~/.assembly/wt/<repo-slug>/<run-id>/<node>/`, on a branch off the run branch.
+The target repository is never modified and needs no `.gitignore` entry.
+
+Run ids restart at 1 in every repository, so the path is keyed by repository as
+well as run: `<repo-slug>` is the repository's own directory name plus a stable
+hash of its absolute path, and a `repo` marker file beside it records the full
+path so `gc` can collect a repository's leftovers without being run from it.
+`$ASSEMBLY_WORKTREE_ROOT` moves the whole tree off `$HOME`.
 
 The run branch is also checked out into a worktree of its own — the
 *integration worktree* — so merges never touch the branch you have checked out.
@@ -311,7 +317,8 @@ assembly resume <run-id>
 assembly status [run-id]         node tree, timings, costs
 assembly logs <run-id> <node> [-f]
 assembly doctor                  smoke-test each configured provider
-assembly gc [--older-than 7d]    prune worktrees and stale run dirs
+assembly gc [--older-than 7d] [--dry-run]
+                                 prune worktrees left by failed nodes
 ```
 
 ## Stack
@@ -335,11 +342,11 @@ going stale as agent CLIs change their flags.
 
 | | Scope |
 |---|---|
-| **M1** | Shell-only parallel DAG: parse, validate, `--jobs`, `resource`, per-node logs, event log, resume-by-replay, skip-subtree failure |
-| **M2** | git worktrees, provider invocation, merge into run branch, `copy` seeding |
+| **M1** ✅ | Shell-only parallel DAG: parse, validate, `--jobs`, `resource`, per-node logs, event log, resume-by-replay, skip-subtree failure |
+| **M2** ✅ | git worktrees, provider invocation, merge into run branch, `copy` seeding |
 | **M3** | Supervision gates, revise loop, `verify`, retries, conflict-resolution agent, caps |
 | **M4** | Hooks, PR delivery, `status` / `logs` / `doctor` / `init` polish |
-| **M5** | Clone, push-per-node, preflight, `gc` |
+| **M5** | Clone, push-per-node, preflight, `gc` for remote branches |
 
 ## Accepted risks
 
@@ -349,3 +356,14 @@ going stale as agent CLIs change their flags.
 3. Shipped default provider configs will go stale as agent CLIs change flags.
    `doctor` detects it, but only if run.
 4. Copied secrets are git-safe, not log-safe (see Seeding worktrees).
+5. A merge into the run branch lands in the integration worktree while an
+   unrelated shell node may be running there, so that node can observe the tree
+   changing under it. M3 routes merges through the approval queue, which
+   serializes them against everything else. Merges are already serialized
+   against each other.
+6. An agent node with no `verify` and no gate has nothing checking its output
+   in M2 — it is committed and merged on exit zero alone. `validate` warns
+   (risk 1); M3's `verify` and gates are what actually close it.
+7. Retrying an agent node discards the previous attempt's branch and worktree.
+   That is what makes `resume` work after a run died mid-agent, but it means a
+   failed attempt is only inspectable until the next one starts.
