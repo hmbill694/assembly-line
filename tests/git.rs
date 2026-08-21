@@ -340,3 +340,82 @@ async fn a_failed_git_command_carries_gits_own_message() {
         .to_string();
     assert!(!err.is_empty());
 }
+
+#[tokio::test]
+async fn an_existing_branch_can_be_checked_out_into_a_fresh_worktree() {
+    // A run's branch outlives its checkout whenever `gc` removes the directory
+    // or a crash orphans it; resuming has to be able to pick the branch back up.
+    let fx = Fixture::new().await;
+    let node = fx.worktree("first", "al/run-1-node").await;
+    let sha = write_and_commit(&node, "work.txt", "done\n", "node work").await;
+    remove_worktree(&fx.repo, &node).await.unwrap();
+
+    let again = fx.worktrees.join("again");
+    git::add_worktree_for_existing_branch(&fx.repo, &again, "al/run-1-node")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        head_sha(&again).await.unwrap(),
+        sha,
+        "lost the branch's work"
+    );
+    assert_eq!(
+        std::fs::read_to_string(again.join("work.txt")).unwrap(),
+        "done\n"
+    );
+}
+
+#[tokio::test]
+async fn checking_out_a_branch_that_is_already_in_a_worktree_is_refused() {
+    // Two checkouts of one branch would let two nodes commit over each other.
+    let fx = Fixture::new().await;
+    fx.worktree("held", "al/run-1-node").await;
+
+    assert!(
+        git::add_worktree_for_existing_branch(
+            &fx.repo,
+            fx.worktrees.join("second"),
+            "al/run-1-node"
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_branch_removes_it_even_though_it_was_never_merged() {
+    // A superseded attempt is unmerged by definition; a safe delete would
+    // refuse it and the retry could never reuse the name.
+    let fx = Fixture::new().await;
+    let node = fx.worktree("node", "al/run-1-node").await;
+    write_and_commit(&node, "work.txt", "half\n", "partial work").await;
+    remove_worktree(&fx.repo, &node).await.unwrap();
+
+    assert!(git::branch_exists(&fx.repo, "al/run-1-node").await.unwrap());
+    git::delete_branch(&fx.repo, "al/run-1-node").await.unwrap();
+    assert!(!git::branch_exists(&fx.repo, "al/run-1-node").await.unwrap());
+}
+
+#[tokio::test]
+async fn deleting_a_branch_that_is_checked_out_is_refused() {
+    let fx = Fixture::new().await;
+    fx.worktree("node", "al/run-1-node").await;
+
+    let err = git::delete_branch(&fx.repo, "al/run-1-node")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("al/run-1-node"), "{err}");
+    assert!(git::branch_exists(&fx.repo, "al/run-1-node").await.unwrap());
+}
+
+#[tokio::test]
+async fn deleting_a_branch_that_does_not_exist_is_an_error_not_a_silent_success() {
+    let fx = Fixture::new().await;
+    assert!(
+        git::delete_branch(&fx.repo, "al/run-1-ghost")
+            .await
+            .is_err()
+    );
+}

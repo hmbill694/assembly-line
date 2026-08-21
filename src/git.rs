@@ -136,6 +136,44 @@ pub async fn add_worktree(
     .map(|_| ())
 }
 
+/// Check an existing branch out into a new worktree, rather than creating the
+/// branch. Used when a run's branch outlived its checkout — `gc` removed it,
+/// or a crash did.
+pub async fn add_worktree_for_existing_branch(
+    repo: impl AsRef<Path>,
+    path: impl AsRef<Path>,
+    branch: &str,
+) -> anyhow::Result<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let path_arg = path.to_string_lossy().into_owned();
+
+    run_expecting_success(
+        repo,
+        &["worktree", "add", &path_arg, branch],
+        &format!("worktree add {branch}"),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Delete a branch whether or not it was merged.
+///
+/// Only ever called on a branch assembly-line created for a node attempt that
+/// a later attempt supersedes; the force is what makes an unmerged failed
+/// attempt collectable.
+pub async fn delete_branch(repo: impl AsRef<Path>, branch: &str) -> anyhow::Result<()> {
+    run_expecting_success(
+        repo,
+        &["branch", "-D", branch],
+        &format!("branch -D {branch}"),
+    )
+    .await
+    .map(|_| ())
+}
+
 /// Remove a worktree and its administrative entry. Forcing is deliberate: the
 /// worktree is assembly-line's to discard, and it routinely holds untracked
 /// build output.
