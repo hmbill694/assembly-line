@@ -235,6 +235,58 @@ async fn a_failing_agent_preserves_its_work_on_a_branch_and_leaves_no_worktree()
     );
 }
 
+/// A gate with nobody at it defers rather than blocks: the node merges on its
+/// own and is recorded as waiting to be looked at. A run never stalls.
+#[tokio::test]
+async fn a_gated_node_defers_its_gate_instead_of_blocking() {
+    let h = Harness::new().await;
+    let src = format!(
+        "{}\n[[task]]\nid = \"work\"\nkind = \"agent\"\nprovider = \"fake\"\n\
+         prompt = \"x\"\nsupervise = \"on-complete\"\n",
+        provider_block("fake-agent.sh", "a")
+    );
+
+    let out = h.run(&src, 1).await;
+
+    assert_eq!(out.status, RunStatus::Ok);
+    assert_eq!(out.state.state("work"), NodeState::Done);
+    assert!(out.has(|k| matches!(k, EventKind::NodeMerged { .. })));
+    assert!(out.has(|k| matches!(k, EventKind::NodeAwaitingReview { node } if node == "work")));
+}
+
+/// The gate is the node's own declaration, so an ungated node never enters the
+/// inbox — otherwise every shell node would need reviewing.
+#[tokio::test]
+async fn an_ungated_node_is_never_awaiting_review() {
+    let h = Harness::new().await;
+    let src = format!(
+        "{}\n[[task]]\nid = \"work\"\nkind = \"agent\"\nprovider = \"fake\"\nprompt = \"x\"\n",
+        provider_block("fake-agent.sh", "a")
+    );
+
+    let out = h.run(&src, 1).await;
+
+    assert!(out.has(|k| matches!(k, EventKind::NodeMerged { .. })));
+    assert!(!out.has(|k| matches!(k, EventKind::NodeAwaitingReview { .. })));
+}
+
+/// A failed node is awaiting a fix, not a review — it never merged, so there
+/// is nothing at the gate to accept.
+#[tokio::test]
+async fn a_gated_node_that_failed_is_not_awaiting_review() {
+    let h = Harness::new().await;
+    let src = format!(
+        "{}\n[[task]]\nid = \"broken\"\nkind = \"agent\"\nprovider = \"fake\"\n\
+         prompt = \"x\"\nsupervise = \"on-complete\"\n",
+        provider_block("failing-agent.sh", "a")
+    );
+
+    let out = h.run(&src, 1).await;
+
+    assert_eq!(out.state.state("broken"), NodeState::Failed);
+    assert!(!out.has(|k| matches!(k, EventKind::NodeAwaitingReview { .. })));
+}
+
 /// The point of publishing: a failed node's work leaves the machine that ran
 /// it. This is what a container or a k8s Job will rely on in M4.
 #[tokio::test]

@@ -136,6 +136,9 @@ impl NodeProgress {
             | EventKind::NodeBranchPublished { .. }
             | EventKind::NodeMerged { .. }
             | EventKind::NodeMergeConflicted { .. }
+            | EventKind::NodeAwaitingReview { .. }
+            | EventKind::NodeApproved { .. }
+            | EventKind::NodeRevisionRequested { .. }
             | EventKind::RunFinished { .. } => self,
         }
     }

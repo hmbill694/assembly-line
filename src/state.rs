@@ -66,12 +66,17 @@ impl RunState {
             // finishes or fails. Listed one by one rather than behind a
             // catch-all arm, so a new event type is a compile error here
             // instead of a silent omission.
+            // Review is a second axis, orthogonal to execution: a node is Done
+            // because it ran, whether or not anyone has looked at it yet.
             EventKind::RunStarted { .. }
             | EventKind::RunBranchCreated { .. }
             | EventKind::NodeCommitted { .. }
             | EventKind::NodeBranchPublished { .. }
             | EventKind::NodeMerged { .. }
-            | EventKind::NodeMergeConflicted { .. } => None,
+            | EventKind::NodeMergeConflicted { .. }
+            | EventKind::NodeAwaitingReview { .. }
+            | EventKind::NodeApproved { .. }
+            | EventKind::NodeRevisionRequested { .. } => None,
             EventKind::RunFinished { status } => {
                 self.status = Some(*status);
                 None

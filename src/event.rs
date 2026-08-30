@@ -82,6 +82,26 @@ pub enum EventKind {
         node: String,
         because: String,
     },
+    /// A gated node finished without a human at the gate, so the gate was
+    /// deferred: the node merged on `verify` alone and is waiting to be
+    /// reviewed.
+    ///
+    /// Recorded rather than derived from the graph's `supervise` field on
+    /// purpose — the graph file may have changed since the run, and the log is
+    /// what actually happened.
+    NodeAwaitingReview {
+        node: String,
+    },
+    /// A gated node's work was accepted.
+    NodeApproved {
+        node: String,
+    },
+    /// A gated node's work was sent back. `feedback` is what the next round's
+    /// prompt carries.
+    NodeRevisionRequested {
+        node: String,
+        feedback: String,
+    },
     RunFinished {
         status: RunStatus,
     },
@@ -99,7 +119,10 @@ impl EventKind {
             | Self::NodeMergeConflicted { node, .. }
             | Self::NodeFinished { node, .. }
             | Self::NodeFailed { node, .. }
-            | Self::NodeSkipped { node, .. } => Some(node),
+            | Self::NodeSkipped { node, .. }
+            | Self::NodeAwaitingReview { node }
+            | Self::NodeApproved { node }
+            | Self::NodeRevisionRequested { node, .. } => Some(node),
             Self::RunStarted { .. } | Self::RunBranchCreated { .. } | Self::RunFinished { .. } => {
                 None
             }
