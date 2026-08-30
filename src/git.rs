@@ -209,6 +209,25 @@ pub async fn push_branch(repo: impl AsRef<Path>, remote: &str, branch: &str) -> 
     .map(|_| ())
 }
 
+/// Push an explicit `<src>:<dst>` refspec.
+///
+/// How work lands directly on a base branch: the remote's ref is advanced to
+/// the run branch. Deliberately not forced — a rejected non-fast-forward means
+/// the base moved and this work has not seen it, which is worth stopping for.
+pub async fn push_refspec(
+    repo: impl AsRef<Path>,
+    remote: &str,
+    refspec: &str,
+) -> anyhow::Result<()> {
+    run_expecting_success(
+        repo,
+        &["push", remote, refspec],
+        &format!("push {remote} {refspec}"),
+    )
+    .await
+    .map(|_| ())
+}
+
 /// Remove a worktree and its administrative entry. Forcing is deliberate: the
 /// worktree is assembly-line's to discard, and it routinely holds untracked
 /// build output.

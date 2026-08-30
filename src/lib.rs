@@ -3,6 +3,7 @@
 pub mod cli;
 pub mod config;
 pub mod dag;
+pub mod delivery;
 pub mod event;
 pub mod exec;
 pub mod git;

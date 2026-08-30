@@ -6,7 +6,7 @@ use assembly_line::report::RunReport;
 use assembly_line::review::{ReviewInbox, ReviewState};
 use assembly_line::scheduler::{RunOpts, execute};
 use assembly_line::state::RunState;
-use assembly_line::{config, dag, git, paths};
+use assembly_line::{config, dag, delivery, git, paths};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -245,9 +245,54 @@ async fn start_new_run(graph_path: PathBuf, jobs: usize) -> ExitCode {
         Ok((status, state)) => {
             record_run_branch_in_meta(&run, &meta);
             print_run_outcome(&run, &graph_path, status, &state);
+            deliver_if_complete(&run, &graph, status).await;
             println!("state: {}", run.dir.display());
             exit_code_for(status)
         }
+    }
+}
+
+/// Hand a finished run's branch on, once the whole graph succeeded.
+///
+/// A partial run still leaves a real branch, but opening a pull request for
+/// work that did not finish is noise — the branch name is printed instead, so
+/// acting on it stays a decision rather than a default.
+async fn deliver_if_complete(run: &RunPaths, graph: &config::Graph, status: RunStatus) {
+    let Some(run_branch) = paths::read_meta(run).ok().and_then(|m| m.run_branch) else {
+        return; // A shell-only graph creates no branch to deliver.
+    };
+
+    if status != RunStatus::Ok {
+        println!("branch: {run_branch} (not delivered — the run did not finish)");
+        return;
+    }
+
+    let Ok(repo) = enclosing_repo_root() else {
+        return;
+    };
+    // Never an assumed `main`: the base is what the user was standing on. The
+    // repository's own HEAD is untouched by a run, so it still says so.
+    let base = match graph.delivery.base.clone() {
+        Some(declared) => Some(declared),
+        None => git::current_branch(&repo).await.ok().flatten(),
+    };
+    let Some(base) = base else {
+        eprintln!("warn: could not tell what branch to deliver onto; branch is {run_branch}");
+        return;
+    };
+
+    let delivered = delivery::deliver(
+        &repo,
+        &graph.delivery,
+        assembly_line::workspace::DEFAULT_REMOTE,
+        &run_branch,
+        &base,
+    )
+    .await;
+
+    match delivered {
+        Ok(outcome) => println!("{outcome}"),
+        Err(e) => eprintln!("warn: delivering {run_branch}: {e}"),
     }
 }
 

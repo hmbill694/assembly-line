@@ -9,6 +9,8 @@ pub struct Graph {
     #[serde(default)]
     pub workspace: Workspace,
     #[serde(default)]
+    pub delivery: Delivery,
+    #[serde(default)]
     pub providers: BTreeMap<String, Provider>,
     #[serde(rename = "task", default)]
     pub tasks: Vec<Task>,
@@ -21,6 +23,30 @@ pub struct Graph {
 pub struct Workspace {
     #[serde(default)]
     pub copy: Vec<String>,
+}
+
+/// What becomes of the run branch once the graph finishes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeliveryMode {
+    /// Push the run branch and open a pull request against `base`.
+    #[default]
+    Pr,
+    /// Fast-forward `base` on the remote to the run branch. For work you
+    /// trust to land unreviewed.
+    Push,
+    /// Leave the branch where it is.
+    None,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Delivery {
+    #[serde(default)]
+    pub mode: DeliveryMode,
+    /// What the work lands on. Defaults to the branch the run started from —
+    /// never an assumed `main`.
+    pub base: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
