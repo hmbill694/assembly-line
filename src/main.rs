@@ -6,7 +6,7 @@ use assembly_line::report::RunReport;
 use assembly_line::review::{ReviewInbox, ReviewState};
 use assembly_line::scheduler::{RunOpts, execute};
 use assembly_line::state::RunState;
-use assembly_line::{config, dag, delivery, git, paths};
+use assembly_line::{config, dag, delivery, gc, git, paths};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -569,102 +569,9 @@ async fn revise_node_of_run(run_id: u64, node: String, feedback: Option<String>)
     }
 }
 
-/// A run's worktree directory that nothing needs any more.
-struct StaleWorktree {
-    path: PathBuf,
-    because: String,
-}
-
-/// Directories directly under `dir` whose names are run ids.
-fn run_directories(dir: &Path) -> Vec<(u64, PathBuf)> {
-    std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| {
-            let id = entry.file_name().to_str()?.parse::<u64>().ok()?;
-            Some((id, entry.path()))
-        })
-        .collect()
-}
-
-fn subdirectories(dir: &Path) -> Vec<PathBuf> {
-    std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .collect()
-}
-
-/// How long ago `path` was last written, or `None` if that cannot be read.
-fn idle_time(path: &Path) -> Option<std::time::Duration> {
-    std::fs::metadata(path)
-        .and_then(|meta| meta.modified())
-        .ok()
-        .and_then(|written| written.elapsed().ok())
-}
-
-/// Why a run's worktree directory is collectable, or `None` while it is still
-/// the record of a run that exists.
+/// Report what `gc` would collect, or collect it.
 ///
-/// Successful nodes discard their own worktrees; what `gc` finds is what
-/// failures deliberately kept, plus anything a crash orphaned.
-fn reason_to_collect(
-    repo: Option<&Path>,
-    run_id: u64,
-    path: &Path,
-    keep_for: Option<std::time::Duration>,
-) -> Option<String> {
-    // Age only collects when the user asked for it; without `--older-than`, a
-    // worktree whose run still exists is still wanted however old it is.
-    let too_old = || {
-        let keep_for = keep_for?;
-        let idle = idle_time(path)?;
-        (idle > keep_for).then(|| {
-            format!(
-                "untouched for {}",
-                humantime::format_duration(std::time::Duration::from_secs(idle.as_secs()))
-            )
-        })
-    };
-
-    match repo {
-        None => Some("its repository is unknown".to_string()),
-        Some(repo) if !repo.exists() => Some(format!("{} no longer exists", repo.display())),
-        Some(repo) if !paths::runs_root(repo).join(run_id.to_string()).is_dir() => {
-            Some(format!("run {run_id} has no state directory"))
-        }
-        Some(_) => too_old(),
-    }
-}
-
-/// Every collectable worktree directory, paired with the repository it belongs
-/// to so the caller can prune that repository's worktree list afterwards.
-fn collectable_worktrees(
-    keep_for: Option<std::time::Duration>,
-) -> Vec<(Option<PathBuf>, Vec<StaleWorktree>)> {
-    let Some(root) = paths::worktrees_root() else {
-        return Vec::new();
-    };
-
-    subdirectories(&root)
-        .into_iter()
-        .map(|per_repo| {
-            let repo = paths::repository_owning_worktrees(&per_repo);
-            let stale = run_directories(&per_repo)
-                .into_iter()
-                .filter_map(|(run_id, path)| {
-                    reason_to_collect(repo.as_deref(), run_id, &path, keep_for)
-                        .map(|because| StaleWorktree { path, because })
-                })
-                .collect();
-            (repo, stale)
-        })
-        .collect()
-}
-
+/// Policy lives in [`assembly_line::gc`]; this is the printing half.
 async fn remove_stale_worktrees(older_than: Option<String>, dry_run: bool) -> ExitCode {
     let keep_for = match older_than
         .as_deref()
@@ -675,13 +582,13 @@ async fn remove_stale_worktrees(older_than: Option<String>, dry_run: bool) -> Ex
         Err(e) => return fail_with_usage_error(e),
     };
 
-    let found = collectable_worktrees(keep_for);
-    let mut removed = 0usize;
-
-    for (repo, stale) in &found {
-        for entry in stale {
+    let found = gc::collectable(keep_for);
+    found
+        .iter()
+        .flat_map(|leftovers| &leftovers.stale)
+        .for_each(|entry| {
             println!(
-                "{} {} — {}",
+                "{} {} \u{2014} {}",
                 match dry_run {
                     true => "would remove",
                     false => "removing",
@@ -689,36 +596,20 @@ async fn remove_stale_worktrees(older_than: Option<String>, dry_run: bool) -> Ex
                 entry.path.display(),
                 entry.because
             );
-            if !dry_run {
-                if let Err(e) = std::fs::remove_dir_all(&entry.path) {
-                    eprintln!("warn: could not remove {}: {e}", entry.path.display());
-                    continue;
-                }
-                removed += 1;
-            }
-        }
+        });
 
-        // Git still lists a worktree whose directory is gone, and will refuse
-        // to reuse the path until it is told otherwise.
-        if let Some(repo) = repo
-            && !dry_run
-            && !stale.is_empty()
-            && repo.exists()
-            && let Err(e) = git::prune_worktrees(repo).await
-        {
-            eprintln!("warn: could not prune worktrees in {}: {e}", repo.display());
-        }
-    }
-
-    let total: usize = found.iter().map(|(_, stale)| stale.len()).sum();
+    let total = gc::total(&found);
     match (dry_run, total) {
         (_, 0) => println!("nothing to collect"),
         (true, total) => println!("{total} worktree(s) would be removed"),
-        (false, _) => println!("removed {removed} worktree(s)"),
+        (false, _) => {
+            let removed = gc::remove(&found).await;
+            removed.warnings.iter().for_each(|w| eprintln!("warn: {w}"));
+            println!("removed {} worktree(s)", removed.directories);
+        }
     }
     ExitCode::SUCCESS
 }
-
 fn print_node_log(run_id: u64, node: &str, follow: bool) -> ExitCode {
     let run = match locate_run(Some(run_id)) {
         Ok((run, _)) => run,

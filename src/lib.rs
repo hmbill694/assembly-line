@@ -6,6 +6,7 @@ pub mod dag;
 pub mod delivery;
 pub mod event;
 pub mod exec;
+pub mod gc;
 pub mod git;
 pub mod paths;
 pub mod provider;

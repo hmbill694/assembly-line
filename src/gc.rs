@@ -1,0 +1,170 @@
+//! Collecting what runs leave behind.
+//!
+//! Jobs discard their own checkouts, so what is found here is narrow: the
+//! integration worktree a run keeps for as long as it exists, plus anything a
+//! run that died mid-node orphaned. That makes the policy small — **a run's
+//! worktrees are wanted exactly as long as the run is** — and `--older-than`
+//! exists only for the leftovers of runs whose state was never cleaned up.
+//!
+//! Deciding and doing are separate: [`collectable`] reports what could go and
+//! why, which is what `--dry-run` prints, and [`remove`] is the only part that
+//! deletes anything.
+
+use crate::git;
+use crate::paths;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// A run's worktree directory that nothing needs any more.
+#[derive(Debug, Clone)]
+pub struct StaleWorktree {
+    pub path: PathBuf,
+    /// Why it is collectable, in the words `gc` prints.
+    pub because: String,
+}
+
+/// One repository's leftovers, paired with the repository itself so its
+/// worktree list can be pruned after the directories go.
+#[derive(Debug, Clone)]
+pub struct RepositoryLeftovers {
+    /// `None` when the marker naming the repository is missing, which by
+    /// itself makes everything under it collectable.
+    pub repo: Option<PathBuf>,
+    pub stale: Vec<StaleWorktree>,
+}
+
+/// Directories directly under `dir` whose names are run ids.
+fn run_directories(dir: &Path) -> Vec<(u64, PathBuf)> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let id = entry.file_name().to_str()?.parse::<u64>().ok()?;
+            Some((id, entry.path()))
+        })
+        .collect()
+}
+
+fn subdirectories(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect()
+}
+
+/// How long ago `path` was last written, or `None` if that cannot be read.
+fn idle_time(path: &Path) -> Option<Duration> {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|written| written.elapsed().ok())
+}
+
+/// Why a run's worktree directory is collectable, or `None` while the run it
+/// belongs to still exists.
+#[must_use]
+pub fn reason_to_collect(
+    repo: Option<&Path>,
+    run_id: u64,
+    path: &Path,
+    keep_for: Option<Duration>,
+) -> Option<String> {
+    // Age only collects when the user asked for it: a worktree whose run still
+    // exists is still wanted however old it is.
+    let too_old = || {
+        let keep_for = keep_for?;
+        let idle = idle_time(path)?;
+        (idle > keep_for).then(|| {
+            format!(
+                "untouched for {}",
+                humantime::format_duration(Duration::from_secs(idle.as_secs()))
+            )
+        })
+    };
+
+    match repo {
+        None => Some("its repository is unknown".to_string()),
+        Some(repo) if !repo.exists() => Some(format!("{} no longer exists", repo.display())),
+        Some(repo) if !paths::runs_root(repo).join(run_id.to_string()).is_dir() => {
+            Some(format!("run {run_id} has no state directory"))
+        }
+        Some(_) => too_old(),
+    }
+}
+
+/// Every collectable worktree directory, grouped by the repository it belongs
+/// to. Reports only — nothing is removed.
+#[must_use]
+pub fn collectable(keep_for: Option<Duration>) -> Vec<RepositoryLeftovers> {
+    let Some(root) = paths::worktrees_root() else {
+        return Vec::new();
+    };
+
+    subdirectories(&root)
+        .into_iter()
+        .map(|per_repo| {
+            let repo = paths::repository_owning_worktrees(&per_repo);
+            RepositoryLeftovers {
+                stale: run_directories(&per_repo)
+                    .into_iter()
+                    .filter_map(|(run_id, path)| {
+                        reason_to_collect(repo.as_deref(), run_id, &path, keep_for)
+                            .map(|because| StaleWorktree { path, because })
+                    })
+                    .collect(),
+                repo,
+            }
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn total(found: &[RepositoryLeftovers]) -> usize {
+    found.iter().map(|leftovers| leftovers.stale.len()).sum()
+}
+
+/// What a collection actually managed to do.
+#[derive(Debug, Default)]
+pub struct Removed {
+    pub directories: usize,
+    /// Non-fatal problems, phrased for the user. A worktree that resists
+    /// removal is worth saying so about, not worth failing the command over.
+    pub warnings: Vec<String>,
+}
+
+/// Delete the directories in `found`, then prune each repository's worktree
+/// list.
+///
+/// Git still lists a worktree whose directory is gone and will refuse to reuse
+/// the path until told otherwise, so the prune is not optional.
+pub async fn remove(found: &[RepositoryLeftovers]) -> Removed {
+    let mut removed = Removed::default();
+
+    for leftovers in found {
+        for entry in &leftovers.stale {
+            match std::fs::remove_dir_all(&entry.path) {
+                Ok(()) => removed.directories += 1,
+                Err(e) => removed
+                    .warnings
+                    .push(format!("could not remove {}: {e}", entry.path.display())),
+            }
+        }
+
+        if let Some(repo) = &leftovers.repo
+            && !leftovers.stale.is_empty()
+            && repo.exists()
+            && let Err(e) = git::prune_worktrees(repo).await
+        {
+            removed.warnings.push(format!(
+                "could not prune worktrees in {}: {e}",
+                repo.display()
+            ));
+        }
+    }
+
+    removed
+}
