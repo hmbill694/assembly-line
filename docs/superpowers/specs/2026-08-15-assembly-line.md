@@ -11,6 +11,23 @@ Agent tasks run in isolated git worktrees and merge back into a run branch.
 Supervision is a per-node gate: a human approves or sends the agent back to
 revise, or an automated `verify` command approves in their place.
 
+## The job contract
+
+**A node's branch always survives; a node's worktree never does.**
+
+A job is stateless. It takes a repository, a base ref and a prompt, and
+produces a branch — pushed when there is a remote, left as a local ref when
+there is not. Its checkout is scratch and is discarded whatever happened,
+including on failure.
+
+Everything else follows from that sentence:
+
+| Consequence | Why it matters |
+|---|---|
+| Failure is a branch, not a directory | Inspectable from any machine, not only the one that ran it |
+| Revising re-seeds from the branch | Nothing has to be kept alive on disk between rounds |
+| `(repo, ref, prompt) -> branch` | Already the shape of a `docker run` or a k8s Job |
+
 ## Core model
 
 A TOML graph file declares tasks. `needs` forms the edges.
@@ -131,8 +148,11 @@ Git refs are paths, and a ref cannot be both a file and a directory — so
 `al/run-42` and `al/run-42/impl-auth` **cannot coexist**. The flat form still
 groups under `al/run-42*` for cleanup.
 
-Worktrees are removed on success and **kept on failure**, so a failed node can
-be inspected. `assembly gc` prunes old ones and runs `git worktree prune`.
+Worktrees are **always removed**, success or failure — they are scratch. What
+a failed node leaves is its *branch*, carrying whatever the agent managed
+before it gave up, published but never merged. `assembly gc` collects the
+integration worktree once a run's state directory is gone, plus anything a run
+that died mid-node orphaned.
 
 ### Seeding worktrees
 
@@ -160,44 +180,65 @@ an agent from printing `.env` contents to stdout, which lands in the node log.
 
 `supervise = "none" | "pre" | "on-complete" | "both"` per node.
 
-A supervised node pauses and enqueues an approval. Approvals are served FIFO
-on the controlling terminal, one at a time; **other branches keep executing
-while you decide.**
+Review is a **second axis, orthogonal to execution**. A node is `Done` because
+it ran; whether anyone has looked at it is tracked separately:
 
 ```
-? impl-auth finished (3 files, +120/-4)
-  [a]pprove [r]evise [s]kip [d]iff [x]abort
+execution:  Pending | Running | Done | Failed | Skipped
+review:     NotGated | Unreviewed | Approved | RevisionRequested
 ```
 
-Approving merges the node's branch into the run branch. **Approval is part of
-completion** — a node is Done only once approved and merged, so dependents
-always branch from reviewed, integrated code. The run branch is always the
-approved truth. The cost is that an unattended gate stalls its own downstream
-subtree; unrelated branches are unaffected.
+The graph declares the *intent*; the invocation decides the *timing*. A gate
+either blocks now or becomes a review item later:
+
+| | Supervised | Unsupervised |
+|---|---|---|
+| Node hits its gate | Blocks, prompts on the TTY | Merges on `verify`, files a review item |
+| Dependents branch from | **Reviewed** code | **Verified** code |
+| A run can stall | Yes, its own subtree only | Never |
+
+`--unsupervised` therefore means **defer**, not ignore — which is why there is
+no need for the earlier rule that a run refuses to start without a TTY. It
+downgrades instead.
+
+**The cost, stated plainly:** under deferral, dependents branch from verified
+rather than reviewed code. Rejecting at 9am work that merged at 2am is not a
+rewind — the revision lands *on top* of whatever followed. `review` reports the
+blast radius so an approval is informed rather than blind.
+
+### The review inbox
+
+```
+run 42: 2 awaiting review
+
+  ? impl-auth  3 files +120/-4   al/run-42-impl-auth
+  ? impl-api   1 file  +12/-0    al/run-42-impl-api
+
+assembly review 42 --approve <node>
+assembly review 42 --revise <node> "what to change"
+```
+
+Derived entirely from the event log, not from the graph's `supervise` field —
+the graph file may have changed since the run, and the log is what actually
+happened. Verdicts are appended to that same log, which is append-only, so a
+verdict is simply another event.
 
 ### The revise loop
 
-`[r]evise` prompts for free-text feedback and re-invokes the agent **in its
-existing worktree**, so it sees its own prior work as files on disk and
-revises rather than restarts. This needs no session replay or conversation
-history, so it behaves identically across every provider.
+`assembly revise <run> <node>` starts a **new job** based at the node's branch
+tip. The agent's prior work arrives as files on disk, so it revises rather than
+restarts — needing no session replay or conversation history, and behaving
+identically across every provider.
 
-The node leaves the approval queue while revising — you are free to handle
-other pending approvals — and re-enters it when the round completes. The loop
-is **unbounded**: iterate as many times as you like. Human revision rounds do
-**not** count against `retries`, which bounds automated verify-failure retries
-only.
+Crucially this needs **nothing kept alive between rounds**. The round checks
+the branch back out into fresh scratch, appends its commit to that branch, and
+discards the checkout again. Its diff is measured against the previous round,
+which is what a reviewer wants to see.
 
-Every round is recorded (`node_revise_requested` with the feedback text,
-`node_started` with a round number), so the log preserves the full
-back-and-forth.
-
-### Mode selection
-
-The graph file declares intent; `--unsupervised` forces every gate to
-auto-approve and `--supervise-all` forces gates everywhere. If a gate would
-block with no TTY and no override, **the run refuses to start** rather than
-hanging forever.
+The loop is **unbounded**. Human revision rounds do **not** count against
+`retries`, which bounds automated verify-failure retries only. Every round is
+recorded (`node_revision_requested` with the feedback text, `node_started` with
+a round number), so the log preserves the full back-and-forth.
 
 ## Unsupervised execution
 
@@ -235,6 +276,32 @@ A node that exhausts its retries fails. Its descendants are marked skipped;
 independent branches run to completion. The run ends `partial` with a nonzero
 exit code. `on_failure = "skip" | "abort" | "continue"` overrides per node,
 defaulting to `skip`.
+
+Whatever the agent produced before failing is committed and published anyway —
+a half-finished failure is exactly the case where the diff is worth reading —
+but it is never merged into the run branch.
+
+## Delivery
+
+```toml
+[delivery]
+mode = "pr"      # or "push", or "none"
+base = "main"    # defaults to the branch the run started from
+```
+
+`pr` pushes the run branch and opens a pull request. `push` fast-forwards the
+base on the remote, for work trusted to land unreviewed; it is deliberately
+not forced, so a base that moved underneath the run is a reported conflict
+rather than a silently overwritten commit.
+
+The base is never an assumed `main` — a run does not touch the repository's own
+HEAD, so it still says what branch you were standing on.
+
+`gh` is not a dependency. If it is missing or refuses, the branch is already on
+the remote and that is reported; a human can open the pull request themselves.
+Delivery runs only when the whole graph succeeded: a partial run still leaves a
+real branch, but opening a pull request for unfinished work is noise, so the
+branch name is printed instead.
 
 ## Context flow
 
@@ -315,6 +382,10 @@ assembly run <graph> [--jobs N] [--unsupervised] [--supervise-all]
                      [--repo URL] [--ref REF] [--graph-in-repo PATH]
 assembly resume <run-id>
 assembly status [run-id]         node tree, timings, costs
+assembly review [run-id] [--approve NODE] [--revise NODE FEEDBACK]
+                                 gates a run deferred, and verdicts on them
+assembly revise <run-id> <node> [feedback]
+                                 another round, based on the node's branch
 assembly logs <run-id> <node> [-f]
 assembly doctor                  smoke-test each configured provider
 assembly gc [--older-than 7d] [--dry-run]
@@ -344,9 +415,16 @@ going stale as agent CLIs change their flags.
 |---|---|
 | **M1** ✅ | Shell-only parallel DAG: parse, validate, `--jobs`, `resource`, per-node logs, event log, resume-by-replay, skip-subtree failure |
 | **M2** ✅ | git worktrees, provider invocation, merge into run branch, `copy` seeding |
-| **M3** | Supervision gates, revise loop, `verify`, retries, conflict-resolution agent, caps |
-| **M4** | Hooks, PR delivery, `status` / `logs` / `doctor` / `init` polish |
-| **M5** | Clone, push-per-node, preflight, `gc` for remote branches |
+| **M3** ✅ | Stateless jobs: branch survives / worktree does not, publish on failure, review inbox, revise-as-new-job, PR and push delivery |
+| **M4** | The runner seam: local and container implementors, then k8s Jobs |
+| **M5** | Detached runs, `assembly runs`, PTY `attach`, blocking supervised gates |
+| **M6** | Built-in refinement prompt and plan schema; `verify`, retries, conflict-resolution agent, caps |
+| **M7** | Clone, preflight, `doctor` / `init`, `gc` for remote branches |
+
+**Deferred from M3, deliberately.** `verify` and `retries` are parsed but not
+yet enforced, so the only thing gating a merge today is the agent's exit code.
+Blocking supervised gates need the PTY work in M5, so M3 ships the deferred
+half of supervision only. Neither is an oversight; both are sequencing.
 
 ## Accepted risks
 
@@ -358,12 +436,17 @@ going stale as agent CLIs change their flags.
 4. Copied secrets are git-safe, not log-safe (see Seeding worktrees).
 5. A merge into the run branch lands in the integration worktree while an
    unrelated shell node may be running there, so that node can observe the tree
-   changing under it. M3 routes merges through the approval queue, which
-   serializes them against everything else. Merges are already serialized
-   against each other.
-6. An agent node with no `verify` and no gate has nothing checking its output
-   in M2 — it is committed and merged on exit zero alone. `validate` warns
-   (risk 1); M3's `verify` and gates are what actually close it.
-7. Retrying an agent node discards the previous attempt's branch and worktree.
-   That is what makes `resume` work after a run died mid-agent, but it means a
-   failed attempt is only inspectable until the next one starts.
+   changing under it. Merges are serialized against each other, but not against
+   shell nodes. Closing this needs the runner seam in M4, where a shell node
+   gets its own checkout too.
+6. An agent node with no gate has nothing checking its output: it is committed
+   and merged on exit zero alone, because `verify` is parsed but not yet
+   enforced. `validate` warns (risk 1); M6 is what actually closes it. Under
+   `--unsupervised` this warning should become an error, and does not yet.
+7. Branches are now the durable artifact, so branch cleanup is a real concern
+   where it was not before. `gc` lost ~150 lines of worktree policy and has not
+   yet gained the branch-pruning job that replaces it. Refs are cheap, so this
+   is untidy rather than urgent.
+8. A revise round appends to the node's branch and merges on top of whatever
+   landed after it. That is forward-fixing, never a rewind — correct, but it
+   means a rejected node's *original* work stays in the run branch's history.

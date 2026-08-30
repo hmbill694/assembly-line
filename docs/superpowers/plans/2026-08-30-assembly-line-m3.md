@@ -1,6 +1,6 @@
 # assembly-line M3 Implementation Plan — stateless jobs
 
-**Status:** in progress
+**Status:** shipped 2026-08-30
 **Spec:** `docs/superpowers/specs/2026-08-15-assembly-line.md`
 
 ## The one-line rule
