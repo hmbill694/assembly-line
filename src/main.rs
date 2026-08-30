@@ -560,13 +560,45 @@ async fn revise_node_of_run(run_id: u64, node: String, feedback: Option<String>)
     {
         Err(e) => fail_with_usage_error(e),
         Ok(node_failed) => {
-            print_run_outcome(&run, &meta.graph, RunStatus::Partial, &state);
+            print_node_outcome(&run, &meta.graph, &node);
             match node_failed {
                 true => ExitCode::from(EXIT_RUN_INCOMPLETE),
                 false => ExitCode::SUCCESS,
             }
         }
     }
+}
+
+/// One node's outcome after a revise round.
+///
+/// Deliberately not the run's summary line: that belongs to the run that
+/// finished earlier, and reprinting it here reads as a contradiction — an
+/// "ok" run with a freshly failed node in it.
+fn print_node_outcome(run: &RunPaths, graph_path: &Path, node: &str) {
+    let Some(reported) = report_for(run, graph_path)
+        .ok()
+        .and_then(|report| report.nodes.into_iter().find(|n| n.id == node))
+    else {
+        return;
+    };
+
+    let outcome = match reported.state {
+        assembly_line::state::NodeState::Done => "merged",
+        assembly_line::state::NodeState::Failed => "failed",
+        assembly_line::state::NodeState::Skipped => "skipped",
+        assembly_line::state::NodeState::Running | assembly_line::state::NodeState::Pending => {
+            "still in flight"
+        }
+    };
+
+    println!(
+        "{node}: {outcome}{}{}",
+        reported.diff.map(|d| format!(" ({d})")).unwrap_or_default(),
+        reported
+            .detail
+            .map(|why| format!(" — {why}"))
+            .unwrap_or_default(),
+    );
 }
 
 /// Report what `gc` would collect, or collect it.

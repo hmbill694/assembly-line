@@ -493,7 +493,11 @@ fn a_revise_round_continues_the_branch_instead_of_starting_over() {
         .args(["revise", "1", "n"])
         .assert()
         .success()
-        .stdout(contains("round 2"));
+        // The node's own outcome, not the run's. Reprinting the run summary
+        // here reads as a contradiction: it belongs to the run that already
+        // finished, so it would say "ok" beside a freshly failed node.
+        .stdout(contains("round 2").and(contains("merged")))
+        .stdout(contains("run 1:").not());
 
     // Two commits on the node's branch, not one replaced by another.
     let commits = std::process::Command::new("git")
