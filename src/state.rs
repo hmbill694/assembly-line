@@ -69,6 +69,7 @@ impl RunState {
             EventKind::RunStarted { .. }
             | EventKind::RunBranchCreated { .. }
             | EventKind::NodeCommitted { .. }
+            | EventKind::NodeBranchPublished { .. }
             | EventKind::NodeMerged { .. }
             | EventKind::NodeMergeConflicted { .. } => None,
             EventKind::RunFinished { status } => {

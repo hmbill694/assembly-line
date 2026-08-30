@@ -145,6 +145,7 @@ async fn drive_run(
         cancel,
         repo: Some(repo_root),
         seed_from,
+        remote: assembly_line::workspace::DEFAULT_REMOTE.to_string(),
     };
     let status = execute(&graph, &dag, run, &mut log, &mut state, &opts)
         .await

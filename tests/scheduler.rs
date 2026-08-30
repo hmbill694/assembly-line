@@ -4,6 +4,7 @@ use assembly_line::event::{EventKind, EventLog, RunStatus};
 use assembly_line::paths::{create_run, runs_root};
 use assembly_line::scheduler::{RunOpts, execute};
 use assembly_line::state::{NodeState, RunState};
+use assembly_line::workspace;
 use tokio_util::sync::CancellationToken;
 
 struct Harness {
@@ -35,6 +36,7 @@ impl Harness {
             cancel: CancellationToken::new(),
             repo: None,
             seed_from: self.tmp.path().to_path_buf(),
+            remote: workspace::DEFAULT_REMOTE.to_string(),
         };
 
         let status = execute(&graph, &dag, &paths, &mut log, &mut state, &opts)
@@ -195,6 +197,7 @@ async fn writes_a_log_file_per_node() {
         cancel: CancellationToken::new(),
         repo: None,
         seed_from: h.tmp.path().to_path_buf(),
+        remote: workspace::DEFAULT_REMOTE.to_string(),
     };
 
     execute(&graph, &dag, &paths, &mut log, &mut state, &opts)

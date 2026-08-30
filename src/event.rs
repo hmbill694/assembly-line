@@ -48,6 +48,17 @@ pub enum EventKind {
         insertions: usize,
         deletions: usize,
     },
+    /// The node's branch was made durable. `pushed_to` names the remote it
+    /// reached, or is `None` when the repository has none and the branch is
+    /// only a local ref — a complete outcome, not a degraded one.
+    ///
+    /// Emitted for failed nodes too: a job leaves nothing but its branch, so
+    /// this is what makes a failure inspectable at all.
+    NodeBranchPublished {
+        node: String,
+        branch: String,
+        pushed_to: Option<String>,
+    },
     /// The node's branch reached the run branch.
     NodeMerged {
         node: String,
@@ -83,6 +94,7 @@ impl EventKind {
         match self {
             Self::NodeStarted { node, .. }
             | Self::NodeCommitted { node, .. }
+            | Self::NodeBranchPublished { node, .. }
             | Self::NodeMerged { node, .. }
             | Self::NodeMergeConflicted { node, .. }
             | Self::NodeFinished { node, .. }

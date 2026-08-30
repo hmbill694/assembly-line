@@ -12,6 +12,9 @@ pub struct NodeWorkspace {
     pub seeded: Vec<String>,
 }
 
+/// The remote a run publishes node branches to unless configured otherwise.
+pub const DEFAULT_REMOTE: &str = "origin";
+
 #[must_use]
 pub fn run_branch_name(run_id: u64) -> String {
     format!("al/run-{run_id}")
@@ -99,6 +102,30 @@ async fn clear_previous_attempt(repo: &Path, path: &Path, branch: &str) -> anyho
 /// seeded file itself.
 pub async fn commit(ws: &NodeWorkspace, message: &str) -> anyhow::Result<Option<String>> {
     git::commit_all_except(&ws.path, message, &ws.seeded).await
+}
+
+/// Make the node's branch durable, returning the remote it reached.
+///
+/// A job is stateless: its checkout is scratch and the branch is the only
+/// thing that outlives it. `None` means the repository has no such remote, so
+/// the branch stays a local ref — an ordinary local run, not a failure.
+///
+/// # Errors
+///
+/// Returns an error if the remote cannot be listed, or if the push is
+/// rejected.
+pub async fn publish(
+    repo: impl AsRef<Path>,
+    ws: &NodeWorkspace,
+    remote: &str,
+) -> anyhow::Result<Option<String>> {
+    let repo = repo.as_ref();
+    match git::remote_exists(repo, remote).await? {
+        false => Ok(None),
+        true => git::push_branch(repo, remote, &ws.branch)
+            .await
+            .map(|()| Some(remote.to_string())),
+    }
 }
 
 /// Remove the checkout. The branch survives, because it is the record of what

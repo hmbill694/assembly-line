@@ -5,7 +5,7 @@ use assembly_line::git::{self, commit_all, head_sha};
 use assembly_line::paths::{create_run, repo_worktrees_root, runs_root};
 use assembly_line::scheduler::{RunOpts, execute};
 use assembly_line::state::{NodeState, RunState};
-use assembly_line::workspace::run_branch_name;
+use assembly_line::workspace::{self, run_branch_name};
 use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
@@ -29,8 +29,8 @@ struct Harness {
     repo: PathBuf,
 }
 
-/// Worktrees live under `$HOME`, and failed nodes deliberately keep theirs.
-/// Tests must not leave that behind.
+/// Worktrees live under `$HOME`. Jobs discard their own, but a run that dies
+/// mid-node can still orphan one, and tests must not leave that behind.
 impl Drop for Harness {
     fn drop(&mut self) {
         if let Some(root) = repo_worktrees_root(&self.repo) {
@@ -71,6 +71,22 @@ impl Harness {
         Harness { tmp, repo }
     }
 
+    /// Add a bare repository as `origin`, so a publish exercises a real push
+    /// with no network and no credentials.
+    async fn with_origin(&self) -> PathBuf {
+        let origin = self.tmp.path().join("origin.git");
+        let origin_arg = origin.to_string_lossy().into_owned();
+
+        for args in [
+            vec!["init", "--bare", "--initial-branch=main", &origin_arg],
+            vec!["remote", "add", "origin", &origin_arg],
+        ] {
+            let out = git::run_allowing_failure(&self.repo, &args).await.unwrap();
+            assert!(out.succeeded(), "git {args:?} failed: {}", out.stderr);
+        }
+        origin
+    }
+
     async fn run(&self, src: &str, jobs: usize) -> Outcome {
         let graph = parse_graph(src).unwrap();
         let dag = Dag::build(&graph.tasks).unwrap();
@@ -84,6 +100,7 @@ impl Harness {
             cancel: CancellationToken::new(),
             repo: Some(self.repo.clone()),
             seed_from: self.repo.clone(),
+            remote: workspace::DEFAULT_REMOTE.to_string(),
         };
         let status = execute(&graph, &dag, &run, &mut log, &mut state, &opts)
             .await
@@ -169,8 +186,11 @@ async fn the_prompt_reaches_the_agent_intact() {
     assert!(content.contains("; semicolons"), "{content}");
 }
 
+/// The job contract: a node's branch always survives, its worktree never does.
+/// A half-finished failure is exactly the case where the diff is worth
+/// reading, so the work is committed before the failure is judged.
 #[tokio::test]
-async fn a_failing_agent_fails_the_node_and_keeps_its_worktree() {
+async fn a_failing_agent_preserves_its_work_on_a_branch_and_leaves_no_worktree() {
     let h = Harness::new().await;
     let src = format!(
         "{}\n[[task]]\nid = \"broken\"\nkind = \"agent\"\nprovider = \"fake\"\nprompt = \"x\"\n",
@@ -184,15 +204,85 @@ async fn a_failing_agent_fails_the_node_and_keeps_its_worktree() {
     assert!(
         out.has(|k| matches!(k, EventKind::NodeFailed { reason, .. } if reason.contains("exit 3")))
     );
+    // Preserved, but never merged: failed work does not reach the run branch.
     assert!(!out.has(|k| matches!(k, EventKind::NodeMerged { .. })));
+    assert!(out.has(|k| matches!(k, EventKind::NodeCommitted { node, .. } if node == "broken")));
+    assert!(out.has(
+        |k| matches!(k, EventKind::NodeBranchPublished { branch, .. } if branch == "al/run-1-broken")
+    ));
 
-    let kept = assembly_line::paths::worktree_root(&h.repo, out.run_id)
+    let scratch = assembly_line::paths::worktree_root(&h.repo, out.run_id)
         .unwrap()
         .join("broken");
     assert!(
-        kept.join("partial.txt").is_file(),
-        "a failed node's worktree is what you inspect to find out why"
+        !scratch.exists(),
+        "a job's checkout is scratch and must not outlive it"
     );
+
+    // The work is on the branch, which is what makes the failure inspectable
+    // from anywhere rather than only on the machine that ran it.
+    let on_branch = git::run_allowing_failure(
+        &h.repo,
+        &["show", "--name-only", "--format=", "al/run-1-broken"],
+    )
+    .await
+    .unwrap();
+    assert!(on_branch.succeeded(), "{}", on_branch.stderr);
+    assert!(
+        on_branch.stdout.contains("partial.txt"),
+        "the agent's partial work is not on the branch: {}",
+        on_branch.stdout
+    );
+}
+
+/// The point of publishing: a failed node's work leaves the machine that ran
+/// it. This is what a container or a k8s Job will rely on in M4.
+#[tokio::test]
+async fn a_failed_nodes_branch_reaches_the_remote() {
+    let h = Harness::new().await;
+    let origin = h.with_origin().await;
+    let src = format!(
+        "{}\n[[task]]\nid = \"broken\"\nkind = \"agent\"\nprovider = \"fake\"\nprompt = \"x\"\n",
+        provider_block("failing-agent.sh", "a")
+    );
+
+    let out = h.run(&src, 1).await;
+
+    assert_eq!(out.state.state("broken"), NodeState::Failed);
+    assert!(out.has(
+        |k| matches!(k, EventKind::NodeBranchPublished { pushed_to, .. } if pushed_to.as_deref() == Some("origin"))
+    ));
+
+    let on_remote = git::run_allowing_failure(
+        &origin,
+        &["show", "--name-only", "--format=", "al/run-1-broken"],
+    )
+    .await
+    .unwrap();
+    assert!(on_remote.succeeded(), "{}", on_remote.stderr);
+    assert!(
+        on_remote.stdout.contains("partial.txt"),
+        "the failed node's work never reached the remote: {}",
+        on_remote.stdout
+    );
+}
+
+/// With no remote configured the branch simply stays local. That is a complete
+/// outcome, not a degraded one, so it is still recorded as published.
+#[tokio::test]
+async fn publishing_without_a_remote_keeps_the_branch_local() {
+    let h = Harness::new().await;
+    let src = format!(
+        "{}\n[[task]]\nid = \"work\"\nkind = \"agent\"\nprovider = \"fake\"\nprompt = \"x\"\n",
+        provider_block("fake-agent.sh", "a")
+    );
+
+    let out = h.run(&src, 1).await;
+
+    assert_eq!(out.status, RunStatus::Ok);
+    assert!(out.has(
+        |k| matches!(k, EventKind::NodeBranchPublished { pushed_to, .. } if pushed_to.is_none())
+    ));
 }
 
 #[tokio::test]

@@ -25,6 +25,9 @@ pub struct RunOpts {
     pub repo: Option<PathBuf>,
     /// Where `copy` paths resolve from — the CLI's working directory.
     pub seed_from: PathBuf,
+    /// The remote node branches are published to. A repository that has no
+    /// remote by this name keeps its branches locally instead.
+    pub remote: String,
 }
 
 /// The branch every agent node's work merges into, and the checkout it lives
@@ -67,21 +70,36 @@ impl RunBranch {
     }
 }
 
+/// What an agent left behind, recorded on its own branch.
+///
+/// This is the whole durable output of a job. The checkout it was produced in
+/// is gone by the time this exists.
+#[derive(Debug)]
+struct AgentWork {
+    branch: String,
+    sha: String,
+    stat: git::DiffStat,
+    /// The remote the branch reached, or `None` for a repository with none.
+    pushed_to: Option<String>,
+}
+
 /// What a finished node reports back to the loop. Events are written by the
 /// loop, not the task, so their order in the log is the order things settled.
 #[derive(Debug)]
 enum NodeResult {
     /// A shell node, or an agent that correctly decided nothing needed doing.
     Succeeded,
-    /// An agent left work, which was committed and then offered to the run
-    /// branch — successfully or not.
+    /// An agent left work, which was committed, published, and then offered to
+    /// the run branch — successfully or not.
     Committed {
-        sha: String,
-        stat: git::DiffStat,
+        work: AgentWork,
         merge: MergeOutcome,
     },
+    /// `work` carries whatever the agent had produced before it failed. That
+    /// work is preserved on the node's branch and never merged.
     Failed {
         reason: String,
+        work: Option<AgentWork>,
     },
 }
 
@@ -92,9 +110,18 @@ impl NodeResult {
         match outcome.map(|o| o.failure_reason()) {
             Err(unspawnable) => NodeResult::Failed {
                 reason: unspawnable.to_string(),
+                work: None,
             },
-            Ok(Some(reason)) => NodeResult::Failed { reason },
+            Ok(Some(reason)) => NodeResult::Failed { reason, work: None },
             Ok(None) => NodeResult::Succeeded,
+        }
+    }
+
+    /// The reason this node failed, if it did.
+    fn failure_reason(self) -> Option<String> {
+        match self {
+            NodeResult::Failed { reason, .. } => Some(reason),
+            _ => None,
         }
     }
 }
@@ -137,6 +164,7 @@ struct AgentNodePlan {
     copy_paths: Vec<String>,
     command: CommandSpec,
     commit_message: String,
+    remote: String,
 }
 
 /// Nodes that may start right now: dependency-ready, within the job cap, and
@@ -238,14 +266,16 @@ fn agent_node_plan(
         copy_paths: declared_copy_paths(graph, task),
         command: render_command(provider, &prompt),
         commit_message: commit_message(&task.id, &prompt),
+        remote: opts.remote.clone(),
     })
 }
 
-/// Run one agent node end to end: sandbox, agent, commit, merge.
+/// Run one agent node end to end: sandbox, agent, commit, publish, merge.
 ///
-/// The workspace is discarded only when the node fully succeeds. On any
-/// failure it stays on disk, because it is the sole record of what the agent
-/// actually did.
+/// The job is stateless — its checkout is scratch and is discarded whatever
+/// happened, including on failure. What survives is the node's branch, which
+/// is why the agent's work is committed and published *before* success is
+/// decided: an unrecorded change would be a lost change.
 async fn agent_node_result(
     plan: &AgentNodePlan,
     log_path: &Path,
@@ -266,22 +296,33 @@ async fn agent_node_result(
     let ran = NodeResult::from_command(
         run_command(&plan.command, &ws.path, log_path, timeout, cancel).await,
     );
-    if matches!(ran, NodeResult::Failed { .. }) {
-        return Ok(ran);
+
+    // Preserve first, judge after. A failed agent that got halfway is exactly
+    // the case where the diff is worth reading.
+    let work = match workspace::commit(&ws, &plan.commit_message).await? {
+        None => None,
+        Some(sha) => Some(AgentWork {
+            branch: ws.branch.clone(),
+            sha,
+            stat: git::diff_stat_against(&ws.path, &base_sha).await?,
+            pushed_to: workspace::publish(&plan.run_branch.repo, &ws, &plan.remote).await?,
+        }),
+    };
+
+    // Merging reads the branch, not the checkout, so the scratch directory is
+    // already surplus by this point.
+    workspace::discard(&plan.run_branch.repo, &ws).await?;
+
+    if let Some(reason) = ran.failure_reason() {
+        return Ok(NodeResult::Failed { reason, work });
     }
 
-    let Some(sha) = workspace::commit(&ws, &plan.commit_message).await? else {
-        workspace::discard(&plan.run_branch.repo, &ws).await?;
+    let Some(work) = work else {
         return Ok(NodeResult::Succeeded);
     };
 
-    let stat = git::diff_stat_against(&ws.path, &base_sha).await?;
-    let merge = plan.run_branch.merge(&plan.node, &ws.branch).await?;
-    if !matches!(merge, MergeOutcome::Conflicted(_)) {
-        workspace::discard(&plan.run_branch.repo, &ws).await?;
-    }
-
-    Ok(NodeResult::Committed { sha, stat, merge })
+    let merge = plan.run_branch.merge(&plan.node, &work.branch).await?;
+    Ok(NodeResult::Committed { work, merge })
 }
 
 /// Create, or on resume re-open, the branch agent work merges into.
@@ -354,58 +395,94 @@ fn record_completion(
     node: &str,
     result: NodeResult,
 ) -> anyhow::Result<bool> {
-    let mut append = |kind| -> anyhow::Result<()> {
+    let (events, node_failed) = events_for_completion(node, result);
+
+    events.into_iter().try_for_each(|kind| {
         let ev = log.append(kind)?;
         state.apply(&ev.kind);
-        Ok(())
-    };
+        anyhow::Ok(())
+    })?;
 
+    Ok(node_failed)
+}
+
+/// Recording what an agent left: the commit, then where its branch went.
+///
+/// Empty for a shell node, or for an agent that correctly changed nothing.
+fn work_recorded(node: &str, work: Option<&AgentWork>) -> Vec<EventKind> {
+    work.map(|w| {
+        vec![
+            EventKind::NodeCommitted {
+                node: node.to_string(),
+                sha: w.sha.clone(),
+                files: w.stat.files,
+                insertions: w.stat.insertions,
+                deletions: w.stat.deletions,
+            },
+            EventKind::NodeBranchPublished {
+                node: node.to_string(),
+                branch: w.branch.clone(),
+                pushed_to: w.pushed_to.clone(),
+            },
+        ]
+    })
+    .unwrap_or_default()
+}
+
+/// The events a completion implies, in the order things settled, paired with
+/// whether the node ended up failed.
+///
+/// Pure, so the ordering that makes replay correct can be asserted without
+/// running anything. Work is always recorded first: a failure that produced a
+/// diff still produced a diff.
+fn events_for_completion(node: &str, result: NodeResult) -> (Vec<EventKind>, bool) {
     let finished = EventKind::NodeFinished {
         node: node.to_string(),
         exit_code: 0,
     };
+    let failed = |reason| EventKind::NodeFailed {
+        node: node.to_string(),
+        reason,
+    };
 
     match result {
-        NodeResult::Succeeded => {
-            append(finished)?;
-            Ok(false)
-        }
-        NodeResult::Failed { reason } => {
-            append(EventKind::NodeFailed {
-                node: node.to_string(),
-                reason,
-            })?;
-            Ok(true)
-        }
-        NodeResult::Committed { sha, stat, merge } => {
-            append(EventKind::NodeCommitted {
-                node: node.to_string(),
-                sha: sha.clone(),
-                files: stat.files,
-                insertions: stat.insertions,
-                deletions: stat.deletions,
-            })?;
-
-            match MergeRecord::of(merge, &sha) {
-                MergeRecord::Landed(sha) => {
-                    append(EventKind::NodeMerged {
-                        node: node.to_string(),
-                        sha,
-                    })?;
-                    append(finished)?;
-                    Ok(false)
-                }
+        NodeResult::Succeeded => (vec![finished], false),
+        NodeResult::Failed { reason, work } => (
+            work_recorded(node, work.as_ref())
+                .into_iter()
+                .chain([failed(reason)])
+                .collect(),
+            true,
+        ),
+        NodeResult::Committed { work, merge } => {
+            let recorded = work_recorded(node, Some(&work)).into_iter();
+            match MergeRecord::of(merge, &work.sha) {
+                MergeRecord::Landed(sha) => (
+                    recorded
+                        .chain([
+                            EventKind::NodeMerged {
+                                node: node.to_string(),
+                                sha,
+                            },
+                            finished,
+                        ])
+                        .collect(),
+                    false,
+                ),
                 MergeRecord::Blocked(paths) => {
                     let reason = format!("merge conflict in {}", paths.join(", "));
-                    append(EventKind::NodeMergeConflicted {
-                        node: node.to_string(),
-                        paths,
-                    })?;
-                    append(EventKind::NodeFailed {
-                        node: node.to_string(),
-                        reason,
-                    })?;
-                    Ok(true)
+                    (
+                        recorded
+                            .chain([
+                                EventKind::NodeMergeConflicted {
+                                    node: node.to_string(),
+                                    paths,
+                                },
+                                failed(reason),
+                            ])
+                            .collect(),
+                        true,
+                    )
                 }
             }
         }
@@ -517,7 +594,9 @@ pub async fn execute(
                                     NodeCompletion {
                                         node: id,
                                         resource,
-                                        result: NodeResult::Failed { reason },
+                                        // A node that never ran left nothing
+                                        // to preserve.
+                                        result: NodeResult::Failed { reason, work: None },
                                     }
                                 });
                             }
@@ -528,8 +607,13 @@ pub async fn execute(
                                     NodeCompletion {
                                         node: id,
                                         resource,
+                                        // The job could not be administered at
+                                        // all — no sandbox, or git refused. Any
+                                        // partial work is described by the
+                                        // error, not by a branch we can name.
                                         result: result.unwrap_or_else(|e| NodeResult::Failed {
                                             reason: e.to_string(),
+                                            work: None,
                                         }),
                                     }
                                 });

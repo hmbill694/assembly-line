@@ -304,7 +304,7 @@ fn gc_with_nothing_to_collect_says_so() {
 }
 
 #[test]
-fn gc_collects_a_failed_nodes_worktree_only_once_its_run_state_is_gone() {
+fn gc_collects_a_runs_worktrees_only_once_its_run_state_is_gone() {
     let tmp = repo_with_commit();
     std::fs::write(
         tmp.path().join("graph.toml"),
@@ -316,8 +316,16 @@ fn gc_collects_a_failed_nodes_worktree_only_once_its_run_state_is_gone() {
 
     let worktrees = run_worktrees(&tmp, 1);
     assert!(
-        worktrees.join("n").is_dir(),
-        "a failed node keeps its worktree for inspection"
+        !worktrees.join("n").exists(),
+        "a job's checkout is scratch — even a failed one discards it"
+    );
+    // What is left is the run's own integration checkout, which lives as long
+    // as the run does.
+    assert!(
+        worktrees
+            .join(assembly_line::paths::INTEGRATION_WORKTREE)
+            .is_dir(),
+        "the integration worktree is the run's, not a node's"
     );
 
     // The run still exists, so its worktrees are still wanted.

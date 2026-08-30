@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Writes a partial change, then fails — the worktree must be kept.
+# Writes a partial change, then fails — the work must reach the node's branch.
 set -euo pipefail
 echo "fake-agent: starting work on $1"
 printf 'half done\n' > partial.txt

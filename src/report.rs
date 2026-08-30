@@ -129,9 +129,11 @@ impl NodeProgress {
                 detail: Some(because.clone()),
                 ..self
             },
-            // A merge moves the run branch, not the node's own progress.
+            // A merge moves the run branch, and publishing moves a ref —
+            // neither is the node's own progress.
             EventKind::RunStarted { .. }
             | EventKind::RunBranchCreated { .. }
+            | EventKind::NodeBranchPublished { .. }
             | EventKind::NodeMerged { .. }
             | EventKind::NodeMergeConflicted { .. }
             | EventKind::RunFinished { .. } => self,

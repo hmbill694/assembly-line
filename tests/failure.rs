@@ -4,6 +4,7 @@ use assembly_line::event::{EventKind, EventLog, RunStatus};
 use assembly_line::paths::{create_run, runs_root};
 use assembly_line::scheduler::{RunOpts, execute};
 use assembly_line::state::{NodeState, RunState};
+use assembly_line::workspace;
 use tokio_util::sync::CancellationToken;
 
 struct Outcome {
@@ -26,6 +27,7 @@ async fn run(src: &str) -> Outcome {
         cancel: CancellationToken::new(),
         repo: None,
         seed_from: tmp.path().to_path_buf(),
+        remote: workspace::DEFAULT_REMOTE.to_string(),
     };
 
     let status = execute(&graph, &dag, &paths, &mut log, &mut state, &opts)
