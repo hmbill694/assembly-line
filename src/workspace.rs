@@ -27,7 +27,19 @@ pub fn node_branch_name(run_id: u64, node: &str) -> String {
     format!("al/run-{run_id}-{node}")
 }
 
-/// Create a worktree for `branch` at `base_sha` and seed it.
+/// Where a job's checkout begins.
+#[derive(Debug, Clone, Copy)]
+pub enum StartPoint<'a> {
+    /// Cut a fresh branch at this commit, superseding any earlier attempt's.
+    FreshBranch(&'a str),
+    /// Continue the node's existing branch. A revise round is a new job, but
+    /// it appends to the branch rather than replacing the record of what came
+    /// before — which is also how the agent sees its own prior work, as files
+    /// on disk, with no session replay.
+    ContinueBranch,
+}
+
+/// Create a worktree for `branch` and seed it.
 ///
 /// # Errors
 ///
@@ -38,7 +50,7 @@ pub async fn create(
     repo: impl AsRef<Path>,
     path: impl AsRef<Path>,
     branch: &str,
-    base_sha: &str,
+    start: StartPoint<'_>,
     seed_from: impl AsRef<Path>,
     copy_paths: &[String],
 ) -> anyhow::Result<NodeWorkspace> {
@@ -51,8 +63,16 @@ pub async fn create(
         );
     }
 
-    clear_previous_attempt(repo, path, branch).await?;
-    git::add_worktree(repo, path, branch, base_sha).await?;
+    match start {
+        StartPoint::FreshBranch(base_sha) => {
+            clear_previous_attempt(repo, path, branch).await?;
+            git::add_worktree(repo, path, branch, base_sha).await?;
+        }
+        StartPoint::ContinueBranch => {
+            clear_previous_checkout(repo, path).await?;
+            git::add_worktree_for_existing_branch(repo, path, branch).await?;
+        }
+    }
 
     copy_paths
         .iter()
@@ -73,20 +93,26 @@ pub async fn create(
     })
 }
 
-/// Remove what a previous attempt at this node left behind: the checkout a
-/// failure deliberately kept, and the branch under it.
+/// Free the checkout path, whatever is holding it.
 ///
-/// A re-run supersedes the earlier attempt, and git will reuse neither name
-/// while they exist — without this, resuming a run that failed inside an agent
-/// node would fail again on the worktree instead of on the work.
-async fn clear_previous_attempt(repo: &Path, path: &Path, branch: &str) -> anyhow::Result<()> {
-    // A worktree whose directory is already gone still holds its
-    // administrative entry, which is enough to make the name unusable.
+/// Jobs discard their own scratch, so anything found here is the residue of a
+/// run that died mid-node. Git will not reuse the path while it is claimed —
+/// and a worktree whose directory is already gone still holds its
+/// administrative entry, which alone is enough to make the name unusable.
+async fn clear_previous_checkout(repo: &Path, path: &Path) -> anyhow::Result<()> {
     git::prune_worktrees(repo).await?;
 
     if path.exists() {
         git::remove_worktree(repo, path).await?;
     }
+    Ok(())
+}
+
+/// Free both the checkout path and the branch name, so a fresh attempt can
+/// take them.
+async fn clear_previous_attempt(repo: &Path, path: &Path, branch: &str) -> anyhow::Result<()> {
+    clear_previous_checkout(repo, path).await?;
+
     match git::branch_exists(repo, branch).await? {
         true => git::delete_branch(repo, branch).await,
         false => Ok(()),

@@ -59,6 +59,17 @@ pub enum Command {
         revise: Option<Vec<String>>,
     },
 
+    /// Run a node again, based on its own branch, with feedback
+    ///
+    /// A new job, not a resumption: the agent's prior work arrives as files on
+    /// disk, and this round appends to the node's branch.
+    Revise {
+        run_id: u64,
+        node: String,
+        /// What to change. Defaults to the feedback recorded by `review`.
+        feedback: Option<String>,
+    },
+
     /// Remove worktrees left behind by failed nodes
     Gc {
         /// Also remove worktrees untouched for this long, e.g. "7d"

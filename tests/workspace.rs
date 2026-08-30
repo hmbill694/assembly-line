@@ -1,5 +1,5 @@
 use assembly_line::git::{self, commit_all, head_sha};
-use assembly_line::workspace::{self, node_branch_name, run_branch_name};
+use assembly_line::workspace::{self, StartPoint, node_branch_name, run_branch_name};
 use std::path::PathBuf;
 
 struct Fixture {
@@ -58,7 +58,7 @@ async fn creating_a_workspace_checks_out_the_base_commit() {
         &fx.repo,
         fx.wt_root.join("impl-auth"),
         "al/run-1-impl-auth",
-        &base,
+        StartPoint::FreshBranch(&base),
         &fx.seed,
         &[],
     )
@@ -81,7 +81,7 @@ async fn seeded_files_are_copied_in_and_kept_out_of_the_commit() {
         &fx.repo,
         fx.wt_root.join("n"),
         "al/run-1-n",
-        &base,
+        StartPoint::FreshBranch(&base),
         &fx.seed,
         &[".env".to_string()],
     )
@@ -119,7 +119,7 @@ async fn seeding_preserves_nested_paths() {
         &fx.repo,
         fx.wt_root.join("n"),
         "al/run-1-n",
-        &base,
+        StartPoint::FreshBranch(&base),
         &fx.seed,
         &[".claude/settings.local.json".to_string()],
     )
@@ -139,7 +139,7 @@ async fn a_missing_seed_path_names_the_file_and_leaves_no_worktree() {
         &fx.repo,
         &path,
         "al/run-1-n",
-        &base,
+        StartPoint::FreshBranch(&base),
         &fx.seed,
         &["nope.env".to_string()],
     )
@@ -160,7 +160,7 @@ async fn committing_an_untouched_workspace_produces_nothing() {
         &fx.repo,
         fx.wt_root.join("n"),
         "al/run-1-n",
-        &base,
+        StartPoint::FreshBranch(&base),
         &fx.seed,
         &[],
     )
@@ -184,7 +184,7 @@ async fn discarding_a_workspace_removes_it_but_keeps_the_branch() {
         &fx.repo,
         fx.wt_root.join("n"),
         "al/run-1-n",
-        &base,
+        StartPoint::FreshBranch(&base),
         &fx.seed,
         &[],
     )
@@ -200,24 +200,85 @@ async fn discarding_a_workspace_removes_it_but_keeps_the_branch() {
     );
 }
 
+/// What a revise round does: the checkout from the last round is long gone,
+/// but continuing the branch puts that work back on disk. This is the whole
+/// mechanism by which an agent revises rather than restarts — no worktree had
+/// to be kept alive to make it happen.
 #[tokio::test]
-async fn a_second_attempt_supersedes_the_worktree_and_branch_of_the_first() {
-    // A failed node keeps its worktree, and its branch outlives that. Git will
-    // reuse neither name, so resuming into the same node has to clear both —
-    // otherwise the retry fails on the sandbox instead of on the work.
+async fn continuing_a_branch_restores_the_previous_rounds_work() {
     let fx = Fixture::new().await;
     let base = head_sha(&fx.repo).await.unwrap();
     let path = fx.wt_root.join("n");
 
-    let first = workspace::create(&fx.repo, &path, "al/run-1-n", &base, &fx.seed, &[])
+    let round_one = workspace::create(
+        &fx.repo,
+        &path,
+        "al/run-1-n",
+        StartPoint::FreshBranch(&base),
+        &fx.seed,
+        &[],
+    )
+    .await
+    .unwrap();
+    std::fs::write(round_one.path.join("work.txt"), "round one\n").unwrap();
+    let first_sha = workspace::commit(&round_one, "round 1")
         .await
+        .unwrap()
         .unwrap();
+    workspace::discard(&fx.repo, &round_one).await.unwrap();
+    assert!(!path.exists(), "the round's scratch is gone");
+
+    let round_two = workspace::create(
+        &fx.repo,
+        &path,
+        "al/run-1-n",
+        StartPoint::ContinueBranch,
+        &fx.seed,
+        &[],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(round_two.path.join("work.txt")).unwrap(),
+        "round one\n",
+        "the agent cannot revise work it cannot see"
+    );
+    assert_eq!(head_sha(&round_two.path).await.unwrap(), first_sha);
+}
+
+#[tokio::test]
+async fn a_second_attempt_supersedes_the_worktree_and_branch_of_the_first() {
+    // A run that died mid-node can orphan a checkout, and its branch outlives
+    // that. Git will reuse neither name, so a fresh attempt has to clear both —
+    // otherwise it fails on the sandbox instead of on the work.
+    let fx = Fixture::new().await;
+    let base = head_sha(&fx.repo).await.unwrap();
+    let path = fx.wt_root.join("n");
+
+    let first = workspace::create(
+        &fx.repo,
+        &path,
+        "al/run-1-n",
+        StartPoint::FreshBranch(&base),
+        &fx.seed,
+        &[],
+    )
+    .await
+    .unwrap();
     std::fs::write(first.path.join("attempt.txt"), "first try\n").unwrap();
     workspace::commit(&first, "first attempt").await.unwrap();
 
-    let second = workspace::create(&fx.repo, &path, "al/run-1-n", &base, &fx.seed, &[])
-        .await
-        .unwrap();
+    let second = workspace::create(
+        &fx.repo,
+        &path,
+        "al/run-1-n",
+        StartPoint::FreshBranch(&base),
+        &fx.seed,
+        &[],
+    )
+    .await
+    .unwrap();
 
     assert!(
         !second.path.join("attempt.txt").exists(),
@@ -234,14 +295,28 @@ async fn a_branch_left_without_its_worktree_does_not_block_the_next_attempt() {
     let base = head_sha(&fx.repo).await.unwrap();
     let path = fx.wt_root.join("n");
 
-    let first = workspace::create(&fx.repo, &path, "al/run-1-n", &base, &fx.seed, &[])
-        .await
-        .unwrap();
+    let first = workspace::create(
+        &fx.repo,
+        &path,
+        "al/run-1-n",
+        StartPoint::FreshBranch(&base),
+        &fx.seed,
+        &[],
+    )
+    .await
+    .unwrap();
     workspace::discard(&fx.repo, &first).await.unwrap();
     assert!(git::branch_exists(&fx.repo, "al/run-1-n").await.unwrap());
 
-    let second = workspace::create(&fx.repo, &path, "al/run-1-n", &base, &fx.seed, &[])
-        .await
-        .unwrap();
+    let second = workspace::create(
+        &fx.repo,
+        &path,
+        "al/run-1-n",
+        StartPoint::FreshBranch(&base),
+        &fx.seed,
+        &[],
+    )
+    .await
+    .unwrap();
     assert!(second.path.join("README.md").is_file());
 }

@@ -467,6 +467,90 @@ fn approve_and_revise_cannot_both_be_given() {
     discard_worktrees(&tmp);
 }
 
+/// The heart of the stateless design: a revise is a new job, and the agent
+/// sees its prior work because that work *is* the branch it starts from.
+/// Nothing was kept on disk between the two rounds.
+#[test]
+fn a_revise_round_continues_the_branch_instead_of_starting_over() {
+    let tmp = repo_with_commit();
+    std::fs::write(
+        tmp.path().join("graph.toml"),
+        gated_agent_graph("revising-agent.sh"),
+    )
+    .unwrap();
+
+    assembly(&tmp)
+        .args(["run", "graph.toml"])
+        .assert()
+        .success();
+
+    assembly(&tmp)
+        .args(["review", "--revise", "n", "add error handling"])
+        .assert()
+        .success();
+
+    assembly(&tmp)
+        .args(["revise", "1", "n"])
+        .assert()
+        .success()
+        .stdout(contains("round 2"));
+
+    // Two commits on the node's branch, not one replaced by another.
+    let commits = std::process::Command::new("git")
+        .args([
+            "-C",
+            tmp.path().to_str().unwrap(),
+            "rev-list",
+            "--count",
+            "al/run-1-n",
+        ])
+        .output()
+        .unwrap();
+    let count: usize = String::from_utf8_lossy(&commits.stdout)
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        count >= 3,
+        "expected base + two rounds, got {count} commits"
+    );
+
+    // The agent appended, which it could only do having seen round 1's file.
+    let file = std::process::Command::new("git")
+        .args([
+            "-C",
+            tmp.path().to_str().unwrap(),
+            "show",
+            "al/run-1-n:rounds.txt",
+        ])
+        .output()
+        .unwrap();
+    let body = String::from_utf8_lossy(&file.stdout);
+    assert!(
+        body.starts_with("hi\n"),
+        "round 1's line is gone, so round 2 started from scratch: {body}"
+    );
+    assert!(
+        body.contains("add error handling"),
+        "round 2 never saw the feedback: {body}"
+    );
+
+    discard_worktrees(&tmp);
+}
+
+#[test]
+fn revising_without_any_feedback_says_how_to_give_some() {
+    let tmp = run_gated_agent();
+
+    assembly(&tmp)
+        .args(["revise", "1", "n"])
+        .assert()
+        .failure()
+        .stderr(contains("no feedback for 'n'").and(contains("--revise")));
+
+    discard_worktrees(&tmp);
+}
+
 #[test]
 fn meta_records_the_run_branch_only_when_the_graph_has_agent_nodes() {
     let tmp = repo_with_commit();

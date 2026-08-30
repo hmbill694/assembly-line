@@ -82,6 +82,17 @@ pub async fn head_sha(repo: impl AsRef<Path>) -> anyhow::Result<String> {
     run_expecting_success(repo, &["rev-parse", "HEAD"], "rev-parse HEAD").await
 }
 
+/// The commit `branch` points at. A revise round starts here, so the agent
+/// sees its own prior work rather than starting over.
+pub async fn branch_tip(repo: impl AsRef<Path>, branch: &str) -> anyhow::Result<String> {
+    run_expecting_success(
+        repo,
+        &["rev-parse", &format!("refs/heads/{branch}")],
+        &format!("rev-parse {branch}"),
+    )
+    .await
+}
+
 /// The checked-out branch, or `None` when HEAD is detached.
 pub async fn current_branch(repo: impl AsRef<Path>) -> anyhow::Result<Option<String>> {
     let name =

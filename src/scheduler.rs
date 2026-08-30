@@ -165,6 +165,10 @@ struct AgentNodePlan {
     command: CommandSpec,
     commit_message: String,
     remote: String,
+    /// A first attempt cuts a fresh branch off the run branch; a revise round
+    /// continues the node's own branch, so the agent starts from its prior
+    /// work.
+    continues_branch: bool,
 }
 
 /// Nodes that may start right now: dependency-ready, within the job cap, and
@@ -231,12 +235,27 @@ fn commit_message(node: &str, prompt: &str) -> String {
 ///
 /// The error is a message rather than a typed value because its only
 /// destination is the node's `NodeFailed` reason.
+/// The prompt a revise round carries: what was originally asked, then what to
+/// change about the answer.
+///
+/// The agent's prior work is already committed in the tree it is about to be
+/// dropped into, so the feedback is the only new context it needs. That is
+/// what makes revising behave identically across every provider — no session
+/// replay, no conversation history.
+fn revised_prompt(original: &str, feedback: &str) -> String {
+    format!(
+        "{original}\n\n---\n\nYour previous attempt is already committed in this \
+         working tree. Revise it based on this feedback:\n\n{feedback}\n"
+    )
+}
+
 fn agent_node_plan(
     graph: &Graph,
     task: &Task,
     paths: &RunPaths,
     opts: &RunOpts,
     run_branch: Option<&RunBranch>,
+    revision: Option<&str>,
 ) -> Result<AgentNodePlan, String> {
     let run_branch = run_branch.ok_or(
         "agent nodes need a git repository to create worktrees from, and this run has none",
@@ -255,7 +274,13 @@ fn agent_node_plan(
         .node_worktree(&run_branch.repo, &task.id)
         .ok_or("HOME is unset, so assembly-line has nowhere to put worktrees")?;
 
-    let prompt = task.prompt.clone().unwrap_or_default();
+    let original = task.prompt.clone().unwrap_or_default();
+    // The commit subject keeps using the original's first line, so `git log`
+    // reads the same across rounds.
+    let prompt = revision.map_or_else(
+        || original.clone(),
+        |feedback| revised_prompt(&original, feedback),
+    );
 
     Ok(AgentNodePlan {
         node: task.id.clone(),
@@ -265,9 +290,85 @@ fn agent_node_plan(
         seed_from: opts.seed_from.clone(),
         copy_paths: declared_copy_paths(graph, task),
         command: render_command(provider, &prompt),
-        commit_message: commit_message(&task.id, &prompt),
+        commit_message: commit_message(&task.id, &original),
         remote: opts.remote.clone(),
+        continues_branch: revision.is_some(),
     })
+}
+
+/// One revise round: which node, what to change about it, and which round
+/// this is.
+#[derive(Debug, Clone, Copy)]
+pub struct Revision<'a> {
+    pub node: &'a str,
+    pub feedback: &'a str,
+    pub round: u32,
+}
+
+/// Run one node again, based at its own branch, with feedback folded into its
+/// prompt. Returns whether the round failed.
+///
+/// A revise is a *new job*, not a resumption. Nothing was kept from the last
+/// round except the branch — which is exactly what the agent needs, because
+/// its prior work arrives as files on disk.
+///
+/// # Errors
+///
+/// Returns an error if the node is not an agent node the graph declares, if
+/// the run has no repository, or if the event log cannot be appended to. A
+/// round that runs and fails is not an error — that is the returned flag.
+pub async fn revise_node(
+    graph: &Graph,
+    paths: &RunPaths,
+    log: &mut EventLog,
+    state: &mut RunState,
+    opts: &RunOpts,
+    revision: &Revision<'_>,
+) -> anyhow::Result<bool> {
+    let Revision {
+        node,
+        feedback,
+        round,
+    } = *revision;
+
+    let task = graph
+        .tasks
+        .iter()
+        .find(|t| t.id == node)
+        .ok_or_else(|| anyhow::anyhow!("the graph has no task '{node}'"))?;
+    anyhow::ensure!(
+        task.kind == TaskKind::Agent,
+        "only agent nodes carry work to revise, and '{node}' is a shell node"
+    );
+
+    let repo = opts
+        .repo
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("revising needs a git repository"))?;
+    let run_branch = prepare_run_branch(repo, paths).await?;
+
+    let plan = agent_node_plan(graph, task, paths, opts, Some(&run_branch), Some(feedback))
+        .map_err(|reason| anyhow::anyhow!(reason))?;
+
+    let ev = log.append(EventKind::NodeStarted {
+        node: node.to_string(),
+        round,
+    })?;
+    state.apply(&ev.kind);
+
+    let result = agent_node_result(
+        &plan,
+        &paths.log(node),
+        wall_clock_limit(task)?,
+        opts.cancel.clone(),
+    )
+    .await
+    .unwrap_or_else(|e| NodeResult::Failed {
+        reason: e.to_string(),
+        work: None,
+    });
+
+    record_completion(log, state, node, task.supervise != Supervise::None, result)
 }
 
 /// Run one agent node end to end: sandbox, agent, commit, publish, merge.
@@ -282,12 +383,23 @@ async fn agent_node_result(
     timeout: Option<Duration>,
     cancel: CancellationToken,
 ) -> anyhow::Result<NodeResult> {
-    let base_sha = plan.run_branch.current_tip().await?;
+    // A first attempt branches from everything merged so far; a revise round
+    // branches from its own last round, so its diff reports what *this* round
+    // changed.
+    let base_sha = match plan.continues_branch {
+        true => git::branch_tip(&plan.run_branch.repo, &plan.branch).await?,
+        false => plan.run_branch.current_tip().await?,
+    };
+    let start = match plan.continues_branch {
+        true => workspace::StartPoint::ContinueBranch,
+        false => workspace::StartPoint::FreshBranch(&base_sha),
+    };
+
     let ws = workspace::create(
         &plan.run_branch.repo,
         &plan.workspace_path,
         &plan.branch,
-        &base_sha,
+        start,
         &plan.seed_from,
         &plan.copy_paths,
     )
@@ -603,7 +715,7 @@ pub async fn execute(
                         });
                     }
                     TaskKind::Agent => {
-                        match agent_node_plan(graph, task, paths, opts, run_branch.as_ref()) {
+                        match agent_node_plan(graph, task, paths, opts, run_branch.as_ref(), None) {
                             Err(reason) => {
                                 in_flight.spawn(async move {
                                     NodeCompletion {

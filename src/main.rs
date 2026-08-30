@@ -30,6 +30,11 @@ fn main() -> ExitCode {
             approve,
             revise,
         } => review_run(run_id, approve, revise.as_deref()),
+        Command::Revise {
+            run_id,
+            node,
+            feedback,
+        } => in_async_runtime(revise_node_of_run(run_id, node, feedback)),
         Command::Gc {
             older_than,
             dry_run,
@@ -416,6 +421,107 @@ fn review_run(run_id: Option<u64>, approve: Option<String>, revise: Option<&[Str
     }
     report_blast_radius(&meta.graph, &node);
     ExitCode::SUCCESS
+}
+
+/// How many rounds this node has already had, so the next one is numbered.
+fn rounds_so_far(events: &[assembly_line::event::Event], node: &str) -> u32 {
+    u32::try_from(
+        events
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::NodeStarted { node: n, .. } if n == node))
+            .count(),
+    )
+    .unwrap_or(u32::MAX)
+}
+
+/// The feedback `review --revise` recorded for this node, if any.
+fn feedback_recorded_for(events: &[assembly_line::event::Event], node: &str) -> Option<String> {
+    events.iter().rev().find_map(|e| match &e.kind {
+        EventKind::NodeRevisionRequested { node: n, feedback } if n == node => {
+            Some(feedback.clone())
+        }
+        _ => None,
+    })
+}
+
+/// Run one node again with feedback. The round appends to the node's branch.
+async fn revise_node_of_run(run_id: u64, node: String, feedback: Option<String>) -> ExitCode {
+    let (run, meta) = match locate_run(Some(run_id)) {
+        Ok(found) => found,
+        Err(e) => return fail_with_usage_error(e),
+    };
+
+    let graph = match config::load_graph(&meta.graph) {
+        Ok(graph) => graph,
+        Err(e) => return fail_with_usage_error(e),
+    };
+
+    let events = match EventLog::read(run.events()) {
+        Ok(events) => events,
+        Err(e) => return fail_with_usage_error(format!("reading the event log: {e}")),
+    };
+
+    // Given on the command line, or left behind by `review --revise`. Without
+    // either there is nothing to tell the agent, so this is a usage error
+    // rather than a silent no-op round.
+    let Some(feedback) = feedback.or_else(|| feedback_recorded_for(&events, &node)) else {
+        return fail_with_usage_error(format!(
+            "no feedback for '{node}' — pass it here, or record it with \
+             `assembly review {run_id} --revise {node} \"...\"`"
+        ));
+    };
+
+    let repo_root = match enclosing_repo_root() {
+        Ok(root) => root,
+        Err(e) => return fail_with_usage_error(e),
+    };
+    let seed_from = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(e) => return fail_with_usage_error(e),
+    };
+
+    let ids: Vec<String> = graph.tasks.iter().map(|t| t.id.clone()).collect();
+    let mut state = RunState::replay(&ids, &events);
+    let mut log = match EventLog::open_append(run.events()) {
+        Ok(log) => log,
+        Err(e) => return fail_with_usage_error(format!("opening the event log: {e}")),
+    };
+
+    let cancel = CancellationToken::new();
+    cancel_on_ctrl_c(cancel.clone());
+
+    let opts = RunOpts {
+        jobs: 1,
+        cwd: repo_root.clone(),
+        cancel,
+        repo: Some(repo_root),
+        seed_from,
+        remote: assembly_line::workspace::DEFAULT_REMOTE.to_string(),
+    };
+
+    let round = rounds_so_far(&events, &node) + 1;
+    println!("revising '{node}' (round {round})");
+
+    let revision = assembly_line::scheduler::Revision {
+        node: &node,
+        feedback: &feedback,
+        round,
+    };
+
+    match assembly_line::scheduler::revise_node(
+        &graph, &run, &mut log, &mut state, &opts, &revision,
+    )
+    .await
+    {
+        Err(e) => fail_with_usage_error(e),
+        Ok(node_failed) => {
+            print_run_outcome(&run, &meta.graph, RunStatus::Partial, &state);
+            match node_failed {
+                true => ExitCode::from(EXIT_RUN_INCOMPLETE),
+                false => ExitCode::SUCCESS,
+            }
+        }
+    }
 }
 
 /// A run's worktree directory that nothing needs any more.
