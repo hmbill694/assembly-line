@@ -355,6 +355,118 @@ fn gc_collects_a_runs_worktrees_only_once_its_run_state_is_gone() {
     discard_worktrees(&tmp);
 }
 
+/// A graph whose single agent node asks for a gate. With nobody at the gate
+/// the node still merges, and waits in the inbox instead of stalling the run.
+fn gated_agent_graph(script: &str) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(script);
+    format!(
+        "[providers.fake]\ncmd = \"bash\"\nargs = [\"{}\", \"{{prompt}}\", \"x\"]\n\
+         [[task]]\nid = \"n\"\nkind = \"agent\"\nprovider = \"fake\"\nprompt = \"hi\"\n\
+         supervise = \"on-complete\"\n",
+        path.display()
+    )
+}
+
+fn run_gated_agent() -> tempfile::TempDir {
+    let tmp = repo_with_commit();
+    std::fs::write(
+        tmp.path().join("graph.toml"),
+        gated_agent_graph("fake-agent.sh"),
+    )
+    .unwrap();
+    assembly(&tmp)
+        .args(["run", "graph.toml"])
+        .assert()
+        .success();
+    tmp
+}
+
+#[test]
+fn review_lists_a_deferred_gate_with_its_branch() {
+    let tmp = run_gated_agent();
+
+    assembly(&tmp).args(["review"]).assert().success().stdout(
+        contains("1 awaiting review")
+            .and(contains("n"))
+            .and(contains("al/run-1-n")),
+    );
+
+    discard_worktrees(&tmp);
+}
+
+#[test]
+fn approving_clears_the_node_from_the_inbox() {
+    let tmp = run_gated_agent();
+
+    assembly(&tmp)
+        .args(["review", "--approve", "n"])
+        .assert()
+        .success()
+        .stdout(contains("approved 'n'"));
+
+    assembly(&tmp)
+        .args(["review"])
+        .assert()
+        .success()
+        .stdout(contains("nothing awaiting review"));
+
+    discard_worktrees(&tmp);
+}
+
+#[test]
+fn requesting_a_revision_records_the_feedback_and_points_at_the_next_step() {
+    let tmp = run_gated_agent();
+
+    assembly(&tmp)
+        .args(["review", "--revise", "n", "use argon2, not bcrypt"])
+        .assert()
+        .success()
+        .stdout(contains("sent 'n' back"));
+
+    let log = std::fs::read_to_string(tmp.path().join(".assembly/runs/1/events.jsonl")).unwrap();
+    assert!(log.contains("use argon2, not bcrypt"), "{log}");
+
+    discard_worktrees(&tmp);
+}
+
+/// A verdict is only meaningful on work that actually reached a gate.
+#[test]
+fn ruling_on_a_node_that_is_not_awaiting_review_is_refused() {
+    let tmp = run_gated_agent();
+
+    assembly(&tmp)
+        .args(["review", "--approve", "n"])
+        .assert()
+        .success();
+    assembly(&tmp)
+        .args(["review", "--approve", "n"])
+        .assert()
+        .failure()
+        .stderr(contains("approved").and(contains("awaiting review")));
+
+    assembly(&tmp)
+        .args(["review", "--approve", "ghost"])
+        .assert()
+        .failure()
+        .stderr(contains("no node 'ghost'"));
+
+    discard_worktrees(&tmp);
+}
+
+#[test]
+fn approve_and_revise_cannot_both_be_given() {
+    let tmp = run_gated_agent();
+
+    assembly(&tmp)
+        .args(["review", "--approve", "n", "--revise", "n", "why"])
+        .assert()
+        .failure();
+
+    discard_worktrees(&tmp);
+}
+
 #[test]
 fn meta_records_the_run_branch_only_when_the_graph_has_agent_nodes() {
     let tmp = repo_with_commit();

@@ -39,6 +39,26 @@ pub enum Command {
         run_id: Option<u64>,
     },
 
+    /// List work whose gate was deferred, or rule on it
+    ///
+    /// An unsupervised run never blocks: a gated node merges on `verify` and
+    /// waits here instead.
+    Review {
+        /// Defaults to the most recent run
+        run_id: Option<u64>,
+        /// Accept a node's work
+        #[arg(long, value_name = "NODE")]
+        approve: Option<String>,
+        /// Send a node's work back, with feedback for the next round
+        #[arg(
+            long,
+            num_args = 2,
+            value_names = ["NODE", "FEEDBACK"],
+            conflicts_with = "approve"
+        )]
+        revise: Option<Vec<String>>,
+    },
+
     /// Remove worktrees left behind by failed nodes
     Gc {
         /// Also remove worktrees untouched for this long, e.g. "7d"
