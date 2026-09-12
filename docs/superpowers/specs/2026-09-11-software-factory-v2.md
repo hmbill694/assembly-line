@@ -241,9 +241,11 @@ never share a directory.
 
 Two signals, with different jobs:
 
-- **`verify`, in-job, before pushing.** A fast local filter so the factory
-  never opens a pull request on code that does not compile, and the signal the
-  tester loop iterates against without paying for a CI cycle per round.
+- **`verify`, in-job, after the commit.** A fast local filter so the factory
+  never *delivers* a pull request on code that does not compile, and the
+  signal the tester loop iterates against without paying for a CI cycle per
+  round. The branch is published either way — a rejected job is exactly the
+  case where the diff is worth reading.
 - **Forge CI, as the merge gate.** It is what branch protection actually
   enforces, so it is what "green" has to mean.
 

@@ -91,6 +91,14 @@ impl JobProgress {
                 branch: Some(branch.clone()),
                 ..self
             },
+            // A progress marker, like `JobCommitted` — the transition to
+            // `Failed` comes from the `JobFailed` that always follows it.
+            // Setting `detail` here only matters if that invariant is ever
+            // broken; when it holds, `JobFailed`'s reason overwrites it.
+            EventKind::JobVerifyFailed { reason } => JobProgress {
+                detail: Some(format!("verify rejected the work: {reason}")),
+                ..self
+            },
             EventKind::JobFinished { .. } => JobProgress {
                 state: JobState::Succeeded,
                 last_attempt_duration: self.time_spent_until(event.at),

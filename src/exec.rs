@@ -44,8 +44,8 @@ fn open_log_for_append(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// Run `cmd` under `sh -c`, appending both stdout and stderr to `log_path`.
-/// Used for `run` and `verify`, where the user wrote a shell line and expects
-/// pipes and redirection to work.
+/// Used for `verify`, where the user wrote a shell line and expects pipes and
+/// redirection to work.
 ///
 /// # Errors
 ///

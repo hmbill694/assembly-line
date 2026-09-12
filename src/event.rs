@@ -35,6 +35,18 @@ pub enum EventKind {
         branch: String,
         pushed_to: Option<String>,
     },
+    /// `verify` ran to completion and rejected the work. Recorded before
+    /// [`EventKind::JobFailed`], so a reader can tell a rejected job from one
+    /// whose agent crashed.
+    ///
+    /// `reason` is how `verify` failed — `exit 1` — not what it printed; the
+    /// command's output is in the job's log. Written only for a verdict
+    /// `verify` actually reached: a run that was cancelled or cut off at
+    /// `max_duration` judged nothing, and this event would claim otherwise in
+    /// a log that can never be corrected.
+    JobVerifyFailed {
+        reason: String,
+    },
     JobFinished {
         exit_code: i32,
     },

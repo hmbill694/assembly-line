@@ -6,7 +6,7 @@
 
 use crate::config::{ConfigError, RepoConfig, parse_duration};
 use crate::event::{EventKind, EventLog};
-use crate::exec::{ShellOutcome, run_command};
+use crate::exec::{ShellOutcome, run_command, run_shell};
 use crate::git;
 use crate::paths::{self, JobMeta, JobPaths};
 use crate::provider::{CommandSpec, render_command};
@@ -50,7 +50,8 @@ struct AgentWork {
     branch: String,
     sha: String,
     stat: git::DiffStat,
-    /// The remote the branch reached, or `None` for a repository with none.
+    /// The remote the branch reached, or `None` for a repository with no such
+    /// remote — or one that refused the push.
     pushed_to: Option<String>,
 }
 
@@ -61,6 +62,13 @@ enum JobResult {
     Succeeded,
     /// An agent left work, which was committed and published.
     Committed { work: AgentWork },
+    /// `verify` rejected an otherwise-successful round. The work — if there
+    /// was any — is preserved regardless: a rejection is exactly the case
+    /// where the diff is worth reading.
+    VerifyRejected {
+        reason: String,
+        work: Option<AgentWork>,
+    },
     /// `work` carries whatever the agent had produced before it failed. That
     /// work is preserved on the job's branch.
     Failed {
@@ -83,11 +91,13 @@ impl JobResult {
         }
     }
 
-    /// The reason this round failed, if it did.
+    /// The reason this round failed, if the agent itself is what failed it.
     fn failure_reason(self) -> Option<String> {
         match self {
             JobResult::Failed { reason, .. } => Some(reason),
-            _ => None,
+            JobResult::Succeeded
+            | JobResult::Committed { .. }
+            | JobResult::VerifyRejected { .. } => None,
         }
     }
 }
@@ -112,6 +122,10 @@ struct JobPlan {
     /// continues the job's own branch, so the agent starts from its prior
     /// work.
     continues_branch: bool,
+    /// The command that decides whether the round's work is accepted, or
+    /// `None` for a repository with no `verify` — which accepts on the
+    /// agent's exit code alone.
+    verify: Option<String>,
 }
 
 fn wall_clock_limit(config: &RepoConfig) -> anyhow::Result<Option<Duration>> {
@@ -179,6 +193,7 @@ fn job_plan(
         commit_message: commit_message(paths.id, spec.prompt),
         remote: opts.remote.clone(),
         continues_branch: spec.round > 1,
+        verify: config.verify.clone(),
     })
 }
 
@@ -306,26 +321,103 @@ async fn round_result(
     .await?;
 
     let ran = JobResult::from_command(
-        run_command(&plan.command, &ws.path, log_path, timeout, cancel).await,
+        run_command(&plan.command, &ws.path, log_path, timeout, cancel.clone()).await,
     );
+    // Taken once, up front: it decides both whether `verify` is worth running
+    // and how the round ends, and an agent failure wins over either answer.
+    let agent_failure = ran.failure_reason();
 
     // Preserve first, judge after — and discard the checkout whichever way
     // preserving went. The checkout is scratch holding whatever was seeded
     // into it, so leaving it for `gc` because a git call failed is not an
     // option; both outcomes are held and reported after it is gone.
+    //
+    // `verify` runs here too, in this same checkout, after the commit: it
+    // judges exactly the tree the branch now carries, and what it gates is
+    // delivery, never the branch's survival. A round whose agent already
+    // failed skips it: there is nothing to judge but an abandoned tree, the
+    // answer could not change the outcome, and `verify` is a user-authored
+    // shell line that gets its own full `max_duration` — running it on the
+    // failure path would silently double the wall-clock cap.
     let preserved = agent_work_on_branch(plan, &ws).await;
+    let verdict = match agent_failure {
+        Some(_) => Ok(VerifyVerdict::NoObjection),
+        None => verify_verdict(plan.verify.as_deref(), &ws.path, log_path, timeout, cancel).await,
+    };
     let discarded = workspace::discard(&plan.repo, &ws).await;
     let work = preserved?;
+    let verdict = verdict?;
     discarded?;
 
-    if let Some(reason) = ran.failure_reason() {
-        return Ok(JobResult::Failed { reason, work });
-    }
-
-    Ok(match work {
-        None => JobResult::Succeeded,
-        Some(work) => JobResult::Committed { work },
+    Ok(match (agent_failure, verdict) {
+        // The two failures that are not judgements about the work: an agent
+        // failure, which is the earlier and more fundamental one and is why
+        // `verify` was never asked; and a `verify` killed before it could
+        // judge anything, which fails the round as itself rather than as a
+        // rejection.
+        (Some(reason), _) | (None, VerifyVerdict::Interrupted { reason }) => {
+            JobResult::Failed { reason, work }
+        }
+        (None, VerifyVerdict::Rejected { reason }) => JobResult::VerifyRejected { reason, work },
+        (None, VerifyVerdict::NoObjection) => match work {
+            None => JobResult::Succeeded,
+            Some(work) => JobResult::Committed { work },
+        },
     })
+}
+
+/// What `verify` had to say about the tree the branch carries.
+#[derive(Debug)]
+enum VerifyVerdict {
+    /// Nothing `verify` holds against the round: it exited 0, the repository
+    /// configures no `verify`, or the agent had already failed and there was
+    /// nothing left worth judging.
+    NoObjection,
+    /// `verify` ran to completion and exited non-zero — a judgement about the
+    /// work, and the only thing that gates delivery.
+    Rejected { reason: String },
+    /// `verify` was killed before it could judge anything: cancelled, or cut
+    /// off at `max_duration`. Ctrl-C during a long test suite is ordinary,
+    /// and recording it as a rejection would put a claim about the work into
+    /// an append-only log that can never be corrected.
+    Interrupted { reason: String },
+}
+
+/// What `verify` made of what the agent left. A repository with no `verify`
+/// raises no objection, so the round succeeds on the agent's exit code alone.
+///
+/// Runs in the job's own checkout, after the commit, so it judges exactly the
+/// tree the branch carries.
+///
+/// The outcome is matched here rather than flattened through
+/// `ShellOutcome::failure_reason`, which cannot tell `exit 1` from a kill: a
+/// rejection is a verdict about the work, and an interruption is the absence
+/// of one.
+async fn verify_verdict(
+    verify: Option<&str>,
+    workspace: &Path,
+    log_path: &Path,
+    timeout: Option<Duration>,
+    cancel: CancellationToken,
+) -> anyhow::Result<VerifyVerdict> {
+    let Some(command) = verify else {
+        return Ok(VerifyVerdict::NoObjection);
+    };
+
+    Ok(
+        match run_shell(command, workspace, log_path, timeout, cancel).await? {
+            ShellOutcome::Exited(0) => VerifyVerdict::NoObjection,
+            ShellOutcome::Exited(code) => VerifyVerdict::Rejected {
+                reason: format!("exit {code}"),
+            },
+            ShellOutcome::TimedOut => VerifyVerdict::Interrupted {
+                reason: "verify timed out".to_string(),
+            },
+            ShellOutcome::Cancelled => VerifyVerdict::Interrupted {
+                reason: "verify cancelled".to_string(),
+            },
+        },
+    )
 }
 
 /// What the agent left on the job's branch, or `None` when it changed nothing.
@@ -420,6 +512,20 @@ fn events_for_completion(result: JobResult) -> (Vec<EventKind>, bool) {
             work_recorded(work.as_ref())
                 .into_iter()
                 .chain([EventKind::JobFailed { reason }])
+                .collect(),
+            true,
+        ),
+        JobResult::VerifyRejected { reason, work } => (
+            work_recorded(work.as_ref())
+                .into_iter()
+                .chain([
+                    EventKind::JobVerifyFailed {
+                        reason: reason.clone(),
+                    },
+                    EventKind::JobFailed {
+                        reason: format!("verify rejected the work: {reason}"),
+                    },
+                ])
                 .collect(),
             true,
         ),
