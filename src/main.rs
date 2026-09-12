@@ -3,7 +3,6 @@ use assembly_line::dag::Validation;
 use assembly_line::event::{EventKind, EventLog, RunStatus};
 use assembly_line::paths::{RunMeta, RunPaths};
 use assembly_line::report::RunReport;
-use assembly_line::review::{ReviewInbox, ReviewState};
 use assembly_line::scheduler::{RunOpts, execute};
 use assembly_line::state::RunState;
 use assembly_line::{config, dag, delivery, gc, git, paths};
@@ -25,11 +24,6 @@ fn main() -> ExitCode {
         Command::Run { graph, jobs } => in_async_runtime(start_new_run(graph, jobs)),
         Command::Resume { run_id, jobs } => in_async_runtime(continue_existing_run(run_id, jobs)),
         Command::Status { run_id } => print_run_status(run_id),
-        Command::Review {
-            run_id,
-            approve,
-            revise,
-        } => review_run(run_id, approve, revise.as_deref()),
         Command::Revise {
             run_id,
             node,
@@ -376,98 +370,6 @@ fn print_run_status(run_id: Option<u64>) -> ExitCode {
     }
 }
 
-/// Nodes that were built on top of `node`, and so inherit any change to it.
-///
-/// A verdict passed at 9am on work that merged at 2am is not a rewind: the
-/// revision lands *on top* of whatever followed it. Saying how much followed
-/// is the difference between an informed approval and a blind one.
-fn nodes_built_on(graph_path: &Path, node: &str) -> Vec<String> {
-    config::load_graph(graph_path)
-        .ok()
-        .and_then(|graph| dag::validate(&graph).dag)
-        .map(|dag| dag.descendants(node).into_iter().collect())
-        .unwrap_or_default()
-}
-
-fn report_blast_radius(graph_path: &Path, node: &str) {
-    let built_on = nodes_built_on(graph_path, node);
-    if !built_on.is_empty() {
-        println!(
-            "note: {} node(s) branched from this work: {}",
-            built_on.len(),
-            built_on.join(", ")
-        );
-    }
-}
-
-/// List a run's deferred gates, or record a verdict on one.
-///
-/// Verdicts are appended to the same log the run wrote. The log is append-only
-/// and reviewing happens after the fact, so a verdict is just another event.
-fn review_run(run_id: Option<u64>, approve: Option<String>, revise: Option<&[String]>) -> ExitCode {
-    let (run, meta) = match locate_run(run_id) {
-        Ok(found) => found,
-        Err(e) => return fail_with_usage_error(e),
-    };
-
-    let events = match EventLog::read(run.events()) {
-        Ok(events) => events,
-        Err(e) => return fail_with_usage_error(format!("reading the event log: {e}")),
-    };
-    let inbox = ReviewInbox::from_events(run.id, &events);
-
-    // Clap guarantees the arity and the exclusivity, so the shapes below are
-    // the only reachable ones.
-    let (node, feedback) = match (approve, revise) {
-        (None, None) => {
-            print!("{}", inbox.to_terminal_list());
-            return ExitCode::SUCCESS;
-        }
-        (Some(node), _) => (node, None),
-        (None, Some([node, feedback])) => (node.clone(), Some(feedback.clone())),
-        (None, Some(_)) => return fail_with_usage_error("--revise takes a node and a message"),
-    };
-
-    match inbox.item(&node).map(|item| item.state) {
-        None => {
-            return fail_with_usage_error(format!("run {} has no node '{node}'", run.id));
-        }
-        Some(ReviewState::Unreviewed) => {}
-        Some(settled) => {
-            return fail_with_usage_error(format!(
-                "'{node}' is {} — only work awaiting review can be ruled on",
-                settled.label()
-            ));
-        }
-    }
-
-    let mut log = match EventLog::open_append(run.events()) {
-        Ok(log) => log,
-        Err(e) => return fail_with_usage_error(format!("opening the event log: {e}")),
-    };
-
-    let verdict = match &feedback {
-        None => EventKind::NodeApproved { node: node.clone() },
-        Some(text) => EventKind::NodeRevisionRequested {
-            node: node.clone(),
-            feedback: text.clone(),
-        },
-    };
-    if let Err(e) = log.append(verdict) {
-        return fail_with_usage_error(format!("recording the verdict: {e}"));
-    }
-
-    match feedback {
-        None => println!("approved '{node}'"),
-        Some(_) => println!(
-            "sent '{node}' back — run `assembly revise {} {node}`",
-            run.id
-        ),
-    }
-    report_blast_radius(&meta.graph, &node);
-    ExitCode::SUCCESS
-}
-
 /// How many rounds this node has already had, so the next one is numbered.
 fn rounds_so_far(events: &[assembly_line::event::Event], node: &str) -> u32 {
     u32::try_from(
@@ -479,18 +381,8 @@ fn rounds_so_far(events: &[assembly_line::event::Event], node: &str) -> u32 {
     .unwrap_or(u32::MAX)
 }
 
-/// The feedback `review --revise` recorded for this node, if any.
-fn feedback_recorded_for(events: &[assembly_line::event::Event], node: &str) -> Option<String> {
-    events.iter().rev().find_map(|e| match &e.kind {
-        EventKind::NodeRevisionRequested { node: n, feedback } if n == node => {
-            Some(feedback.clone())
-        }
-        _ => None,
-    })
-}
-
 /// Run one node again with feedback. The round appends to the node's branch.
-async fn revise_node_of_run(run_id: u64, node: String, feedback: Option<String>) -> ExitCode {
+async fn revise_node_of_run(run_id: u64, node: String, feedback: String) -> ExitCode {
     let (run, meta) = match locate_run(Some(run_id)) {
         Ok(found) => found,
         Err(e) => return fail_with_usage_error(e),
@@ -504,16 +396,6 @@ async fn revise_node_of_run(run_id: u64, node: String, feedback: Option<String>)
     let events = match EventLog::read(run.events()) {
         Ok(events) => events,
         Err(e) => return fail_with_usage_error(format!("reading the event log: {e}")),
-    };
-
-    // Given on the command line, or left behind by `review --revise`. Without
-    // either there is nothing to tell the agent, so this is a usage error
-    // rather than a silent no-op round.
-    let Some(feedback) = feedback.or_else(|| feedback_recorded_for(&events, &node)) else {
-        return fail_with_usage_error(format!(
-            "no feedback for '{node}' — pass it here, or record it with \
-             `assembly review {run_id} --revise {node} \"...\"`"
-        ));
     };
 
     let repo_root = match enclosing_repo_root() {

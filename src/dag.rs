@@ -1,4 +1,4 @@
-use crate::config::{Graph, Supervise, Task, TaskKind};
+use crate::config::{Graph, Task, TaskKind};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,16 +48,16 @@ impl std::fmt::Display for ValidationError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Warning {
-    UnsupervisedAgentWithoutVerify(String),
+    AgentWithoutVerify(String),
     CostCapWithoutAdapter { task: String, provider: String },
 }
 
 impl std::fmt::Display for Warning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnsupervisedAgentWithoutVerify(id) => write!(
+            Self::AgentWithoutVerify(id) => write!(
                 f,
-                "agent task '{id}' is unsupervised and declares no `verify` — nothing will check its output, and merge conflicts cannot be auto-resolved"
+                "agent task '{id}' declares no `verify` — nothing will check its output"
             ),
             Self::CostCapWithoutAdapter { task, provider } => write!(
                 f,
@@ -327,8 +327,10 @@ fn check_agent_task(graph: &Graph, t: &Task) -> (Vec<ValidationError>, Vec<Warni
                 Vec::new(),
             ),
             Some(p) => {
-                let unverified = (t.supervise == Supervise::None && t.verify.is_none())
-                    .then(|| Warning::UnsupervisedAgentWithoutVerify(t.id.clone()));
+                let unverified = t
+                    .verify
+                    .is_none()
+                    .then(|| Warning::AgentWithoutVerify(t.id.clone()));
                 let uncapped = (t.max_cost_usd.is_some() && p.adapter.is_none()).then(|| {
                     Warning::CostCapWithoutAdapter {
                         task: t.id.clone(),

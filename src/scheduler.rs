@@ -1,4 +1,4 @@
-use crate::config::{Graph, OnFailure, Supervise, Task, TaskKind, parse_duration};
+use crate::config::{Graph, OnFailure, Task, TaskKind, parse_duration};
 use crate::dag::Dag;
 use crate::event::{EventKind, EventLog, RunStatus};
 use crate::exec::{ShellOutcome, run_command, run_shell};
@@ -368,7 +368,7 @@ pub async fn revise_node(
         work: None,
     });
 
-    record_completion(log, state, node, task.supervise != Supervise::None, result)
+    record_completion(log, state, node, result)
 }
 
 /// Run one agent node end to end: sandbox, agent, commit, publish, merge.
@@ -505,10 +505,9 @@ fn record_completion(
     log: &mut EventLog,
     state: &mut RunState,
     node: &str,
-    gated: bool,
     result: NodeResult,
 ) -> anyhow::Result<bool> {
-    let (events, node_failed) = events_for_completion(node, gated, result);
+    let (events, node_failed) = events_for_completion(node, result);
 
     events.into_iter().try_for_each(|kind| {
         let ev = log.append(kind)?;
@@ -548,12 +547,7 @@ fn work_recorded(node: &str, work: Option<&AgentWork>) -> Vec<EventKind> {
 /// Pure, so the ordering that makes replay correct can be asserted without
 /// running anything. Work is always recorded first: a failure that produced a
 /// diff still produced a diff.
-///
-/// `gated` marks a node whose `supervise` setting asked for a human. With no
-/// one at the gate the node still merges on `verify` alone, and the gate is
-/// *deferred* rather than ignored — which is what the trailing
-/// `NodeAwaitingReview` records.
-fn events_for_completion(node: &str, gated: bool, result: NodeResult) -> (Vec<EventKind>, bool) {
+fn events_for_completion(node: &str, result: NodeResult) -> (Vec<EventKind>, bool) {
     let finished = EventKind::NodeFinished {
         node: node.to_string(),
         exit_code: 0,
@@ -562,14 +556,6 @@ fn events_for_completion(node: &str, gated: bool, result: NodeResult) -> (Vec<Ev
         node: node.to_string(),
         reason,
     };
-    // A failed node is not awaiting review, it is awaiting a fix; and a node
-    // that changed nothing has nothing to look at.
-    let deferred_gate: Vec<EventKind> = gated
-        .then(|| EventKind::NodeAwaitingReview {
-            node: node.to_string(),
-        })
-        .into_iter()
-        .collect();
 
     match result {
         NodeResult::Succeeded => (vec![finished], false),
@@ -592,7 +578,6 @@ fn events_for_completion(node: &str, gated: bool, result: NodeResult) -> (Vec<Ev
                             },
                             finished,
                         ])
-                        .chain(deferred_gate)
                         .collect(),
                     false,
                 ),
@@ -760,11 +745,7 @@ pub async fn execute(
             resources_in_use.remove(r);
         }
 
-        let gated = tasks
-            .get(completion.node.as_str())
-            .is_some_and(|t| t.supervise != Supervise::None);
-        let node_failed =
-            record_completion(log, state, &completion.node, gated, completion.result)?;
+        let node_failed = record_completion(log, state, &completion.node, completion.result)?;
         if node_failed {
             match tasks
                 .get(completion.node.as_str())

@@ -1,4 +1,4 @@
-use assembly_line::config::{OnFailure, Supervise, TaskKind, parse_duration, parse_graph};
+use assembly_line::config::{OnFailure, TaskKind, parse_duration, parse_graph};
 use std::time::Duration;
 
 const FULL: &str = r#"
@@ -21,7 +21,6 @@ needs = ["build"]
 prompt = "do the thing"
 provider = "claude"
 verify = "cargo test"
-supervise = "on-complete"
 retries = 2
 max_duration = "20m"
 resource = "postgres"
@@ -51,7 +50,6 @@ fn parses_a_full_graph() {
     assert_eq!(agent.kind, TaskKind::Agent);
     assert_eq!(agent.needs, vec!["build".to_string()]);
     assert_eq!(agent.provider.as_deref(), Some("claude"));
-    assert_eq!(agent.supervise, Supervise::OnComplete);
     assert_eq!(agent.on_failure, OnFailure::Abort);
     assert_eq!(agent.retries, 2);
     assert_eq!(agent.resource.as_deref(), Some("postgres"));
@@ -64,7 +62,6 @@ fn applies_defaults() {
     let t = &g.tasks[0];
     assert!(t.needs.is_empty());
     assert!(t.copy.is_empty());
-    assert_eq!(t.supervise, Supervise::None);
     assert_eq!(t.on_failure, OnFailure::Skip);
     assert_eq!(t.retries, 0);
     assert!(t.max_cost_usd.is_none());

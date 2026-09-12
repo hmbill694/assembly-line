@@ -76,16 +76,6 @@ pub enum TaskKind {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum Supervise {
-    #[default]
-    None,
-    Pre,
-    OnComplete,
-    Both,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
 pub enum OnFailure {
     #[default]
     Skip,
@@ -119,8 +109,6 @@ pub struct Task {
     pub resource: Option<String>,
     #[serde(default)]
     pub copy: Vec<String>,
-    #[serde(default)]
-    pub supervise: Supervise,
     #[serde(default)]
     pub retries: u32,
     pub max_duration: Option<String>,

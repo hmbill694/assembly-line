@@ -192,14 +192,14 @@ fn rejects_unknown_provider() {
 }
 
 #[test]
-fn warns_on_unsupervised_agent_without_verify() {
+fn warns_on_agent_without_verify() {
     let src = "[providers.p]\ncmd=\"true\"\n\
                [[task]]\nid=\"a\"\nkind=\"agent\"\nprompt=\"hi\"\nprovider=\"p\"\n";
     let v = validate(&parse_graph(src).unwrap());
     assert!(v.errors.is_empty(), "{:?}", v.errors);
     assert!(
         v.warnings
-            .contains(&Warning::UnsupervisedAgentWithoutVerify("a".into())),
+            .contains(&Warning::AgentWithoutVerify("a".into())),
         "{:?}",
         v.warnings
     );

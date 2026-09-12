@@ -39,26 +39,6 @@ pub enum Command {
         run_id: Option<u64>,
     },
 
-    /// List work whose gate was deferred, or rule on it
-    ///
-    /// An unsupervised run never blocks: a gated node merges on `verify` and
-    /// waits here instead.
-    Review {
-        /// Defaults to the most recent run
-        run_id: Option<u64>,
-        /// Accept a node's work
-        #[arg(long, value_name = "NODE")]
-        approve: Option<String>,
-        /// Send a node's work back, with feedback for the next round
-        #[arg(
-            long,
-            num_args = 2,
-            value_names = ["NODE", "FEEDBACK"],
-            conflicts_with = "approve"
-        )]
-        revise: Option<Vec<String>>,
-    },
-
     /// Run a node again, based on its own branch, with feedback
     ///
     /// A new job, not a resumption: the agent's prior work arrives as files on
@@ -66,8 +46,8 @@ pub enum Command {
     Revise {
         run_id: u64,
         node: String,
-        /// What to change. Defaults to the feedback recorded by `review`.
-        feedback: Option<String>,
+        /// What to change about the previous round's work
+        feedback: String,
     },
 
     /// Remove worktrees left behind by failed nodes
