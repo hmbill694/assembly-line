@@ -1,5 +1,4 @@
 use assembly_line::config::parse_graph;
-use assembly_line::dag::Dag;
 use assembly_line::event::{EventKind, EventLog, RunStatus};
 use assembly_line::git::{self, commit_all};
 use assembly_line::paths::{create_run, repo_worktrees_root, runs_root};
@@ -59,9 +58,9 @@ impl Harness {
     }
 }
 
-/// A chain whose first node is always marked complete by hand before a test
-/// even starts — resume must not run it again — while the rest run for real
-/// through a trivial provider.
+/// A set of independent tasks whose first is always marked complete by hand
+/// before a test even starts — resume must not run it again — while the rest
+/// run for real through a trivial provider.
 const CHAIN: &str = r#"
 [providers.run]
 cmd = "bash"
@@ -73,13 +72,11 @@ prompt = "unused — this node is never actually launched"
 
 [[task]]
 id = "two"
-needs = ["one"]
 provider = "run"
 prompt = "true"
 
 [[task]]
 id = "three"
-needs = ["two"]
 provider = "run"
 prompt = "true"
 "#;
@@ -88,7 +85,7 @@ prompt = "true"
 async fn resume_does_not_rerun_completed_nodes() {
     let h = Harness::new().await;
     let graph = parse_graph(CHAIN).unwrap();
-    let dag = Dag::build(&graph.tasks).unwrap();
+    let ids: Vec<String> = graph.tasks.iter().map(|t| t.id.clone()).collect();
     let paths = create_run(&runs_root(h.tmp.path()), 1).unwrap();
 
     // Stand in for a first run that got through "one" and died inside "two".
@@ -116,13 +113,13 @@ async fn resume_does_not_rerun_completed_nodes() {
     }
 
     let events = EventLog::read(paths.events()).unwrap();
-    let mut state = RunState::replay(dag.ids(), &events);
+    let mut state = RunState::replay(&ids, &events);
     assert_eq!(state.state("two"), NodeState::Running);
     assert_eq!(state.reset_running(), vec!["two".to_string()]);
 
     let mut log = EventLog::open_append(paths.events()).unwrap();
     let opts = h.opts(4);
-    let status = execute(&graph, &dag, &paths, &mut log, &mut state, &opts)
+    let status = execute(&graph, &paths, &mut log, &mut state, &opts)
         .await
         .unwrap();
 
@@ -142,7 +139,7 @@ async fn resume_does_not_rerun_completed_nodes() {
 async fn resume_appends_to_the_same_log() {
     let h = Harness::new().await;
     let graph = parse_graph(CHAIN).unwrap();
-    let dag = Dag::build(&graph.tasks).unwrap();
+    let ids: Vec<String> = graph.tasks.iter().map(|t| t.id.clone()).collect();
     let paths = create_run(&runs_root(h.tmp.path()), 1).unwrap();
 
     {
@@ -158,10 +155,10 @@ async fn resume_appends_to_the_same_log() {
     let before = EventLog::read(paths.events()).unwrap().len();
 
     let events = EventLog::read(paths.events()).unwrap();
-    let mut state = RunState::replay(dag.ids(), &events);
+    let mut state = RunState::replay(&ids, &events);
     let mut log = EventLog::open_append(paths.events()).unwrap();
     let opts = h.opts(4);
-    execute(&graph, &dag, &paths, &mut log, &mut state, &opts)
+    execute(&graph, &paths, &mut log, &mut state, &opts)
         .await
         .unwrap();
 

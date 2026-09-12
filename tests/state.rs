@@ -1,28 +1,9 @@
-use assembly_line::config::parse_graph;
-use assembly_line::dag::Dag;
 use assembly_line::event::{Event, EventKind, RunStatus};
-use assembly_line::state::{Counts, NodeState, RunState, task_map};
+use assembly_line::state::{Counts, NodeState, RunState};
 
-const DIAMOND: &str = r#"
-[[task]]
-id = "build"
-prompt = "x"
-
-[[task]]
-id = "left"
-needs = ["build"]
-prompt = "x"
-
-[[task]]
-id = "right"
-needs = ["build"]
-prompt = "x"
-
-[[task]]
-id = "join"
-needs = ["left", "right"]
-prompt = "x"
-"#;
+fn ids() -> Vec<String> {
+    vec!["build".into(), "left".into(), "right".into()]
+}
 
 fn finished(node: &str) -> EventKind {
     EventKind::NodeFinished {
@@ -39,109 +20,36 @@ fn started(node: &str) -> EventKind {
 }
 
 #[test]
-fn only_root_nodes_are_ready_initially() {
-    let g = parse_graph(DIAMOND).unwrap();
-    let dag = Dag::build(&g.tasks).unwrap();
-    let tm = task_map(&g.tasks);
-    let st = RunState::new(dag.ids());
-    assert_eq!(st.ready(&dag, &tm), vec!["build".to_string()]);
+fn every_task_starts_pending() {
+    let st = RunState::new(&ids());
+    assert_eq!(st.state("build"), NodeState::Pending);
+    assert_eq!(st.state("left"), NodeState::Pending);
+    assert_eq!(st.state("right"), NodeState::Pending);
 }
 
 #[test]
-fn finishing_a_node_unlocks_both_branches() {
-    let g = parse_graph(DIAMOND).unwrap();
-    let dag = Dag::build(&g.tasks).unwrap();
-    let tm = task_map(&g.tasks);
-    let mut st = RunState::new(dag.ids());
+fn starting_and_finishing_a_node_moves_it_through_running_to_done() {
+    let mut st = RunState::new(&ids());
 
     st.apply(&started("build"));
     assert_eq!(st.state("build"), NodeState::Running);
-    assert!(st.ready(&dag, &tm).is_empty());
 
     st.apply(&finished("build"));
     assert_eq!(st.state("build"), NodeState::Done);
-    assert_eq!(
-        st.ready(&dag, &tm),
-        vec!["left".to_string(), "right".to_string()]
-    );
 }
 
 #[test]
-fn a_join_waits_for_every_dependency() {
-    let g = parse_graph(DIAMOND).unwrap();
-    let dag = Dag::build(&g.tasks).unwrap();
-    let tm = task_map(&g.tasks);
-    let mut st = RunState::new(dag.ids());
-
-    ["build", "left"]
-        .iter()
-        .for_each(|n| st.apply(&finished(n)));
-    assert_eq!(st.ready(&dag, &tm), vec!["right".to_string()]);
-
-    st.apply(&finished("right"));
-    assert_eq!(st.ready(&dag, &tm), vec!["join".to_string()]);
-}
-
-#[test]
-fn a_skipped_dependency_never_satisfies() {
-    let g = parse_graph(DIAMOND).unwrap();
-    let dag = Dag::build(&g.tasks).unwrap();
-    let tm = task_map(&g.tasks);
-    let mut st = RunState::new(dag.ids());
-
-    st.apply(&finished("build"));
-    st.apply(&finished("left"));
-    st.apply(&EventKind::NodeSkipped {
-        node: "right".into(),
-        because: "needs x".into(),
-    });
-    assert!(st.ready(&dag, &tm).is_empty());
-}
-
-#[test]
-fn a_failed_dependency_with_on_failure_continue_does_satisfy() {
-    let src = r#"
-[[task]]
-id = "lint"
-prompt = "x"
-on_failure = "continue"
-
-[[task]]
-id = "build"
-needs = ["lint"]
-prompt = "x"
-"#;
-    let g = parse_graph(src).unwrap();
-    let dag = Dag::build(&g.tasks).unwrap();
-    let tm = task_map(&g.tasks);
-    let mut st = RunState::new(dag.ids());
-
-    st.apply(&EventKind::NodeFailed {
-        node: "lint".into(),
-        reason: "exit 1".into(),
-    });
-    assert_eq!(st.state("lint"), NodeState::Failed);
-    assert_eq!(st.ready(&dag, &tm), vec!["build".to_string()]);
-}
-
-#[test]
-fn a_failed_dependency_without_continue_blocks() {
-    let g = parse_graph(DIAMOND).unwrap();
-    let dag = Dag::build(&g.tasks).unwrap();
-    let tm = task_map(&g.tasks);
-    let mut st = RunState::new(dag.ids());
-
+fn a_failed_node_is_recorded_as_failed() {
+    let mut st = RunState::new(&ids());
     st.apply(&EventKind::NodeFailed {
         node: "build".into(),
         reason: "exit 1".into(),
     });
-    assert!(st.ready(&dag, &tm).is_empty());
+    assert_eq!(st.state("build"), NodeState::Failed);
 }
 
 #[test]
 fn replay_reconstructs_state_and_reset_running_requeues() {
-    let g = parse_graph(DIAMOND).unwrap();
-    let dag = Dag::build(&g.tasks).unwrap();
     let now = chrono::Utc::now();
     let events: Vec<Event> = [
         EventKind::RunStarted { run_id: 1, jobs: 4 },
@@ -153,34 +61,22 @@ fn replay_reconstructs_state_and_reset_running_requeues() {
     .map(|kind| Event { at: now, kind })
     .collect();
 
-    let mut st = RunState::replay(dag.ids(), &events);
+    let mut st = RunState::replay(&ids(), &events);
     assert_eq!(st.state("build"), NodeState::Done);
     assert_eq!(st.state("left"), NodeState::Running);
 
     assert_eq!(st.reset_running(), vec!["left".to_string()]);
     assert_eq!(st.state("left"), NodeState::Pending);
-
-    let tm = task_map(&g.tasks);
-    assert_eq!(
-        st.ready(&dag, &tm),
-        vec!["left".to_string(), "right".to_string()]
-    );
 }
 
 #[test]
 fn counts_summarize_the_run() {
-    let g = parse_graph(DIAMOND).unwrap();
-    let dag = Dag::build(&g.tasks).unwrap();
-    let mut st = RunState::new(dag.ids());
+    let mut st = RunState::new(&ids());
 
     st.apply(&finished("build"));
     st.apply(&EventKind::NodeFailed {
         node: "left".into(),
         reason: "exit 1".into(),
-    });
-    st.apply(&EventKind::NodeSkipped {
-        node: "join".into(),
-        because: "needs left".into(),
     });
 
     assert_eq!(
@@ -188,7 +84,6 @@ fn counts_summarize_the_run() {
         Counts {
             done: 1,
             failed: 1,
-            skipped: 1,
             outstanding: 1,
         }
     );
@@ -196,9 +91,7 @@ fn counts_summarize_the_run() {
 
 #[test]
 fn run_finished_is_recorded() {
-    let g = parse_graph(DIAMOND).unwrap();
-    let dag = Dag::build(&g.tasks).unwrap();
-    let mut st = RunState::new(dag.ids());
+    let mut st = RunState::new(&ids());
 
     assert!(st.status.is_none());
     st.apply(&EventKind::RunFinished {
@@ -209,9 +102,7 @@ fn run_finished_is_recorded() {
 
 #[test]
 fn a_commit_event_does_not_change_node_state() {
-    let g = parse_graph(DIAMOND).unwrap();
-    let dag = Dag::build(&g.tasks).unwrap();
-    let mut st = RunState::new(dag.ids());
+    let mut st = RunState::new(&ids());
 
     st.apply(&started("build"));
     st.apply(&EventKind::NodeCommitted {

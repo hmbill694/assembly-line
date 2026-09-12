@@ -1,13 +1,11 @@
-use crate::config::{Graph, OnFailure, Task, parse_duration};
-use crate::dag::Dag;
+use crate::config::{Graph, Task, parse_duration};
 use crate::event::{EventKind, EventLog, RunStatus};
 use crate::exec::{ShellOutcome, run_command};
 use crate::git;
 use crate::paths::{self, RunPaths};
 use crate::provider::{CommandSpec, render_command};
-use crate::state::{NodeState, RunState, TaskMap, task_map};
+use crate::state::{NodeState, RunState, task_map};
 use crate::workspace::{self, node_branch_name};
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::task::JoinSet;
@@ -84,7 +82,6 @@ impl NodeResult {
 /// What a finished node reports back to the loop.
 struct NodeCompletion {
     node: String,
-    resource: Option<String>,
     result: NodeResult,
 }
 
@@ -107,33 +104,13 @@ struct AgentNodePlan {
     continues_branch: bool,
 }
 
-/// Nodes that may start right now: dependency-ready, within the job cap, and
-/// holding no resource another node is already using.
-///
-/// Resources are claimed as the selection is built, so two ready nodes sharing
-/// a label cannot both be launched in the same pass.
-fn nodes_clear_to_launch(
-    state: &RunState,
-    dag: &Dag,
-    tasks: &TaskMap,
-    resources_in_use: &BTreeSet<String>,
-    free_slots: usize,
-) -> Vec<String> {
-    state
-        .ready(dag, tasks)
-        .into_iter()
-        .scan(resources_in_use.clone(), |claimed, id| {
-            let resource = tasks.get(id.as_str()).and_then(|t| t.resource.clone());
-            Some(match resource {
-                Some(r) if claimed.contains(&r) => None,
-                Some(r) => {
-                    claimed.insert(r);
-                    Some(id)
-                }
-                None => Some(id),
-            })
-        })
-        .flatten()
+/// Tasks not yet started, up to the job cap.
+fn tasks_clear_to_launch(state: &RunState, graph: &Graph, free_slots: usize) -> Vec<String> {
+    graph
+        .tasks
+        .iter()
+        .filter(|t| state.state(&t.id) == NodeState::Pending)
+        .map(|t| t.id.clone())
         .take(free_slots)
         .collect()
 }
@@ -483,23 +460,15 @@ fn events_for_completion(node: &str, result: NodeResult) -> (Vec<EventKind>, boo
 /// # Panics
 ///
 /// Does not panic. A panic inside a node's task is surfaced as an error.
-#[allow(
-    clippy::too_many_lines,
-    reason = "the launch/await/settle loop is one state machine; splitting it \
-              would scatter the event-log ordering that makes replay correct"
-)]
 pub async fn execute(
     graph: &Graph,
-    dag: &Dag,
     paths: &RunPaths,
     log: &mut EventLog,
     state: &mut RunState,
     opts: &RunOpts,
 ) -> anyhow::Result<RunStatus> {
     let tasks = task_map(&graph.tasks);
-    let mut resources_in_use: BTreeSet<String> = BTreeSet::new();
     let mut in_flight: JoinSet<NodeCompletion> = JoinSet::new();
-    let mut aborting = false;
 
     let ev = log.append(EventKind::RunStarted {
         run_id: paths.id,
@@ -515,59 +484,50 @@ pub async fn execute(
     // A state machine over time: launch what fits, await one completion,
     // re-derive readiness. Not expressible as an iterator chain.
     loop {
-        if !aborting {
-            let free_slots = opts.jobs.saturating_sub(in_flight.len());
-            for id in nodes_clear_to_launch(state, dag, &tasks, &resources_in_use, free_slots) {
-                let Some(task) = tasks.get(id.as_str()).copied() else {
-                    continue;
-                };
-                let timeout = wall_clock_limit(task)?;
+        let free_slots = opts.jobs.saturating_sub(in_flight.len());
+        for id in tasks_clear_to_launch(state, graph, free_slots) {
+            let Some(task) = tasks.get(id.as_str()).copied() else {
+                continue;
+            };
+            let timeout = wall_clock_limit(task)?;
 
-                let ev = log.append(EventKind::NodeStarted {
-                    node: id.clone(),
-                    round: 1,
-                })?;
-                state.apply(&ev.kind);
-                if let Some(r) = &task.resource {
-                    resources_in_use.insert(r.clone());
+            let ev = log.append(EventKind::NodeStarted {
+                node: id.clone(),
+                round: 1,
+            })?;
+            state.apply(&ev.kind);
+
+            let log_path = paths.log(&id);
+            let cancel = opts.cancel.clone();
+
+            let repo_and_base = repo_and_base
+                .as_ref()
+                .map(|(repo, base_sha)| (repo.as_path(), base_sha.as_str()));
+            match agent_node_plan(graph, task, paths, opts, repo_and_base, None) {
+                Err(reason) => {
+                    in_flight.spawn(async move {
+                        NodeCompletion {
+                            node: id,
+                            // A node that never ran left nothing to preserve.
+                            result: NodeResult::Failed { reason, work: None },
+                        }
+                    });
                 }
-
-                let resource = task.resource.clone();
-                let log_path = paths.log(&id);
-                let cancel = opts.cancel.clone();
-
-                let repo_and_base = repo_and_base
-                    .as_ref()
-                    .map(|(repo, base_sha)| (repo.as_path(), base_sha.as_str()));
-                match agent_node_plan(graph, task, paths, opts, repo_and_base, None) {
-                    Err(reason) => {
-                        in_flight.spawn(async move {
-                            NodeCompletion {
-                                node: id,
-                                resource,
-                                // A node that never ran left nothing to
-                                // preserve.
-                                result: NodeResult::Failed { reason, work: None },
-                            }
-                        });
-                    }
-                    Ok(plan) => {
-                        in_flight.spawn(async move {
-                            let result = agent_node_result(&plan, &log_path, timeout, cancel).await;
-                            NodeCompletion {
-                                node: id,
-                                resource,
-                                // The job could not be administered at all —
-                                // no sandbox, or git refused. Any partial work
-                                // is described by the error, not by a branch
-                                // we can name.
-                                result: result.unwrap_or_else(|e| NodeResult::Failed {
-                                    reason: e.to_string(),
-                                    work: None,
-                                }),
-                            }
-                        });
-                    }
+                Ok(plan) => {
+                    in_flight.spawn(async move {
+                        let result = agent_node_result(&plan, &log_path, timeout, cancel).await;
+                        NodeCompletion {
+                            node: id,
+                            // The job could not be administered at all — no
+                            // sandbox, or git refused. Any partial work is
+                            // described by the error, not by a branch we can
+                            // name.
+                            result: result.unwrap_or_else(|e| NodeResult::Failed {
+                                reason: e.to_string(),
+                                work: None,
+                            }),
+                        }
+                    });
                 }
             }
         }
@@ -576,70 +536,15 @@ pub async fn execute(
             break;
         };
         let completion = joined?;
-
-        if let Some(r) = &completion.resource {
-            resources_in_use.remove(r);
-        }
-
-        let node_failed = record_completion(log, state, &completion.node, completion.result)?;
-        if node_failed {
-            match tasks
-                .get(completion.node.as_str())
-                .map(|t| t.on_failure)
-                .unwrap_or_default()
-            {
-                OnFailure::Continue => {}
-                OnFailure::Skip => mark_pending_as_skipped(
-                    log,
-                    state,
-                    dag.descendants(&completion.node),
-                    &format!("needs {}", completion.node),
-                )?,
-                OnFailure::Abort => {
-                    aborting = true;
-                    opts.cancel.cancel();
-                }
-            }
-        }
+        record_completion(log, state, &completion.node, completion.result)?;
     }
 
-    if aborting {
-        // Record what never got a chance rather than silently dropping it.
-        mark_pending_as_skipped(log, state, dag.ids().iter().cloned(), "run aborted")?;
-    }
-
-    let counts = state.counts();
-    let status = match (aborting, counts.failed + counts.skipped) {
-        (true, _) => RunStatus::Aborted,
-        (false, 0) => RunStatus::Ok,
-        (false, _) => RunStatus::Partial,
+    let status = match state.counts().failed {
+        0 => RunStatus::Ok,
+        _ => RunStatus::Partial,
     };
 
     let ev = log.append(EventKind::RunFinished { status })?;
     state.apply(&ev.kind);
     Ok(status)
-}
-
-/// Record the still-pending members of `candidates` as skipped. Nodes that
-/// already started are left alone — one running under a `continue` parent must
-/// not be retroactively skipped.
-fn mark_pending_as_skipped(
-    log: &mut EventLog,
-    state: &mut RunState,
-    candidates: impl IntoIterator<Item = String>,
-    because: &str,
-) -> anyhow::Result<()> {
-    let pending: Vec<String> = candidates
-        .into_iter()
-        .filter(|id| state.state(id) == NodeState::Pending)
-        .collect();
-
-    pending.into_iter().try_for_each(|id| {
-        let ev = log.append(EventKind::NodeSkipped {
-            node: id,
-            because: because.to_string(),
-        })?;
-        state.apply(&ev.kind);
-        anyhow::Ok(())
-    })
 }

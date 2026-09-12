@@ -123,12 +123,6 @@ impl NodeProgress {
                 detail: Some(reason.clone()),
                 ..self
             },
-            // A skipped node never started, so it has no duration.
-            EventKind::NodeSkipped { because, .. } => NodeProgress {
-                state: Some(NodeState::Skipped),
-                detail: Some(because.clone()),
-                ..self
-            },
             // Publishing moves a ref, not the node's own progress.
             EventKind::RunStarted { .. }
             | EventKind::NodeBranchPublished { .. }
@@ -211,12 +205,11 @@ impl RunReport {
     #[must_use]
     pub fn to_summary_line(&self) -> String {
         format!(
-            "run {}: {} — {} done, {} failed, {} skipped",
+            "run {}: {} — {} done, {} failed",
             self.id,
             self.status.map_or("in progress", RunStatus::label),
             self.count_in_state(NodeState::Done),
             self.count_in_state(NodeState::Failed),
-            self.count_in_state(NodeState::Skipped),
         )
     }
 }
@@ -225,7 +218,6 @@ fn state_glyph(state: NodeState) -> char {
     match state {
         NodeState::Done => '✓',
         NodeState::Failed => '✗',
-        NodeState::Skipped => '⊝',
         NodeState::Running => '⠙',
         NodeState::Pending => '·',
     }

@@ -61,10 +61,6 @@ pub enum EventKind {
         node: String,
         reason: String,
     },
-    NodeSkipped {
-        node: String,
-        because: String,
-    },
     RunFinished {
         status: RunStatus,
     },
@@ -79,8 +75,7 @@ impl EventKind {
             | Self::NodeCommitted { node, .. }
             | Self::NodeBranchPublished { node, .. }
             | Self::NodeFinished { node, .. }
-            | Self::NodeFailed { node, .. }
-            | Self::NodeSkipped { node, .. } => Some(node),
+            | Self::NodeFailed { node, .. } => Some(node),
             Self::RunStarted { .. } | Self::RunFinished { .. } => None,
         }
     }

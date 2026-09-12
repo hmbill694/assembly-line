@@ -61,9 +61,9 @@ fn reopening_appends_rather_than_truncates() {
 fn each_line_is_one_tagged_json_object() {
     // Writing into a buffer rather than a file — the sink is generic.
     let mut log = EventLog::new(Vec::new());
-    log.append(EventKind::NodeSkipped {
+    log.append(EventKind::NodeFailed {
         node: "x".into(),
-        because: "needs a".into(),
+        reason: "exit 1".into(),
     })
     .unwrap();
 
@@ -71,9 +71,9 @@ fn each_line_is_one_tagged_json_object() {
     assert_eq!(raw.lines().count(), 1);
 
     let v: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
-    assert_eq!(v["t"], "node_skipped");
+    assert_eq!(v["t"], "node_failed");
     assert_eq!(v["node"], "x");
-    assert_eq!(v["because"], "needs a");
+    assert_eq!(v["reason"], "exit 1");
     assert!(v["at"].is_string());
 }
 

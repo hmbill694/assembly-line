@@ -46,19 +46,6 @@ fn validate_accepts_a_good_graph() {
 }
 
 #[test]
-fn validate_reports_a_cycle_and_exits_two() {
-    let tmp = with_graph(
-        "[[task]]\nid=\"a\"\nneeds=[\"b\"]\nprompt=\"x\"\n\
-         [[task]]\nid=\"b\"\nneeds=[\"a\"]\nprompt=\"x\"\n",
-    );
-    assembly(&tmp)
-        .args(["validate", "graph.toml"])
-        .assert()
-        .code(2)
-        .stderr(contains("dependency cycle"));
-}
-
-#[test]
 fn validate_warns_about_an_agent_without_verify() {
     let tmp = with_graph(
         "[providers.p]\ncmd=\"true\"\n\
@@ -106,7 +93,7 @@ fn run_exits_one_when_a_node_fails() {
 
 #[test]
 fn run_exits_two_on_an_invalid_graph_and_leaves_no_run_directory() {
-    let tmp = with_graph("[[task]]\nid=\"a\"\nneeds=[\"ghost\"]\nprompt=\"x\"\n");
+    let tmp = with_graph("[[task]]\nid=\"a\"\nprompt=\"x\"\nprovider=\"ghost\"\n");
     assembly(&tmp)
         .args(["run", "graph.toml"])
         .assert()
@@ -144,8 +131,8 @@ fn status_and_logs_report_a_finished_run() {
         tmp.path().join("graph.toml"),
         "[providers.run]\ncmd = \"bash\"\nargs = [\"-c\", \"{prompt}\"]\n\
          [[task]]\nid=\"build\"\nprovider=\"run\"\nprompt=\"echo building\"\n\
-         [[task]]\nid=\"broken\"\nneeds=[\"build\"]\nprovider=\"run\"\nprompt=\"echo nope 1>&2; exit 1\"\n\
-         [[task]]\nid=\"after\"\nneeds=[\"broken\"]\nprovider=\"run\"\nprompt=\"true\"\n",
+         [[task]]\nid=\"broken\"\nprovider=\"run\"\nprompt=\"echo nope 1>&2; exit 1\"\n\
+         [[task]]\nid=\"after\"\nprovider=\"run\"\nprompt=\"true\"\n",
     )
     .unwrap();
 
@@ -161,7 +148,7 @@ fn status_and_logs_report_a_finished_run() {
                 .and(contains("broken"))
                 .and(contains("after")),
         )
-        .stdout(contains("exit 1").and(contains("needs broken")))
+        .stdout(contains("exit 1"))
         .stdout(contains("partial"));
 
     assembly(&tmp)

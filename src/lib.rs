@@ -1,8 +1,7 @@
-//! assembly-line: run a DAG of coding-agent tasks in parallel.
+//! assembly-line: run a set of independent coding-agent tasks in parallel.
 
 pub mod cli;
 pub mod config;
-pub mod dag;
 pub mod delivery;
 pub mod event;
 pub mod exec;

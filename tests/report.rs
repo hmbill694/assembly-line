@@ -48,13 +48,6 @@ fn summarizes_states_durations_and_detail() {
         ),
         (
             9,
-            EventKind::NodeSkipped {
-                node: "wire-routes".into(),
-                because: "needs impl-auth".into(),
-            },
-        ),
-        (
-            9,
             EventKind::RunFinished {
                 status: RunStatus::Partial,
             },
@@ -73,9 +66,8 @@ fn summarizes_states_durations_and_detail() {
     assert_eq!(report.nodes[1].duration.unwrap().as_secs(), 7);
     assert_eq!(report.nodes[1].detail.as_deref(), Some("exit 1"));
 
-    assert_eq!(report.nodes[2].state, NodeState::Skipped);
-    assert!(report.nodes[2].duration.is_none());
-    assert_eq!(report.nodes[2].detail.as_deref(), Some("needs impl-auth"));
+    // A node with no events of its own is left pending.
+    assert_eq!(report.nodes[2].state, NodeState::Pending);
 }
 
 #[test]

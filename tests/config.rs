@@ -1,4 +1,4 @@
-use assembly_line::config::{OnFailure, parse_duration, parse_graph};
+use assembly_line::config::{ValidationError, Warning, parse_duration, parse_graph, validate};
 use std::time::Duration;
 
 const FULL: &str = r#"
@@ -15,14 +15,11 @@ prompt = "cargo build"
 
 [[task]]
 id = "impl-auth"
-needs = ["build"]
 prompt = "do the thing"
 provider = "claude"
 verify = "cargo test"
 retries = 2
 max_duration = "20m"
-resource = "postgres"
-on_failure = "abort"
 
 [[hook]]
 on = "run_complete"
@@ -44,11 +41,8 @@ fn parses_a_full_graph() {
     assert_eq!(g.tasks[0].prompt.as_deref(), Some("cargo build"));
 
     let agent = &g.tasks[1];
-    assert_eq!(agent.needs, vec!["build".to_string()]);
     assert_eq!(agent.provider.as_deref(), Some("claude"));
-    assert_eq!(agent.on_failure, OnFailure::Abort);
     assert_eq!(agent.retries, 2);
-    assert_eq!(agent.resource.as_deref(), Some("postgres"));
     assert_eq!(agent.max_duration.as_deref(), Some("20m"));
 }
 
@@ -56,9 +50,7 @@ fn parses_a_full_graph() {
 fn applies_defaults() {
     let g = parse_graph("[[task]]\nid = \"a\"\nprompt = \"x\"\n").unwrap();
     let t = &g.tasks[0];
-    assert!(t.needs.is_empty());
     assert!(t.copy.is_empty());
-    assert_eq!(t.on_failure, OnFailure::Skip);
     assert_eq!(t.retries, 0);
     assert!(t.max_cost_usd.is_none());
 }
@@ -79,4 +71,160 @@ fn parses_durations() {
     assert_eq!(parse_duration("20m").unwrap(), Duration::from_secs(1200));
     assert_eq!(parse_duration("1h 30m").unwrap(), Duration::from_secs(5400));
     assert!(parse_duration("soon").is_err());
+}
+
+// Validation: tasks have no dependencies to order any more, but an id still
+// becomes a filename and a branch name, and an agent still needs a prompt and
+// a real provider. These checks survive even though task ids themselves are
+// on their way out — this revision's tree still has them, and still must
+// validate them.
+
+#[test]
+fn rejects_duplicate_ids() {
+    let graph = parse_graph(
+        "[[task]]\nid=\"a\"\nprompt=\"x\"\n\
+         [[task]]\nid=\"a\"\nprompt=\"x\"\n",
+    )
+    .unwrap();
+    let errs = validate(&graph).errors;
+    assert!(
+        errs.contains(&ValidationError::DuplicateId("a".into())),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn an_id_that_cannot_be_a_branch_name_is_rejected() {
+    let graph = parse_graph(
+        r#"
+        [[task]]
+        id = "impl auth"
+        prompt = "go"
+        "#,
+    )
+    .unwrap();
+
+    assert!(
+        validate(&graph)
+            .errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::InvalidId(id) if id == "impl auth")),
+    );
+}
+
+#[test]
+fn rejects_an_id_that_starts_with_the_reserved_underscore_prefix() {
+    let graph = parse_graph("[[task]]\nid=\"_scratch\"\nprompt=\"x\"\n").unwrap();
+    let errs = validate(&graph).errors;
+    assert!(
+        errs.contains(&ValidationError::ReservedId("_scratch".into())),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn a_task_without_a_prompt_is_rejected() {
+    let graph = parse_graph(
+        r#"
+        [[task]]
+        id = "impl"
+        "#,
+    )
+    .unwrap();
+
+    let validation = validate(&graph);
+    assert!(
+        validation
+            .errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::AgentMissingPrompt(id) if id == "impl")),
+        "expected a missing-prompt error, got {:?}",
+        validation.errors
+    );
+}
+
+#[test]
+fn rejects_unknown_provider() {
+    let graph = parse_graph("[[task]]\nid=\"a\"\nprompt=\"hi\"\nprovider=\"nope\"\n").unwrap();
+    let v = validate(&graph);
+    assert!(
+        v.errors.contains(&ValidationError::UnknownProvider {
+            task: "a".into(),
+            provider: "nope".into()
+        }),
+        "{:?}",
+        v.errors
+    );
+}
+
+#[test]
+fn rejects_invalid_max_duration() {
+    let graph = parse_graph("[[task]]\nid=\"a\"\nprompt=\"x\"\nmax_duration=\"soon\"\n").unwrap();
+    let v = validate(&graph);
+    assert!(
+        v.errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::InvalidDuration { .. })),
+        "{:?}",
+        v.errors
+    );
+}
+
+#[test]
+fn reports_every_problem_at_once() {
+    let graph = parse_graph(
+        "[[task]]\nid=\"a\"\n\
+         [[task]]\nid=\"b\"\nprompt=\"x\"\nprovider=\"ghost\"\n",
+    )
+    .unwrap();
+    let errs = validate(&graph).errors;
+    assert_eq!(errs.len(), 2, "{errs:?}");
+}
+
+#[test]
+fn warns_on_agent_without_verify() {
+    let graph = parse_graph(
+        "[providers.p]\ncmd=\"true\"\n\
+         [[task]]\nid=\"a\"\nprompt=\"hi\"\nprovider=\"p\"\n",
+    )
+    .unwrap();
+    let v = validate(&graph);
+    assert!(v.errors.is_empty(), "{:?}", v.errors);
+    assert!(
+        v.warnings
+            .contains(&Warning::AgentWithoutVerify("a".into())),
+        "{:?}",
+        v.warnings
+    );
+}
+
+#[test]
+fn warns_when_cost_cap_has_no_adapter() {
+    let graph = parse_graph(
+        "[providers.p]\ncmd=\"true\"\n\
+         [[task]]\nid=\"a\"\nprompt=\"hi\"\nprovider=\"p\"\n\
+         verify=\"true\"\nmax_cost_usd=5.0\n",
+    )
+    .unwrap();
+    let v = validate(&graph);
+    assert!(
+        v.warnings.contains(&Warning::CostCapWithoutAdapter {
+            task: "a".into(),
+            provider: "p".into()
+        }),
+        "{:?}",
+        v.warnings
+    );
+}
+
+#[test]
+fn no_cost_warning_when_the_provider_has_an_adapter() {
+    let graph = parse_graph(
+        "[providers.p]\ncmd=\"true\"\nadapter=\"wrap.sh\"\n\
+         [[task]]\nid=\"a\"\nprompt=\"hi\"\nprovider=\"p\"\n\
+         verify=\"true\"\nmax_cost_usd=5.0\n",
+    )
+    .unwrap();
+    let v = validate(&graph);
+    assert!(v.warnings.is_empty(), "{:?}", v.warnings);
 }

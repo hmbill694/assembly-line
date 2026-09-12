@@ -2,7 +2,11 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
-#[command(name = "assembly", version, about = "Run a DAG of coding-agent tasks")]
+#[command(
+    name = "assembly",
+    version,
+    about = "Run a set of independent coding-agent tasks"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -10,7 +14,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Check a graph for cycles, unknown dependencies, and config mistakes
+    /// Check a graph for config mistakes
     Validate { graph: PathBuf },
 
     /// Execute a graph

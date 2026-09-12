@@ -1,5 +1,4 @@
 use assembly_line::config::parse_graph;
-use assembly_line::dag::Dag;
 use assembly_line::event::{EventKind, EventLog, RunStatus};
 use assembly_line::git::{self, commit_all, head_sha};
 use assembly_line::paths::{create_run, repo_worktrees_root, runs_root};
@@ -89,10 +88,10 @@ impl Harness {
 
     async fn run(&self, src: &str, jobs: usize) -> Outcome {
         let graph = parse_graph(src).unwrap();
-        let dag = Dag::build(&graph.tasks).unwrap();
+        let ids: Vec<String> = graph.tasks.iter().map(|t| t.id.clone()).collect();
         let run = create_run(&runs_root(self.tmp.path()), 1).unwrap();
         let mut log = EventLog::open_append(run.events()).unwrap();
-        let mut state = RunState::new(dag.ids());
+        let mut state = RunState::new(&ids);
 
         let opts = RunOpts {
             jobs,
@@ -102,7 +101,7 @@ impl Harness {
             seed_from: self.repo.clone(),
             remote: workspace::DEFAULT_REMOTE.to_string(),
         };
-        let status = execute(&graph, &dag, &run, &mut log, &mut state, &opts)
+        let status = execute(&graph, &run, &mut log, &mut state, &opts)
             .await
             .unwrap();
 

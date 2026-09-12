@@ -3,6 +3,182 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationError {
+    DuplicateId(String),
+    InvalidId(String),
+    ReservedId(String),
+    AgentMissingPrompt(String),
+    UnknownProvider { task: String, provider: String },
+    InvalidDuration { task: String, value: String },
+}
+
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DuplicateId(id) => write!(f, "duplicate task id '{id}'"),
+            Self::InvalidId(id) => write!(
+                f,
+                "invalid task id '{id}': ids must match [A-Za-z0-9_-]+ (they become filenames and branch names)"
+            ),
+            Self::ReservedId(id) => write!(
+                f,
+                "task id '{id}' is reserved: ids may not start with '_', which assembly-line keeps for itself"
+            ),
+            Self::AgentMissingPrompt(id) => {
+                write!(f, "agent task '{id}' has no `prompt` or `prompt_file`")
+            }
+            Self::UnknownProvider { task, provider } => {
+                write!(f, "task '{task}' uses undefined provider '{provider}'")
+            }
+            Self::InvalidDuration { task, value } => {
+                write!(f, "task '{task}' has invalid max_duration '{value}'")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Warning {
+    AgentWithoutVerify(String),
+    CostCapWithoutAdapter { task: String, provider: String },
+}
+
+impl std::fmt::Display for Warning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AgentWithoutVerify(id) => write!(
+                f,
+                "agent task '{id}' declares no `verify` — nothing will check its output"
+            ),
+            Self::CostCapWithoutAdapter { task, provider } => write!(
+                f,
+                "task '{task}' sets max_cost_usd but provider '{provider}' reports no cost — the cap will not apply"
+            ),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Validation {
+    pub errors: Vec<ValidationError>,
+    pub warnings: Vec<Warning>,
+}
+
+fn id_is_valid(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Ids that are unusable as filenames, ids assembly-line has claimed for
+/// itself, and ids declared more than once.
+fn id_naming_errors(tasks: &[Task]) -> impl Iterator<Item = ValidationError> + '_ {
+    let invalid = tasks
+        .iter()
+        .filter(|t| !id_is_valid(&t.id))
+        .map(|t| ValidationError::InvalidId(t.id.clone()));
+
+    let duplicated = tasks
+        .iter()
+        .enumerate()
+        .filter(|(i, t)| tasks[..*i].iter().any(|prior| prior.id == t.id))
+        .map(|(_, t)| ValidationError::DuplicateId(t.id.clone()));
+
+    // Ids become directory names beside assembly-line's own bookkeeping
+    // entries, whose names start with `_`. Reserving the whole prefix keeps
+    // that space ours.
+    let reserved = tasks
+        .iter()
+        .filter(|t| t.id.starts_with('_'))
+        .map(|t| ValidationError::ReservedId(t.id.clone()));
+
+    invalid.chain(duplicated).chain(reserved)
+}
+
+/// A task must carry a prompt to be runnable at all. It may supply it inline
+/// or by file; `load_graph` folds the latter into the former, so either
+/// satisfies this check.
+fn missing_required_field(t: &Task) -> Option<ValidationError> {
+    match (&t.prompt, &t.prompt_file) {
+        (None, None) => Some(ValidationError::AgentMissingPrompt(t.id.clone())),
+        _ => None,
+    }
+}
+
+fn unparseable_max_duration(t: &Task) -> Option<ValidationError> {
+    match &t.max_duration {
+        Some(d) if parse_duration(d).is_err() => Some(ValidationError::InvalidDuration {
+            task: t.id.clone(),
+            value: d.clone(),
+        }),
+        _ => None,
+    }
+}
+
+/// A task's provider must exist among the graph's declared providers.
+fn unknown_provider(graph: &Graph, t: &Task) -> Option<ValidationError> {
+    match &t.provider {
+        Some(name) if !graph.providers.contains_key(name) => {
+            Some(ValidationError::UnknownProvider {
+                task: t.id.clone(),
+                provider: name.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Checks against a task's declared provider that are worth flagging but not
+/// rejecting outright: no oversight at all, or a cost cap the provider cannot
+/// honour.
+fn agent_checks(graph: &Graph, t: &Task) -> Vec<Warning> {
+    let Some(provider) = t
+        .provider
+        .as_ref()
+        .and_then(|name| graph.providers.get(name))
+    else {
+        return Vec::new();
+    };
+
+    let unverified = t
+        .verify
+        .is_none()
+        .then(|| Warning::AgentWithoutVerify(t.id.clone()));
+    let uncapped = (t.max_cost_usd.is_some() && provider.adapter.is_none()).then(|| {
+        Warning::CostCapWithoutAdapter {
+            task: t.id.clone(),
+            provider: t.provider.clone().unwrap_or_default(),
+        }
+    });
+
+    unverified.into_iter().chain(uncapped).collect()
+}
+
+/// Every problem in a graph file, so a user fixes all of them in one pass
+/// rather than one per run.
+#[must_use]
+pub fn validate(graph: &Graph) -> Validation {
+    Validation {
+        errors: id_naming_errors(&graph.tasks)
+            .chain(graph.tasks.iter().filter_map(missing_required_field))
+            .chain(
+                graph
+                    .tasks
+                    .iter()
+                    .filter_map(|t| unknown_provider(graph, t)),
+            )
+            .chain(graph.tasks.iter().filter_map(unparseable_max_duration))
+            .collect(),
+        warnings: graph
+            .tasks
+            .iter()
+            .flat_map(|t| agent_checks(graph, t))
+            .collect(),
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Graph {
@@ -67,21 +243,10 @@ pub struct Hook {
     pub when: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum OnFailure {
-    #[default]
-    Skip,
-    Abort,
-    Continue,
-}
-
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Task {
     pub id: String,
-    #[serde(default)]
-    pub needs: Vec<String>,
 
     /// Inline prompt text. Mutually exclusive with `prompt_file`.
     pub prompt: Option<String>,
@@ -93,15 +258,12 @@ pub struct Task {
     pub output_file: Option<String>,
 
     pub verify: Option<String>,
-    pub resource: Option<String>,
     #[serde(default)]
     pub copy: Vec<String>,
     #[serde(default)]
     pub retries: u32,
     pub max_duration: Option<String>,
     pub max_cost_usd: Option<f64>,
-    #[serde(default)]
-    pub on_failure: OnFailure,
 }
 
 /// Parse a graph from TOML text, without touching the filesystem.

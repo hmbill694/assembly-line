@@ -1,5 +1,4 @@
-use assembly_line::config::{load_graph, parse_graph};
-use assembly_line::dag::{Dag, ValidationError};
+use assembly_line::config::{ValidationError, load_graph, parse_graph, validate};
 use std::fs;
 
 /// A graph directory with a graph file and any prompt files beside it.
@@ -85,14 +84,15 @@ fn an_agent_with_only_a_prompt_file_passes_validation() {
     let src = "[providers.p]\ncmd=\"true\"\n\
                [[task]]\nid=\"a\"\nprovider=\"p\"\n\
                prompt_file=\"p.md\"\nverify=\"true\"\n";
-    let tasks = parse_graph(src).unwrap().tasks;
-    assert!(Dag::build(&tasks).is_ok());
+    let graph = parse_graph(src).unwrap();
+    assert!(validate(&graph).errors.is_empty());
 }
 
 #[test]
 fn an_agent_with_neither_prompt_nor_prompt_file_is_rejected() {
     let src = "[[task]]\nid=\"a\"\n";
-    let errs = Dag::build(&parse_graph(src).unwrap().tasks).unwrap_err();
+    let graph = parse_graph(src).unwrap();
+    let errs = validate(&graph).errors;
     assert!(
         errs.contains(&ValidationError::AgentMissingPrompt("a".into())),
         "{errs:?}"

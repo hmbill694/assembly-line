@@ -1,11 +1,11 @@
 use assembly_line::cli::{Cli, Command};
-use assembly_line::dag::Validation;
+use assembly_line::config::Validation;
 use assembly_line::event::{EventKind, EventLog, RunStatus};
 use assembly_line::paths::{RunMeta, RunPaths};
 use assembly_line::report::RunReport;
 use assembly_line::scheduler::{RunOpts, execute};
 use assembly_line::state::RunState;
-use assembly_line::{config, dag, gc, paths};
+use assembly_line::{config, gc, paths};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -83,7 +83,7 @@ fn validate_graph_file(path: &Path) -> ExitCode {
         Err(e) => return fail_with_usage_error(e),
     };
 
-    let validation = dag::validate(&graph);
+    let validation = config::validate(&graph);
     print_warnings(&validation);
 
     if validation.errors.is_empty() {
@@ -126,13 +126,13 @@ async fn drive_run(
     state: RunState,
 ) -> Result<(RunStatus, RunState), String> {
     let graph = config::load_graph(graph_path).map_err(|e| e.to_string())?;
-    let validation = dag::validate(&graph);
+    let validation = config::validate(&graph);
     print_warnings(&validation);
 
-    let Some(dag) = validation.dag else {
+    if !validation.errors.is_empty() {
         print_errors(&validation);
         return Err(format!("{} is not runnable", graph_path.display()));
-    };
+    }
 
     let repo_root = enclosing_repo_root()?;
     let mut log = EventLog::open_append(run.events()).map_err(|e| e.to_string())?;
@@ -152,7 +152,7 @@ async fn drive_run(
         seed_from,
         remote: assembly_line::workspace::DEFAULT_REMOTE.to_string(),
     };
-    let status = execute(&graph, &dag, run, &mut log, &mut state, &opts)
+    let status = execute(&graph, run, &mut log, &mut state, &opts)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -172,7 +172,7 @@ async fn start_new_run(graph_path: PathBuf, jobs: usize) -> ExitCode {
         Ok(g) => g,
         Err(e) => return fail_with_usage_error(e),
     };
-    let validation = dag::validate(&graph);
+    let validation = config::validate(&graph);
     if !validation.errors.is_empty() {
         print_warnings(&validation);
         print_errors(&validation);
@@ -250,12 +250,11 @@ fn print_run_outcome(run: &RunPaths, graph_path: &Path, status: RunStatus, state
     } else {
         let counts = state.counts();
         println!(
-            "run {}: {} — {} done, {} failed, {} skipped",
+            "run {}: {} — {} done, {} failed",
             run.id,
             status.label(),
             counts.done,
             counts.failed,
-            counts.skipped
         );
     }
 }
@@ -387,7 +386,6 @@ fn print_node_outcome(run: &RunPaths, graph_path: &Path, node: &str) {
     let outcome = match reported.state {
         assembly_line::state::NodeState::Done => "done",
         assembly_line::state::NodeState::Failed => "failed",
-        assembly_line::state::NodeState::Skipped => "skipped",
         assembly_line::state::NodeState::Running | assembly_line::state::NodeState::Pending => {
             "still in flight"
         }
