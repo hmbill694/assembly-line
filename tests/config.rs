@@ -1,4 +1,4 @@
-use assembly_line::config::{OnFailure, TaskKind, parse_duration, parse_graph};
+use assembly_line::config::{OnFailure, parse_duration, parse_graph};
 use std::time::Duration;
 
 const FULL: &str = r#"
@@ -11,12 +11,10 @@ args = ["-p", "{prompt}"]
 
 [[task]]
 id = "build"
-kind = "shell"
-run = "cargo build"
+prompt = "cargo build"
 
 [[task]]
 id = "impl-auth"
-kind = "agent"
 needs = ["build"]
 prompt = "do the thing"
 provider = "claude"
@@ -43,11 +41,9 @@ fn parses_a_full_graph() {
     assert_eq!(g.hooks[0].on, "run_complete");
 
     assert_eq!(g.tasks.len(), 2);
-    assert_eq!(g.tasks[0].kind, TaskKind::Shell);
-    assert_eq!(g.tasks[0].run.as_deref(), Some("cargo build"));
+    assert_eq!(g.tasks[0].prompt.as_deref(), Some("cargo build"));
 
     let agent = &g.tasks[1];
-    assert_eq!(agent.kind, TaskKind::Agent);
     assert_eq!(agent.needs, vec!["build".to_string()]);
     assert_eq!(agent.provider.as_deref(), Some("claude"));
     assert_eq!(agent.on_failure, OnFailure::Abort);
@@ -58,7 +54,7 @@ fn parses_a_full_graph() {
 
 #[test]
 fn applies_defaults() {
-    let g = parse_graph("[[task]]\nid = \"a\"\nkind = \"shell\"\nrun = \"true\"\n").unwrap();
+    let g = parse_graph("[[task]]\nid = \"a\"\nprompt = \"x\"\n").unwrap();
     let t = &g.tasks[0];
     assert!(t.needs.is_empty());
     assert!(t.copy.is_empty());
@@ -69,7 +65,7 @@ fn applies_defaults() {
 
 #[test]
 fn rejects_unknown_fields() {
-    let err = parse_graph("[[task]]\nid = \"a\"\nkind = \"shell\"\nrun = \"true\"\nnope = 1\n")
+    let err = parse_graph("[[task]]\nid = \"a\"\nprompt = \"x\"\nnope = 1\n")
         .expect_err("unknown field must be rejected");
     assert!(err.to_string().contains("nope"), "got: {err}");
 }

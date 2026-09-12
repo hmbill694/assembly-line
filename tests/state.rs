@@ -6,26 +6,22 @@ use assembly_line::state::{Counts, NodeState, RunState, task_map};
 const DIAMOND: &str = r#"
 [[task]]
 id = "build"
-kind = "shell"
-run = "true"
+prompt = "x"
 
 [[task]]
 id = "left"
-kind = "shell"
 needs = ["build"]
-run = "true"
+prompt = "x"
 
 [[task]]
 id = "right"
-kind = "shell"
 needs = ["build"]
-run = "true"
+prompt = "x"
 
 [[task]]
 id = "join"
-kind = "shell"
 needs = ["left", "right"]
-run = "true"
+prompt = "x"
 "#;
 
 fn finished(node: &str) -> EventKind {
@@ -107,15 +103,13 @@ fn a_failed_dependency_with_on_failure_continue_does_satisfy() {
     let src = r#"
 [[task]]
 id = "lint"
-kind = "shell"
-run = "false"
+prompt = "x"
 on_failure = "continue"
 
 [[task]]
 id = "build"
-kind = "shell"
 needs = ["lint"]
-run = "true"
+prompt = "x"
 "#;
     let g = parse_graph(src).unwrap();
     let dag = Dag::build(&g.tasks).unwrap();

@@ -35,8 +35,8 @@ pub struct NodeReport {
     pub state: NodeState,
     /// Wall time of the node's most recent attempt.
     pub duration: Option<Duration>,
-    /// What the node committed, for nodes that produced work. `None` for a
-    /// shell node, or an agent that correctly decided nothing needed changing.
+    /// What the node committed, for nodes that produced work. `None` for an
+    /// agent that correctly decided nothing needed changing.
     pub diff: Option<DiffSummary>,
     /// Failure reason or skip cause, when there is one.
     pub detail: Option<String>,
@@ -186,8 +186,8 @@ impl RunReport {
     #[must_use]
     pub fn to_terminal_tree(&self) -> String {
         let id_column = self.nodes.iter().map(|n| n.id.len()).max().unwrap_or(0);
-        // `None` for a run that committed nothing — a shell-only graph should
-        // not pay for a column it never fills.
+        // `None` for a run that committed nothing — it should not pay for a
+        // column it never fills.
         let diff_column = self
             .nodes
             .iter()

@@ -37,7 +37,7 @@ fn assembly(tmp: &tempfile::TempDir) -> Command {
 
 #[test]
 fn validate_accepts_a_good_graph() {
-    let tmp = with_graph("[[task]]\nid=\"a\"\nkind=\"shell\"\nrun=\"true\"\n");
+    let tmp = with_graph("[[task]]\nid=\"a\"\nprompt=\"x\"\n");
     assembly(&tmp)
         .args(["validate", "graph.toml"])
         .assert()
@@ -48,8 +48,8 @@ fn validate_accepts_a_good_graph() {
 #[test]
 fn validate_reports_a_cycle_and_exits_two() {
     let tmp = with_graph(
-        "[[task]]\nid=\"a\"\nkind=\"shell\"\nneeds=[\"b\"]\nrun=\"true\"\n\
-         [[task]]\nid=\"b\"\nkind=\"shell\"\nneeds=[\"a\"]\nrun=\"true\"\n",
+        "[[task]]\nid=\"a\"\nneeds=[\"b\"]\nprompt=\"x\"\n\
+         [[task]]\nid=\"b\"\nneeds=[\"a\"]\nprompt=\"x\"\n",
     );
     assembly(&tmp)
         .args(["validate", "graph.toml"])
@@ -62,7 +62,7 @@ fn validate_reports_a_cycle_and_exits_two() {
 fn validate_warns_about_an_agent_without_verify() {
     let tmp = with_graph(
         "[providers.p]\ncmd=\"true\"\n\
-         [[task]]\nid=\"a\"\nkind=\"agent\"\nprompt=\"hi\"\nprovider=\"p\"\n",
+         [[task]]\nid=\"a\"\nprompt=\"hi\"\nprovider=\"p\"\n",
     );
     assembly(&tmp)
         .args(["validate", "graph.toml"])
@@ -73,7 +73,8 @@ fn validate_warns_about_an_agent_without_verify() {
 
 #[test]
 fn run_exits_zero_and_records_the_run() {
-    let tmp = with_graph("[[task]]\nid=\"a\"\nkind=\"shell\"\nrun=\"true\"\n");
+    let tmp = repo_with_commit();
+    std::fs::write(tmp.path().join("graph.toml"), agent_graph("fake-agent.sh")).unwrap();
     assembly(&tmp)
         .args(["run", "graph.toml"])
         .assert()
@@ -82,21 +83,30 @@ fn run_exits_zero_and_records_the_run() {
 
     assert!(tmp.path().join(".assembly/runs/1/events.jsonl").is_file());
     assert!(tmp.path().join(".assembly/runs/1/meta.json").is_file());
+
+    discard_worktrees(&tmp);
 }
 
 #[test]
 fn run_exits_one_when_a_node_fails() {
-    let tmp = with_graph("[[task]]\nid=\"a\"\nkind=\"shell\"\nrun=\"exit 1\"\n");
+    let tmp = repo_with_commit();
+    std::fs::write(
+        tmp.path().join("graph.toml"),
+        agent_graph("failing-agent.sh"),
+    )
+    .unwrap();
     assembly(&tmp)
         .args(["run", "graph.toml"])
         .assert()
         .code(1)
         .stdout(contains("partial"));
+
+    discard_worktrees(&tmp);
 }
 
 #[test]
 fn run_exits_two_on_an_invalid_graph_and_leaves_no_run_directory() {
-    let tmp = with_graph("[[task]]\nid=\"a\"\nkind=\"shell\"\nneeds=[\"ghost\"]\nrun=\"true\"\n");
+    let tmp = with_graph("[[task]]\nid=\"a\"\nneeds=[\"ghost\"]\nprompt=\"x\"\n");
     assembly(&tmp)
         .args(["run", "graph.toml"])
         .assert()
@@ -114,7 +124,7 @@ fn run_outside_a_git_repo_explains_itself() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
         tmp.path().join("graph.toml"),
-        "[[task]]\nid=\"a\"\nkind=\"shell\"\nrun=\"true\"\n",
+        "[[task]]\nid=\"a\"\nprompt=\"x\"\n",
     )
     .unwrap();
 
@@ -129,11 +139,15 @@ fn run_outside_a_git_repo_explains_itself() {
 
 #[test]
 fn status_and_logs_report_a_finished_run() {
-    let tmp = with_graph(
-        "[[task]]\nid=\"build\"\nkind=\"shell\"\nrun=\"echo building\"\n\
-         [[task]]\nid=\"broken\"\nkind=\"shell\"\nneeds=[\"build\"]\nrun=\"echo nope 1>&2; exit 1\"\n\
-         [[task]]\nid=\"after\"\nkind=\"shell\"\nneeds=[\"broken\"]\nrun=\"true\"\n",
-    );
+    let tmp = repo_with_commit();
+    std::fs::write(
+        tmp.path().join("graph.toml"),
+        "[providers.run]\ncmd = \"bash\"\nargs = [\"-c\", \"{prompt}\"]\n\
+         [[task]]\nid=\"build\"\nprovider=\"run\"\nprompt=\"echo building\"\n\
+         [[task]]\nid=\"broken\"\nneeds=[\"build\"]\nprovider=\"run\"\nprompt=\"echo nope 1>&2; exit 1\"\n\
+         [[task]]\nid=\"after\"\nneeds=[\"broken\"]\nprovider=\"run\"\nprompt=\"true\"\n",
+    )
+    .unwrap();
 
     assembly(&tmp).args(["run", "graph.toml"]).assert().code(1);
 
@@ -155,11 +169,14 @@ fn status_and_logs_report_a_finished_run() {
         .assert()
         .success()
         .stdout(contains("nope"));
+
+    discard_worktrees(&tmp);
 }
 
 #[test]
 fn logs_for_an_unknown_node_explains_itself() {
-    let tmp = with_graph("[[task]]\nid=\"a\"\nkind=\"shell\"\nrun=\"true\"\n");
+    let tmp = repo_with_commit();
+    std::fs::write(tmp.path().join("graph.toml"), agent_graph("fake-agent.sh")).unwrap();
     assembly(&tmp)
         .args(["run", "graph.toml"])
         .assert()
@@ -170,6 +187,8 @@ fn logs_for_an_unknown_node_explains_itself() {
         .assert()
         .code(2)
         .stderr(contains("no log for node 'ghost'"));
+
+    discard_worktrees(&tmp);
 }
 
 #[test]
@@ -199,7 +218,7 @@ fn a_prompt_file_is_read_through_the_cli() {
     std::fs::write(
         tmp.path().join("graph.toml"),
         "[providers.p]\ncmd=\"true\"\n\
-         [[task]]\nid=\"a\"\nkind=\"agent\"\nprovider=\"p\"\nprompt_file=\"auth.md\"\nverify=\"true\"\n",
+         [[task]]\nid=\"a\"\nprovider=\"p\"\nprompt_file=\"auth.md\"\nverify=\"true\"\n",
     )
     .unwrap();
 
@@ -215,7 +234,7 @@ fn a_missing_prompt_file_is_reported_before_the_run_starts() {
     std::fs::write(
         tmp.path().join("graph.toml"),
         "[providers.p]\ncmd=\"true\"\n\
-         [[task]]\nid=\"a\"\nkind=\"agent\"\nprovider=\"p\"\nprompt_file=\"gone.md\"\nverify=\"true\"\n",
+         [[task]]\nid=\"a\"\nprovider=\"p\"\nprompt_file=\"gone.md\"\nverify=\"true\"\n",
     )
     .unwrap();
 
@@ -283,14 +302,15 @@ fn agent_graph(script: &str) -> String {
         .join(script);
     format!(
         "[providers.fake]\ncmd = \"bash\"\nargs = [\"{}\", \"{{prompt}}\", \"x\"]\n\
-         [[task]]\nid = \"n\"\nkind = \"agent\"\nprovider = \"fake\"\nprompt = \"hi\"\n",
+         [[task]]\nid = \"n\"\nprovider = \"fake\"\nprompt = \"hi\"\n",
         path.display()
     )
 }
 
 #[test]
 fn gc_with_nothing_to_collect_says_so() {
-    let tmp = with_graph("[[task]]\nid=\"a\"\nkind=\"shell\"\nrun=\"true\"\n");
+    let tmp = repo_with_commit();
+    std::fs::write(tmp.path().join("graph.toml"), agent_graph("fake-agent.sh")).unwrap();
     assembly(&tmp)
         .args(["run", "graph.toml"])
         .assert()
@@ -301,6 +321,8 @@ fn gc_with_nothing_to_collect_says_so() {
         .assert()
         .success()
         .stdout(contains("nothing to collect"));
+
+    discard_worktrees(&tmp);
 }
 
 #[test]
@@ -438,34 +460,6 @@ fn revise_without_feedback_is_a_usage_error() {
         .success();
 
     assembly(&tmp).args(["revise", "1", "n"]).assert().code(2);
-
-    discard_worktrees(&tmp);
-}
-
-#[test]
-fn meta_records_the_run_branch_only_when_the_graph_has_agent_nodes() {
-    let tmp = repo_with_commit();
-    std::fs::write(tmp.path().join("graph.toml"), agent_graph("fake-agent.sh")).unwrap();
-
-    assembly(&tmp)
-        .args(["run", "graph.toml"])
-        .assert()
-        .success();
-    let meta = std::fs::read_to_string(tmp.path().join(".assembly/runs/1/meta.json")).unwrap();
-    assert!(meta.contains("al/run-1"), "{meta}");
-
-    // A shell-only run creates no branch, so records none.
-    std::fs::write(
-        tmp.path().join("shell.toml"),
-        "[[task]]\nid=\"a\"\nkind=\"shell\"\nrun=\"true\"\n",
-    )
-    .unwrap();
-    assembly(&tmp)
-        .args(["run", "shell.toml"])
-        .assert()
-        .success();
-    let meta2 = std::fs::read_to_string(tmp.path().join(".assembly/runs/2/meta.json")).unwrap();
-    assert!(!meta2.contains("al/run-2"), "{meta2}");
 
     discard_worktrees(&tmp);
 }

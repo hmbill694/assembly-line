@@ -31,49 +31,6 @@ fmt-check:
 lint-explain:
     cargo clippy --all-targets --message-format=short 2>&1 | grep -E "warning|error" || echo "clean"
 
-# Run one graph end to end against a throwaway repo, to see real output.
-demo:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cargo build --quiet
-    bin="$CARGO_TARGET_DIR/debug/assembly"
-    dir=$(mktemp -d)
-    cd "$dir" && git init -q .
-    cat > graph.toml <<'EOF'
-    [[task]]
-    id = "build"
-    kind = "shell"
-    run = "echo building; sleep 0.3"
-
-    [[task]]
-    id = "test-auth"
-    kind = "shell"
-    needs = ["build"]
-    run = "echo testing auth; sleep 0.5"
-
-    [[task]]
-    id = "test-api"
-    kind = "shell"
-    needs = ["build"]
-    run = "echo testing api; sleep 0.5"
-
-    [[task]]
-    id = "migrate"
-    kind = "shell"
-    needs = ["build"]
-    run = "echo nope 1>&2; exit 3"
-
-    [[task]]
-    id = "deploy"
-    kind = "shell"
-    needs = ["migrate", "test-auth", "test-api"]
-    run = "echo deploying"
-    EOF
-    "$bin" run graph.toml || true
-    echo
-    "$bin" status
-    echo "demo run left in $dir"
-
 # Check every change in the jj stack independently, oldest first.
 #
 # Each revision is exported to a temp directory and built there, so this never
@@ -128,7 +85,7 @@ verify-stack:
 
     exit $failed
 
-# Prune build artifacts and the demo target directory.
+# Prune build artifacts and the out-of-repo target directory.
 clean:
     cargo clean || true
     rm -rf "$CARGO_TARGET_DIR"

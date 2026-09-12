@@ -126,7 +126,7 @@ async fn an_agent_node_runs_commits_and_merges_into_the_run_branch() {
     let h = Harness::new().await;
     let base = head_sha(&h.repo).await.unwrap();
     let src = format!(
-        "{}\n[[task]]\nid = \"impl-auth\"\nkind = \"agent\"\nprovider = \"fake\"\n\
+        "{}\n[[task]]\nid = \"impl-auth\"\nprovider = \"fake\"\n\
          prompt = \"add authentication\"\n",
         provider_block("fake-agent.sh", "a")
     );
@@ -161,7 +161,7 @@ async fn an_agent_node_runs_commits_and_merges_into_the_run_branch() {
 async fn the_prompt_reaches_the_agent_intact() {
     let h = Harness::new().await;
     let src = format!(
-        "{}\n[[task]]\nid = \"n\"\nkind = \"agent\"\nprovider = \"fake\"\n\
+        "{}\n[[task]]\nid = \"n\"\nprovider = \"fake\"\n\
          prompt = \"quotes \\\" and $HOME and ; semicolons\"\n",
         provider_block("fake-agent.sh", "a")
     );
@@ -193,7 +193,7 @@ async fn the_prompt_reaches_the_agent_intact() {
 async fn a_failing_agent_preserves_its_work_on_a_branch_and_leaves_no_worktree() {
     let h = Harness::new().await;
     let src = format!(
-        "{}\n[[task]]\nid = \"broken\"\nkind = \"agent\"\nprovider = \"fake\"\nprompt = \"x\"\n",
+        "{}\n[[task]]\nid = \"broken\"\nprovider = \"fake\"\nprompt = \"x\"\n",
         provider_block("failing-agent.sh", "a")
     );
 
@@ -242,7 +242,7 @@ async fn a_failed_nodes_branch_reaches_the_remote() {
     let h = Harness::new().await;
     let origin = h.with_origin().await;
     let src = format!(
-        "{}\n[[task]]\nid = \"broken\"\nkind = \"agent\"\nprovider = \"fake\"\nprompt = \"x\"\n",
+        "{}\n[[task]]\nid = \"broken\"\nprovider = \"fake\"\nprompt = \"x\"\n",
         provider_block("failing-agent.sh", "a")
     );
 
@@ -273,7 +273,7 @@ async fn a_failed_nodes_branch_reaches_the_remote() {
 async fn publishing_without_a_remote_keeps_the_branch_local() {
     let h = Harness::new().await;
     let src = format!(
-        "{}\n[[task]]\nid = \"work\"\nkind = \"agent\"\nprovider = \"fake\"\nprompt = \"x\"\n",
+        "{}\n[[task]]\nid = \"work\"\nprovider = \"fake\"\nprompt = \"x\"\n",
         provider_block("fake-agent.sh", "a")
     );
 
@@ -289,7 +289,7 @@ async fn publishing_without_a_remote_keeps_the_branch_local() {
 async fn an_agent_that_changes_nothing_succeeds_without_a_merge() {
     let h = Harness::new().await;
     let src = format!(
-        "{}\n[[task]]\nid = \"n\"\nkind = \"agent\"\nprovider = \"fake\"\nprompt = \"x\"\n",
+        "{}\n[[task]]\nid = \"n\"\nprovider = \"fake\"\nprompt = \"x\"\n",
         provider_block("noop-agent.sh", "a")
     );
 
@@ -306,9 +306,10 @@ async fn a_second_node_sees_the_first_nodes_merged_work() {
     let h = Harness::new().await;
     let src = format!(
         "{}\n\
-         [[task]]\nid = \"first\"\nkind = \"agent\"\nprovider = \"fake\"\nprompt = \"one\"\n\
-         [[task]]\nid = \"second\"\nkind = \"shell\"\nneeds = [\"first\"]\n\
-         run = \"test -f agent-output.txt\"\n",
+         [providers.check]\ncmd = \"bash\"\nargs = [\"-c\", \"test -f agent-output.txt\"]\n\n\
+         [[task]]\nid = \"first\"\nprovider = \"fake\"\nprompt = \"one\"\n\
+         [[task]]\nid = \"second\"\nneeds = [\"first\"]\n\
+         provider = \"check\"\nprompt = \"x\"\n",
         provider_block("fake-agent.sh", "a")
     );
 
@@ -328,8 +329,8 @@ async fn two_agents_editing_the_same_file_conflict_on_the_second_merge() {
     let src = format!(
         "[providers.a]\ncmd = \"bash\"\nargs = [\"{script}\", \"{{prompt}}\", \"a\"]\n\
          [providers.b]\ncmd = \"bash\"\nargs = [\"{script}\", \"{{prompt}}\", \"b\"]\n\
-         [[task]]\nid = \"one\"\nkind = \"agent\"\nprovider = \"a\"\nprompt = \"x\"\n\
-         [[task]]\nid = \"two\"\nkind = \"agent\"\nprovider = \"b\"\nprompt = \"y\"\n",
+         [[task]]\nid = \"one\"\nprovider = \"a\"\nprompt = \"x\"\n\
+         [[task]]\nid = \"two\"\nprovider = \"b\"\nprompt = \"y\"\n",
         script = fixture("conflicting-agent.sh").display()
     );
 
@@ -357,7 +358,7 @@ async fn seeded_files_reach_the_agent_but_never_the_run_branch() {
     std::fs::write(h.repo.join(".env"), "API_KEY=hunter2\n").unwrap();
     let src = format!(
         "{}\n[workspace]\ncopy = [\".env\"]\n\
-         [[task]]\nid = \"n\"\nkind = \"agent\"\nprovider = \"fake\"\nprompt = \"x\"\n",
+         [[task]]\nid = \"n\"\nprovider = \"fake\"\nprompt = \"x\"\n",
         provider_block("fake-agent.sh", "a")
     );
 
@@ -378,35 +379,10 @@ async fn seeded_files_reach_the_agent_but_never_the_run_branch() {
 }
 
 #[tokio::test]
-async fn a_shell_only_graph_creates_no_branch_and_no_worktrees() {
-    let h = Harness::new().await;
-    let out = h
-        .run(
-            "[[task]]\nid = \"a\"\nkind = \"shell\"\nrun = \"true\"\n",
-            1,
-        )
-        .await;
-
-    assert_eq!(out.status, RunStatus::Ok);
-    assert!(!out.has(|k| matches!(k, EventKind::RunBranchCreated { .. })));
-    assert!(
-        !git::branch_exists(&h.repo, &run_branch_name(out.run_id))
-            .await
-            .unwrap(),
-        "a shell-only run must behave exactly as it did in M1"
-    );
-    assert!(
-        !assembly_line::paths::worktree_root(&h.repo, out.run_id)
-            .unwrap()
-            .exists()
-    );
-}
-
-#[tokio::test]
 async fn a_missing_provider_binary_fails_the_node_with_a_useful_message() {
     let h = Harness::new().await;
     let src = "[providers.gone]\ncmd = \"definitely-not-real-xyz\"\nargs = [\"{prompt}\"]\n\
-               [[task]]\nid = \"n\"\nkind = \"agent\"\nprovider = \"gone\"\nprompt = \"x\"\n";
+               [[task]]\nid = \"n\"\nprovider = \"gone\"\nprompt = \"x\"\n";
 
     let out = h.run(src, 1).await;
 

@@ -67,13 +67,6 @@ pub struct Hook {
     pub when: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum TaskKind {
-    Shell,
-    Agent,
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OnFailure {
@@ -87,14 +80,9 @@ pub enum OnFailure {
 #[serde(deny_unknown_fields)]
 pub struct Task {
     pub id: String,
-    pub kind: TaskKind,
     #[serde(default)]
     pub needs: Vec<String>,
 
-    // shell
-    pub run: Option<String>,
-
-    // agent — parsed in M1, executed in M2
     /// Inline prompt text. Mutually exclusive with `prompt_file`.
     pub prompt: Option<String>,
     /// Path to a file holding the prompt, resolved relative to the graph file.
@@ -104,7 +92,6 @@ pub struct Task {
     pub provider: Option<String>,
     pub output_file: Option<String>,
 
-    // shared
     pub verify: Option<String>,
     pub resource: Option<String>,
     #[serde(default)]

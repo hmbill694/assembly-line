@@ -224,7 +224,7 @@ async fn pr_mode_still_pushes_when_no_pull_request_can_be_opened() {
 
 #[test]
 fn delivery_defaults_to_a_pull_request_and_the_branch_you_started_from() {
-    let graph = parse_graph("[[task]]\nid=\"a\"\nkind=\"shell\"\nrun=\"true\"\n").unwrap();
+    let graph = parse_graph("[[task]]\nid=\"a\"\n").unwrap();
 
     assert_eq!(graph.delivery.mode, DeliveryMode::Pr);
     assert_eq!(
@@ -237,7 +237,7 @@ fn delivery_defaults_to_a_pull_request_and_the_branch_you_started_from() {
 fn delivery_is_configurable_from_the_graph() {
     let graph = parse_graph(
         "[delivery]\nmode = \"push\"\nbase = \"develop\"\n\
-         [[task]]\nid=\"a\"\nkind=\"shell\"\nrun=\"true\"\n",
+         [[task]]\nid=\"a\"\n",
     )
     .unwrap();
 

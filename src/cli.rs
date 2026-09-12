@@ -2,11 +2,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
-#[command(
-    name = "assembly",
-    version,
-    about = "Run a DAG of shell and agent tasks"
-)]
+#[command(name = "assembly", version, about = "Run a DAG of coding-agent tasks")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,

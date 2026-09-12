@@ -1,4 +1,4 @@
-use crate::config::{Graph, Task, TaskKind};
+use crate::config::{Graph, Task};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9,7 +9,6 @@ pub enum ValidationError {
     SelfDep(String),
     UnknownDep { task: String, dep: String },
     Cycle(Vec<String>),
-    ShellMissingRun(String),
     AgentMissingPrompt(String),
     UnknownProvider { task: String, provider: String },
     InvalidDuration { task: String, value: String },
@@ -32,7 +31,6 @@ impl std::fmt::Display for ValidationError {
                 write!(f, "task '{task}' needs '{dep}', which does not exist")
             }
             Self::Cycle(path) => write!(f, "dependency cycle: {}", path.join(" -> ")),
-            Self::ShellMissingRun(id) => write!(f, "shell task '{id}' has no `run`"),
             Self::AgentMissingPrompt(id) => {
                 write!(f, "agent task '{id}' has no `prompt` or `prompt_file`")
             }
@@ -108,13 +106,12 @@ fn id_naming_errors(tasks: &[Task]) -> impl Iterator<Item = ValidationError> + '
     invalid.chain(duplicated).chain(reserved)
 }
 
-/// A task must carry the field its kind needs to be runnable at all. An agent
-/// may supply its prompt inline or by file; `load_graph` folds the latter into
-/// the former, so either satisfies this check.
+/// A task must carry a prompt to be runnable at all. It may supply it inline
+/// or by file; `load_graph` folds the latter into the former, so either
+/// satisfies this check.
 fn missing_required_field(t: &Task) -> Option<ValidationError> {
-    match (t.kind, &t.run, &t.prompt, &t.prompt_file) {
-        (TaskKind::Shell, None, _, _) => Some(ValidationError::ShellMissingRun(t.id.clone())),
-        (TaskKind::Agent, _, None, None) => Some(ValidationError::AgentMissingPrompt(t.id.clone())),
+    match (&t.prompt, &t.prompt_file) {
+        (None, None) => Some(ValidationError::AgentMissingPrompt(t.id.clone())),
         _ => None,
     }
 }
@@ -314,11 +311,11 @@ fn unparseable_max_duration(t: &Task) -> Option<ValidationError> {
     }
 }
 
-/// Checks that only apply to agent tasks: the provider must exist, and an
-/// agent with no oversight at all is worth flagging.
+/// Checks against a task's declared provider: it must exist, and a task with
+/// no oversight at all is worth flagging.
 fn check_agent_task(graph: &Graph, t: &Task) -> (Vec<ValidationError>, Vec<Warning>) {
-    match (t.kind, &t.provider) {
-        (TaskKind::Agent, Some(name)) => match graph.providers.get(name) {
+    match &t.provider {
+        Some(name) => match graph.providers.get(name) {
             None => (
                 vec![ValidationError::UnknownProvider {
                     task: t.id.clone(),
@@ -340,7 +337,7 @@ fn check_agent_task(graph: &Graph, t: &Task) -> (Vec<ValidationError>, Vec<Warni
                 (Vec::new(), unverified.into_iter().chain(uncapped).collect())
             }
         },
-        _ => (Vec::new(), Vec::new()),
+        None => (Vec::new(), Vec::new()),
     }
 }
 

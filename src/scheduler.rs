@@ -1,7 +1,7 @@
-use crate::config::{Graph, OnFailure, Task, TaskKind, parse_duration};
+use crate::config::{Graph, OnFailure, Task, parse_duration};
 use crate::dag::Dag;
 use crate::event::{EventKind, EventLog, RunStatus};
-use crate::exec::{ShellOutcome, run_command, run_shell};
+use crate::exec::{ShellOutcome, run_command};
 use crate::git::{self, MergeOutcome};
 use crate::paths::{self, RunPaths};
 use crate::provider::{CommandSpec, render_command};
@@ -20,8 +20,8 @@ pub struct RunOpts {
     pub jobs: usize,
     pub cwd: PathBuf,
     pub cancel: CancellationToken,
-    /// The repository worktrees are created from. `None` disables agent
-    /// nodes, which is how shell-only runs keep M1 behaviour exactly.
+    /// The repository worktrees are created from. Every task is an agent
+    /// task, so `None` here means every node fails rather than runs.
     pub repo: Option<PathBuf>,
     /// Where `copy` paths resolve from — the CLI's working directory.
     pub seed_from: PathBuf,
@@ -87,7 +87,7 @@ struct AgentWork {
 /// loop, not the task, so their order in the log is the order things settled.
 #[derive(Debug)]
 enum NodeResult {
-    /// A shell node, or an agent that correctly decided nothing needed doing.
+    /// An agent that correctly decided nothing needed doing.
     Succeeded,
     /// An agent left work, which was committed, published, and then offered to
     /// the run branch — successfully or not.
@@ -314,9 +314,9 @@ pub struct Revision<'a> {
 ///
 /// # Errors
 ///
-/// Returns an error if the node is not an agent node the graph declares, if
-/// the run has no repository, or if the event log cannot be appended to. A
-/// round that runs and fails is not an error — that is the returned flag.
+/// Returns an error if the node is not a task the graph declares, if the run
+/// has no repository, or if the event log cannot be appended to. A round that
+/// runs and fails is not an error — that is the returned flag.
 pub async fn revise_node(
     graph: &Graph,
     paths: &RunPaths,
@@ -336,11 +336,6 @@ pub async fn revise_node(
         .iter()
         .find(|t| t.id == node)
         .ok_or_else(|| anyhow::anyhow!("the graph has no task '{node}'"))?;
-    anyhow::ensure!(
-        task.kind == TaskKind::Agent,
-        "only agent nodes carry work to revise, and '{node}' is a shell node"
-    );
-
     let repo = opts
         .repo
         .as_deref()
@@ -520,7 +515,7 @@ fn record_completion(
 
 /// Recording what an agent left: the commit, then where its branch went.
 ///
-/// Empty for a shell node, or for an agent that correctly changed nothing.
+/// Empty for an agent that correctly changed nothing.
 fn work_recorded(node: &str, work: Option<&AgentWork>) -> Vec<EventKind> {
     work.map(|w| {
         vec![
@@ -638,11 +633,9 @@ pub async fn execute(
     })?;
     state.apply(&ev.kind);
 
-    let graph_has_agent_nodes = graph.tasks.iter().any(|t| t.kind == TaskKind::Agent);
-    let run_branch = match (graph_has_agent_nodes, &opts.repo) {
-        // A shell-only graph touches git not at all — M1 behaviour, exactly.
-        (false, _) | (true, None) => None,
-        (true, Some(repo)) => Some(prepare_run_branch(repo, paths).await?),
+    let run_branch = match &opts.repo {
+        None => None,
+        Some(repo) => Some(prepare_run_branch(repo, paths).await?),
     };
 
     if let Some(branch) = &run_branch
@@ -654,13 +647,6 @@ pub async fn execute(
         })?;
         state.apply(&ev.kind);
     }
-
-    // Shell nodes run against the run branch too, so a dependent sees what the
-    // agents before it merged. Without agents there is no branch, and they run
-    // where the user invoked assembly.
-    let shell_cwd = run_branch
-        .as_ref()
-        .map_or_else(|| opts.cwd.clone(), |b| b.worktree.clone());
 
     // A state machine over time: launch what fits, await one completion,
     // re-derive readiness. Not expressible as an iterator chain.
@@ -686,51 +672,34 @@ pub async fn execute(
                 let log_path = paths.log(&id);
                 let cancel = opts.cancel.clone();
 
-                match task.kind {
-                    TaskKind::Shell => {
-                        let cmd = task.run.clone().unwrap_or_default();
-                        let cwd = shell_cwd.clone();
+                match agent_node_plan(graph, task, paths, opts, run_branch.as_ref(), None) {
+                    Err(reason) => {
                         in_flight.spawn(async move {
-                            let outcome = run_shell(&cmd, &cwd, &log_path, timeout, cancel).await;
                             NodeCompletion {
                                 node: id,
                                 resource,
-                                result: NodeResult::from_command(outcome),
+                                // A node that never ran left nothing to
+                                // preserve.
+                                result: NodeResult::Failed { reason, work: None },
                             }
                         });
                     }
-                    TaskKind::Agent => {
-                        match agent_node_plan(graph, task, paths, opts, run_branch.as_ref(), None) {
-                            Err(reason) => {
-                                in_flight.spawn(async move {
-                                    NodeCompletion {
-                                        node: id,
-                                        resource,
-                                        // A node that never ran left nothing
-                                        // to preserve.
-                                        result: NodeResult::Failed { reason, work: None },
-                                    }
-                                });
+                    Ok(plan) => {
+                        in_flight.spawn(async move {
+                            let result = agent_node_result(&plan, &log_path, timeout, cancel).await;
+                            NodeCompletion {
+                                node: id,
+                                resource,
+                                // The job could not be administered at all —
+                                // no sandbox, or git refused. Any partial work
+                                // is described by the error, not by a branch
+                                // we can name.
+                                result: result.unwrap_or_else(|e| NodeResult::Failed {
+                                    reason: e.to_string(),
+                                    work: None,
+                                }),
                             }
-                            Ok(plan) => {
-                                in_flight.spawn(async move {
-                                    let result =
-                                        agent_node_result(&plan, &log_path, timeout, cancel).await;
-                                    NodeCompletion {
-                                        node: id,
-                                        resource,
-                                        // The job could not be administered at
-                                        // all — no sandbox, or git refused. Any
-                                        // partial work is described by the
-                                        // error, not by a branch we can name.
-                                        result: result.unwrap_or_else(|e| NodeResult::Failed {
-                                            reason: e.to_string(),
-                                            work: None,
-                                        }),
-                                    }
-                                });
-                            }
-                        }
+                        });
                     }
                 }
             }

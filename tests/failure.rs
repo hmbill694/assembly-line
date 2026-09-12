@@ -1,32 +1,75 @@
 use assembly_line::config::parse_graph;
 use assembly_line::dag::Dag;
 use assembly_line::event::{EventKind, EventLog, RunStatus};
-use assembly_line::paths::{create_run, runs_root};
+use assembly_line::git::{self, commit_all};
+use assembly_line::paths::{create_run, repo_worktrees_root, runs_root};
 use assembly_line::scheduler::{RunOpts, execute};
 use assembly_line::state::{NodeState, RunState};
 use assembly_line::workspace;
+use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
 struct Outcome {
     status: RunStatus,
     state: RunState,
     events: Vec<EventKind>,
-    _tmp: tempfile::TempDir,
 }
 
-async fn run(src: &str) -> Outcome {
-    let tmp = tempfile::tempdir().unwrap();
+/// A repository with one commit, so agent nodes have somewhere to branch
+/// from. Every task is an agent task now, so every failure-handling test
+/// needs one.
+struct Harness {
+    tmp: tempfile::TempDir,
+    repo: PathBuf,
+}
+
+/// Worktrees live under `$HOME`. A run that dies mid-node can orphan one, and
+/// tests must not leave that behind.
+impl Drop for Harness {
+    fn drop(&mut self) {
+        if let Some(root) = repo_worktrees_root(&self.repo) {
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+}
+
+impl Harness {
+    async fn new() -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [
+            vec!["init", "--initial-branch=main"],
+            vec!["config", "user.email", "t@e.com"],
+            vec!["config", "user.name", "T"],
+            vec!["config", "commit.gpgsign", "false"],
+        ] {
+            git::run_allowing_failure(&repo, &args).await.unwrap();
+        }
+        std::fs::write(repo.join("README.md"), "base\n").unwrap();
+        commit_all(&repo, "initial").await.unwrap().unwrap();
+
+        Harness { tmp, repo }
+    }
+}
+
+/// One `[providers.run]` block whose command is the task's own prompt, run
+/// through a shell. Lets a test hand each node an arbitrary script without
+/// needing a fixture file for it.
+const RUN_PROVIDER: &str = "[providers.run]\ncmd = \"bash\"\nargs = [\"-c\", \"{prompt}\"]\n";
+
+async fn run(h: &Harness, src: &str) -> Outcome {
     let graph = parse_graph(src).unwrap();
     let dag = Dag::build(&graph.tasks).unwrap();
-    let paths = create_run(&runs_root(tmp.path()), 1).unwrap();
+    let paths = create_run(&runs_root(h.tmp.path()), 1).unwrap();
     let mut log = EventLog::open_append(paths.events()).unwrap();
     let mut state = RunState::new(dag.ids());
     let opts = RunOpts {
         jobs: 4,
-        cwd: tmp.path().to_path_buf(),
+        cwd: h.repo.clone(),
         cancel: CancellationToken::new(),
-        repo: None,
-        seed_from: tmp.path().to_path_buf(),
+        repo: Some(h.repo.clone()),
+        seed_from: h.repo.clone(),
         remote: workspace::DEFAULT_REMOTE.to_string(),
     };
 
@@ -43,37 +86,39 @@ async fn run(src: &str) -> Outcome {
         status,
         state,
         events,
-        _tmp: tmp,
     }
 }
 
 #[tokio::test]
 async fn a_failure_skips_its_subtree_and_spares_independent_branches() {
-    let src = r#"
+    let h = Harness::new().await;
+    let src = format!(
+        "{RUN_PROVIDER}\n\
 [[task]]
-id = "build"
-kind = "shell"
-run = "true"
+id = \"build\"
+provider = \"run\"
+prompt = \"true\"
 
 [[task]]
-id = "impl-auth"
-kind = "shell"
-needs = ["build"]
-run = "exit 1"
+id = \"impl-auth\"
+needs = [\"build\"]
+provider = \"run\"
+prompt = \"exit 1\"
 
 [[task]]
-id = "wire-routes"
-kind = "shell"
-needs = ["impl-auth"]
-run = "true"
+id = \"wire-routes\"
+needs = [\"impl-auth\"]
+provider = \"run\"
+prompt = \"true\"
 
 [[task]]
-id = "impl-api"
-kind = "shell"
-needs = ["build"]
-run = "true"
-"#;
-    let out = run(src).await;
+id = \"impl-api\"
+needs = [\"build\"]
+provider = \"run\"
+prompt = \"true\"
+"
+    );
+    let out = run(&h, &src).await;
 
     assert_eq!(out.status, RunStatus::Partial);
     assert_eq!(out.state.state("build"), NodeState::Done);
@@ -94,25 +139,28 @@ run = "true"
 
 #[tokio::test]
 async fn a_failure_skips_the_whole_subtree_not_just_direct_children() {
-    let src = r#"
+    let h = Harness::new().await;
+    let src = format!(
+        "{RUN_PROVIDER}\n\
 [[task]]
-id = "a"
-kind = "shell"
-run = "exit 1"
+id = \"a\"
+provider = \"run\"
+prompt = \"exit 1\"
 
 [[task]]
-id = "b"
-kind = "shell"
-needs = ["a"]
-run = "true"
+id = \"b\"
+needs = [\"a\"]
+provider = \"run\"
+prompt = \"true\"
 
 [[task]]
-id = "c"
-kind = "shell"
-needs = ["b"]
-run = "true"
-"#;
-    let out = run(src).await;
+id = \"c\"
+needs = [\"b\"]
+provider = \"run\"
+prompt = \"true\"
+"
+    );
+    let out = run(&h, &src).await;
 
     assert_eq!(out.state.state("b"), NodeState::Skipped);
     assert_eq!(out.state.state("c"), NodeState::Skipped);
@@ -120,20 +168,23 @@ run = "true"
 
 #[tokio::test]
 async fn on_failure_continue_lets_dependents_run() {
-    let src = r#"
+    let h = Harness::new().await;
+    let src = format!(
+        "{RUN_PROVIDER}\n\
 [[task]]
-id = "lint"
-kind = "shell"
-run = "exit 1"
-on_failure = "continue"
+id = \"lint\"
+provider = \"run\"
+prompt = \"exit 1\"
+on_failure = \"continue\"
 
 [[task]]
-id = "build"
-kind = "shell"
-needs = ["lint"]
-run = "true"
-"#;
-    let out = run(src).await;
+id = \"build\"
+needs = [\"lint\"]
+provider = \"run\"
+prompt = \"true\"
+"
+    );
+    let out = run(&h, &src).await;
 
     assert_eq!(out.state.state("lint"), NodeState::Failed);
     assert_eq!(out.state.state("build"), NodeState::Done);
@@ -146,26 +197,29 @@ run = "true"
 
 #[tokio::test]
 async fn on_failure_abort_stops_the_run_and_skips_the_rest() {
-    let src = r#"
+    let h = Harness::new().await;
+    let src = format!(
+        "{RUN_PROVIDER}\n\
 [[task]]
-id = "migrate"
-kind = "shell"
-run = "exit 1"
-on_failure = "abort"
+id = \"migrate\"
+provider = \"run\"
+prompt = \"exit 1\"
+on_failure = \"abort\"
 
 [[task]]
-id = "slow"
-kind = "shell"
-run = "sleep 5"
+id = \"slow\"
+provider = \"run\"
+prompt = \"sleep 5\"
 
 [[task]]
-id = "later"
-kind = "shell"
-needs = ["migrate"]
-run = "true"
-"#;
+id = \"later\"
+needs = [\"migrate\"]
+provider = \"run\"
+prompt = \"true\"
+"
+    );
     let started = std::time::Instant::now();
-    let out = run(src).await;
+    let out = run(&h, &src).await;
 
     assert_eq!(out.status, RunStatus::Aborted);
     assert_eq!(out.state.state("later"), NodeState::Skipped);
@@ -178,14 +232,17 @@ run = "true"
 
 #[tokio::test]
 async fn a_timed_out_node_fails_with_that_reason() {
-    let src = r#"
+    let h = Harness::new().await;
+    let src = format!(
+        "{RUN_PROVIDER}\n\
 [[task]]
-id = "hang"
-kind = "shell"
-run = "sleep 10"
-max_duration = "200ms"
-"#;
-    let out = run(src).await;
+id = \"hang\"
+provider = \"run\"
+prompt = \"sleep 10\"
+max_duration = \"200ms\"
+"
+    );
+    let out = run(&h, &src).await;
 
     assert_eq!(out.status, RunStatus::Partial);
     assert_eq!(out.state.state("hang"), NodeState::Failed);
@@ -198,7 +255,9 @@ max_duration = "200ms"
 
 #[tokio::test]
 async fn a_nonzero_exit_records_the_code_in_the_reason() {
-    let out = run("[[task]]\nid=\"a\"\nkind=\"shell\"\nrun=\"exit 7\"\n").await;
+    let h = Harness::new().await;
+    let src = format!("{RUN_PROVIDER}\n[[task]]\nid=\"a\"\nprovider=\"run\"\nprompt=\"exit 7\"\n");
+    let out = run(&h, &src).await;
     assert!(
         out.events
             .iter()
@@ -210,6 +269,8 @@ async fn a_nonzero_exit_records_the_code_in_the_reason() {
 
 #[tokio::test]
 async fn a_clean_run_is_ok() {
-    let out = run("[[task]]\nid=\"a\"\nkind=\"shell\"\nrun=\"true\"\n").await;
+    let h = Harness::new().await;
+    let src = format!("{RUN_PROVIDER}\n[[task]]\nid=\"a\"\nprovider=\"run\"\nprompt=\"true\"\n");
+    let out = run(&h, &src).await;
     assert_eq!(out.status, RunStatus::Ok);
 }

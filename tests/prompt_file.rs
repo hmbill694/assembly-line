@@ -20,7 +20,7 @@ fn graph_dir(graph_body: &str, prompts: &[(&str, &str)]) -> tempfile::TempDir {
 fn a_prompt_file_is_read_into_the_prompt() {
     let tmp = graph_dir(
         "[providers.p]\ncmd=\"true\"\n\
-         [[task]]\nid=\"impl-auth\"\nkind=\"agent\"\nprovider=\"p\"\n\
+         [[task]]\nid=\"impl-auth\"\nprovider=\"p\"\n\
          prompt_file=\"prompts/auth.md\"\nverify=\"true\"\n",
         &[("prompts/auth.md", "Implement JWT auth.\nUse argon2.\n")],
     );
@@ -36,7 +36,7 @@ fn a_prompt_file_is_read_into_the_prompt() {
 fn prompt_file_paths_resolve_relative_to_the_graph_not_the_cwd() {
     let tmp = graph_dir(
         "[providers.p]\ncmd=\"true\"\n\
-         [[task]]\nid=\"a\"\nkind=\"agent\"\nprovider=\"p\"\n\
+         [[task]]\nid=\"a\"\nprovider=\"p\"\n\
          prompt_file=\"p.md\"\nverify=\"true\"\n",
         &[("p.md", "from the graph's directory")],
     );
@@ -53,7 +53,7 @@ fn prompt_file_paths_resolve_relative_to_the_graph_not_the_cwd() {
 fn setting_both_prompt_and_prompt_file_is_an_error() {
     let tmp = graph_dir(
         "[providers.p]\ncmd=\"true\"\n\
-         [[task]]\nid=\"a\"\nkind=\"agent\"\nprovider=\"p\"\n\
+         [[task]]\nid=\"a\"\nprovider=\"p\"\n\
          prompt=\"inline\"\nprompt_file=\"p.md\"\nverify=\"true\"\n",
         &[("p.md", "from a file")],
     );
@@ -68,7 +68,7 @@ fn setting_both_prompt_and_prompt_file_is_an_error() {
 fn a_missing_prompt_file_names_the_task_and_the_path() {
     let tmp = graph_dir(
         "[providers.p]\ncmd=\"true\"\n\
-         [[task]]\nid=\"impl-auth\"\nkind=\"agent\"\nprovider=\"p\"\n\
+         [[task]]\nid=\"impl-auth\"\nprovider=\"p\"\n\
          prompt_file=\"prompts/gone.md\"\nverify=\"true\"\n",
         &[],
     );
@@ -83,7 +83,7 @@ fn a_missing_prompt_file_names_the_task_and_the_path() {
 #[test]
 fn an_agent_with_only_a_prompt_file_passes_validation() {
     let src = "[providers.p]\ncmd=\"true\"\n\
-               [[task]]\nid=\"a\"\nkind=\"agent\"\nprovider=\"p\"\n\
+               [[task]]\nid=\"a\"\nprovider=\"p\"\n\
                prompt_file=\"p.md\"\nverify=\"true\"\n";
     let tasks = parse_graph(src).unwrap().tasks;
     assert!(Dag::build(&tasks).is_ok());
@@ -91,7 +91,7 @@ fn an_agent_with_only_a_prompt_file_passes_validation() {
 
 #[test]
 fn an_agent_with_neither_prompt_nor_prompt_file_is_rejected() {
-    let src = "[[task]]\nid=\"a\"\nkind=\"agent\"\n";
+    let src = "[[task]]\nid=\"a\"\n";
     let errs = Dag::build(&parse_graph(src).unwrap().tasks).unwrap_err();
     assert!(
         errs.contains(&ValidationError::AgentMissingPrompt("a".into())),
@@ -100,8 +100,8 @@ fn an_agent_with_neither_prompt_nor_prompt_file_is_rejected() {
 }
 
 #[test]
-fn shell_tasks_are_unaffected() {
-    let tmp = graph_dir("[[task]]\nid=\"a\"\nkind=\"shell\"\nrun=\"true\"\n", &[]);
+fn a_task_with_no_prompt_at_all_is_left_alone_by_load_graph() {
+    let tmp = graph_dir("[[task]]\nid=\"a\"\n", &[]);
     let graph = load_graph(&tmp.path().join("graph.toml")).unwrap();
     assert!(graph.tasks[0].prompt.is_none());
 }

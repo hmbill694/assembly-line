@@ -1,27 +1,68 @@
 use assembly_line::config::parse_graph;
 use assembly_line::dag::Dag;
 use assembly_line::event::{EventKind, EventLog, RunStatus};
-use assembly_line::paths::{create_run, runs_root};
+use assembly_line::git::{self, commit_all};
+use assembly_line::paths::{create_run, repo_worktrees_root, runs_root};
 use assembly_line::scheduler::{RunOpts, execute};
 use assembly_line::state::{NodeState, RunState};
-use assembly_line::workspace;
+use assembly_line::workspace::{self, run_branch_name};
+use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
+/// A repository with one commit, so agent nodes have somewhere to branch
+/// from. Every task is an agent task now, so every scheduling test needs one.
 struct Harness {
     tmp: tempfile::TempDir,
+    repo: PathBuf,
+}
+
+/// Worktrees live under `$HOME`. A run that dies mid-node can orphan one, and
+/// tests must not leave that behind.
+impl Drop for Harness {
+    fn drop(&mut self) {
+        if let Some(root) = repo_worktrees_root(&self.repo) {
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
 }
 
 struct Outcome {
     status: RunStatus,
     events: Vec<EventKind>,
-    state: RunState,
+    run_id: u64,
 }
 
 impl Harness {
-    fn new() -> Self {
-        Harness {
-            tmp: tempfile::tempdir().unwrap(),
+    async fn new() -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [
+            vec!["init", "--initial-branch=main"],
+            vec!["config", "user.email", "t@e.com"],
+            vec!["config", "user.name", "T"],
+            vec!["config", "commit.gpgsign", "false"],
+        ] {
+            git::run_allowing_failure(&repo, &args).await.unwrap();
         }
+        std::fs::write(repo.join("README.md"), "base\n").unwrap();
+        commit_all(&repo, "initial").await.unwrap().unwrap();
+
+        Harness { tmp, repo }
+    }
+
+    /// A script that touches nothing in the node's own worktree, so it can be
+    /// run concurrently without merge conflicts. `dir` and `out` are absolute
+    /// paths outside the repo, so every node's process — each in its own
+    /// worktree — still observes the same files.
+    fn probe(&self, dir: &str, out: &str) -> String {
+        let dir = self.tmp.path().join(dir);
+        let out = self.tmp.path().join(out);
+        format!(
+            "mkdir -p {d}; touch {d}/$$; ls {d} | wc -l >> {o}; sleep 0.3; rm {d}/$$",
+            d = dir.display(),
+            o = out.display()
+        )
     }
 
     async fn run(&self, src: &str, jobs: usize) -> Outcome {
@@ -32,10 +73,10 @@ impl Harness {
         let mut state = RunState::new(dag.ids());
         let opts = RunOpts {
             jobs,
-            cwd: self.tmp.path().to_path_buf(),
+            cwd: self.repo.clone(),
             cancel: CancellationToken::new(),
-            repo: None,
-            seed_from: self.tmp.path().to_path_buf(),
+            repo: Some(self.repo.clone()),
+            seed_from: self.repo.clone(),
             remote: workspace::DEFAULT_REMOTE.to_string(),
         };
 
@@ -51,17 +92,14 @@ impl Harness {
         Outcome {
             status,
             events,
-            state,
+            run_id: paths.id,
         }
-    }
-
-    fn read(&self, file: &str) -> String {
-        std::fs::read_to_string(self.tmp.path().join(file)).unwrap()
     }
 
     /// Highest concurrency the probe observed.
     fn peak(&self, file: &str) -> usize {
-        self.read(file)
+        std::fs::read_to_string(self.tmp.path().join(file))
+            .unwrap()
             .lines()
             .filter_map(|l| l.trim().parse::<usize>().ok())
             .max()
@@ -69,70 +107,65 @@ impl Harness {
     }
 }
 
-/// A shell body that records how many copies of itself were live on entry.
-fn probe(dir: &str, out: &str) -> String {
-    format!("mkdir -p {dir}; touch {dir}/$$; ls {dir} | wc -l >> {out}; sleep 0.3; rm {dir}/$$")
-}
+/// One `[providers.run]` block whose command is the task's own prompt, run
+/// through a shell. Lets a test hand each node an arbitrary script without
+/// needing a fixture file for it.
+const RUN_PROVIDER: &str = "[providers.run]\ncmd = \"bash\"\nargs = [\"-c\", \"{prompt}\"]\n";
 
-fn shell_tasks(bodies: &[(&str, &str)]) -> String {
-    bodies
+fn agent_tasks(bodies: &[(&str, &str)]) -> String {
+    let tasks: String = bodies
         .iter()
-        .map(|(id, body)| format!("[[task]]\nid = \"{id}\"\nkind = \"shell\"\nrun = \"{body}\"\n"))
-        .collect()
+        .map(|(id, body)| {
+            format!("[[task]]\nid = \"{id}\"\nprovider = \"run\"\nprompt = \"{body}\"\n")
+        })
+        .collect();
+    format!("{RUN_PROVIDER}\n{tasks}")
 }
 
+fn agent_tasks_with_resource(bodies: &[(&str, &str, &str)]) -> String {
+    let tasks: String = bodies
+        .iter()
+        .map(|(id, resource, body)| {
+            format!(
+                "[[task]]\nid = \"{id}\"\nprovider = \"run\"\nresource = \"{resource}\"\nprompt = \"{body}\"\n"
+            )
+        })
+        .collect();
+    format!("{RUN_PROVIDER}\n{tasks}")
+}
+
+/// Dependency order is what the scheduler exists to enforce, so it must still
+/// hold once every node is an agent: each node's workspace starts from
+/// whatever the run branch carries when it launches, which is only ever what
+/// finished before it.
 #[tokio::test]
 async fn runs_a_linear_chain_in_order() {
-    let h = Harness::new();
-    let src = r#"
-[[task]]
-id = "one"
-kind = "shell"
-run = "echo one >> order.txt"
-
-[[task]]
-id = "two"
-kind = "shell"
-needs = ["one"]
-run = "echo two >> order.txt"
-
-[[task]]
-id = "three"
-kind = "shell"
-needs = ["two"]
-run = "echo three >> order.txt"
-"#;
-    let out = h.run(src, 4).await;
+    let h = Harness::new().await;
+    let src = format!(
+        "{RUN_PROVIDER}\n\
+         [[task]]\nid = \"one\"\nprovider = \"run\"\nprompt = \"printf 'one\\\\n' >> order.txt\"\n\
+         [[task]]\nid = \"two\"\nneeds = [\"one\"]\nprovider = \"run\"\nprompt = \"printf 'two\\\\n' >> order.txt\"\n\
+         [[task]]\nid = \"three\"\nneeds = [\"two\"]\nprovider = \"run\"\nprompt = \"printf 'three\\\\n' >> order.txt\"\n"
+    );
+    let out = h.run(&src, 4).await;
 
     assert_eq!(out.status, RunStatus::Ok);
+    let branch = run_branch_name(out.run_id);
+    let content = git::run_allowing_failure(&h.repo, &["show", &format!("{branch}:order.txt")])
+        .await
+        .unwrap()
+        .stdout;
     assert_eq!(
-        h.read("order.txt").lines().collect::<Vec<_>>(),
+        content.lines().collect::<Vec<_>>(),
         vec!["one", "two", "three"]
     );
 }
 
 #[tokio::test]
-async fn independent_nodes_actually_overlap() {
-    let h = Harness::new();
-    // Three 400ms sleeps: ~1.2s serially, ~0.4s in parallel.
-    let src = shell_tasks(&[("a", "sleep 0.4"), ("b", "sleep 0.4"), ("c", "sleep 0.4")]);
-
-    let start = std::time::Instant::now();
-    let out = h.run(&src, 4).await;
-    let elapsed = start.elapsed();
-
-    assert_eq!(out.status, RunStatus::Ok);
-    assert!(
-        elapsed.as_millis() < 900,
-        "took {elapsed:?}, expected overlap"
-    );
-}
-
-#[tokio::test]
 async fn jobs_one_serializes() {
-    let h = Harness::new();
-    let body = probe("conc", "seen.txt");
-    let src = shell_tasks(&[("a", &body), ("b", &body), ("c", &body)]);
+    let h = Harness::new().await;
+    let body = h.probe("conc", "seen.txt");
+    let src = agent_tasks(&[("a", &body), ("b", &body), ("c", &body)]);
 
     assert_eq!(h.run(&src, 1).await.status, RunStatus::Ok);
     assert_eq!(h.peak("seen.txt"), 1);
@@ -140,9 +173,9 @@ async fn jobs_one_serializes() {
 
 #[tokio::test]
 async fn jobs_cap_is_respected() {
-    let h = Harness::new();
-    let body = probe("conc", "seen.txt");
-    let src = shell_tasks(&[("a", &body), ("b", &body), ("c", &body), ("d", &body)]);
+    let h = Harness::new().await;
+    let body = h.probe("conc", "seen.txt");
+    let src = agent_tasks(&[("a", &body), ("b", &body), ("c", &body), ("d", &body)]);
 
     assert_eq!(h.run(&src, 2).await.status, RunStatus::Ok);
     assert!(h.peak("seen.txt") <= 2, "jobs cap not honored");
@@ -150,16 +183,13 @@ async fn jobs_cap_is_respected() {
 
 #[tokio::test]
 async fn nodes_sharing_a_resource_never_overlap() {
-    let h = Harness::new();
-    let body = probe("db", "db_seen.txt");
-    let src: String = ["a", "b", "c"]
-        .iter()
-        .map(|id| {
-            format!(
-                "[[task]]\nid = \"{id}\"\nkind = \"shell\"\nresource = \"postgres\"\nrun = \"{body}\"\n"
-            )
-        })
-        .collect();
+    let h = Harness::new().await;
+    let body = h.probe("db", "db_seen.txt");
+    let src = agent_tasks_with_resource(&[
+        ("a", "postgres", &body),
+        ("b", "postgres", &body),
+        ("c", "postgres", &body),
+    ]);
 
     assert_eq!(h.run(&src, 4).await.status, RunStatus::Ok);
     assert_eq!(
@@ -171,13 +201,9 @@ async fn nodes_sharing_a_resource_never_overlap() {
 
 #[tokio::test]
 async fn different_resources_still_overlap() {
-    let h = Harness::new();
-    let src = format!(
-        "[[task]]\nid = \"a\"\nkind = \"shell\"\nresource = \"pg\"\nrun = \"{}\"\n\
-         [[task]]\nid = \"b\"\nkind = \"shell\"\nresource = \"redis\"\nrun = \"{}\"\n",
-        probe("both", "seen.txt"),
-        probe("both", "seen.txt")
-    );
+    let h = Harness::new().await;
+    let body = h.probe("both", "seen.txt");
+    let src = agent_tasks_with_resource(&[("a", "pg", &body), ("b", "redis", &body)]);
 
     assert_eq!(h.run(&src, 4).await.status, RunStatus::Ok);
     assert_eq!(h.peak("seen.txt"), 2, "distinct resources should not block");
@@ -185,18 +211,19 @@ async fn different_resources_still_overlap() {
 
 #[tokio::test]
 async fn writes_a_log_file_per_node() {
-    let h = Harness::new();
-    let graph = parse_graph("[[task]]\nid=\"a\"\nkind=\"shell\"\nrun=\"echo marker\"\n").unwrap();
+    let h = Harness::new().await;
+    let src = agent_tasks(&[("a", "echo marker")]);
+    let graph = parse_graph(&src).unwrap();
     let dag = Dag::build(&graph.tasks).unwrap();
     let paths = create_run(&runs_root(h.tmp.path()), 9).unwrap();
     let mut log = EventLog::open_append(paths.events()).unwrap();
     let mut state = RunState::new(dag.ids());
     let opts = RunOpts {
         jobs: 1,
-        cwd: h.tmp.path().to_path_buf(),
+        cwd: h.repo.clone(),
         cancel: CancellationToken::new(),
-        repo: None,
-        seed_from: h.tmp.path().to_path_buf(),
+        repo: Some(h.repo.clone()),
+        seed_from: h.repo.clone(),
         remote: workspace::DEFAULT_REMOTE.to_string(),
     };
 
@@ -210,10 +237,8 @@ async fn writes_a_log_file_per_node() {
 
 #[tokio::test]
 async fn emits_started_and_finished_events_for_every_node() {
-    let h = Harness::new();
-    let out = h
-        .run("[[task]]\nid=\"a\"\nkind=\"shell\"\nrun=\"true\"\n", 1)
-        .await;
+    let h = Harness::new().await;
+    let out = h.run(&agent_tasks(&[("a", "true")]), 1).await;
 
     assert!(matches!(out.events[0], EventKind::RunStarted { .. }));
     assert!(
@@ -239,25 +264,61 @@ async fn emits_started_and_finished_events_for_every_node() {
 /// fail rather than half-run.
 #[tokio::test]
 async fn an_agent_node_without_a_repository_fails_saying_so() {
-    let h = Harness::new();
+    let tmp = tempfile::tempdir().unwrap();
     let src = "[providers.p]\ncmd=\"true\"\n\
-               [[task]]\nid=\"a\"\nkind=\"agent\"\nprompt=\"hi\"\nprovider=\"p\"\nverify=\"true\"\n";
-    let out = h.run(src, 1).await;
+               [[task]]\nid=\"a\"\nprompt=\"hi\"\nprovider=\"p\"\nverify=\"true\"\n";
+    let graph = parse_graph(src).unwrap();
+    let dag = Dag::build(&graph.tasks).unwrap();
+    let paths = create_run(&runs_root(tmp.path()), 1).unwrap();
+    let mut log = EventLog::open_append(paths.events()).unwrap();
+    let mut state = RunState::new(dag.ids());
+    let opts = RunOpts {
+        jobs: 1,
+        cwd: tmp.path().to_path_buf(),
+        cancel: CancellationToken::new(),
+        repo: None,
+        seed_from: tmp.path().to_path_buf(),
+        remote: workspace::DEFAULT_REMOTE.to_string(),
+    };
 
-    assert_eq!(out.status, RunStatus::Partial);
-    assert_eq!(out.state.state("a"), NodeState::Failed);
+    let status = execute(&graph, &dag, &paths, &mut log, &mut state, &opts)
+        .await
+        .unwrap();
+    let events: Vec<EventKind> = EventLog::read(paths.events())
+        .unwrap()
+        .into_iter()
+        .map(|e| e.kind)
+        .collect();
+
+    assert_eq!(status, RunStatus::Partial);
+    assert_eq!(state.state("a"), NodeState::Failed);
     assert!(
-        out.events.iter().any(
+        events.iter().any(
             |k| matches!(k, EventKind::NodeFailed { reason, .. } if reason.contains("repository"))
         ),
-        "{:?}",
-        out.events
+        "{events:?}"
     );
 }
 
 #[tokio::test]
 async fn an_empty_graph_is_ok() {
-    let h = Harness::new();
-    let out = h.run("", 4).await;
-    assert_eq!(out.status, RunStatus::Ok);
+    let tmp = tempfile::tempdir().unwrap();
+    let graph = parse_graph("").unwrap();
+    let dag = Dag::build(&graph.tasks).unwrap();
+    let paths = create_run(&runs_root(tmp.path()), 1).unwrap();
+    let mut log = EventLog::open_append(paths.events()).unwrap();
+    let mut state = RunState::new(dag.ids());
+    let opts = RunOpts {
+        jobs: 4,
+        cwd: tmp.path().to_path_buf(),
+        cancel: CancellationToken::new(),
+        repo: None,
+        seed_from: tmp.path().to_path_buf(),
+        remote: workspace::DEFAULT_REMOTE.to_string(),
+    };
+
+    let status = execute(&graph, &dag, &paths, &mut log, &mut state, &opts)
+        .await
+        .unwrap();
+    assert_eq!(status, RunStatus::Ok);
 }

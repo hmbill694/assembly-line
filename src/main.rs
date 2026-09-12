@@ -253,7 +253,7 @@ async fn start_new_run(graph_path: PathBuf, jobs: usize) -> ExitCode {
 /// acting on it stays a decision rather than a default.
 async fn deliver_if_complete(run: &RunPaths, graph: &config::Graph, status: RunStatus) {
     let Some(run_branch) = paths::read_meta(run).ok().and_then(|m| m.run_branch) else {
-        return; // A shell-only graph creates no branch to deliver.
+        return; // A run given no repository creates no branch to deliver.
     };
 
     if status != RunStatus::Ok {
