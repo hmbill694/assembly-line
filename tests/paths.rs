@@ -1,7 +1,7 @@
 use assembly_line::paths::{
-    RunMeta, create_run, git_root, latest_run_id, next_run_id, open_run, read_meta,
-    record_repository_for_worktrees, repo_slug, repository_owning_worktrees, runs_root,
-    worktree_root, worktrees_root_given, write_meta,
+    JobMeta, create_job, git_root, jobs_root, latest_job_id, next_job_id, open_job, read_meta,
+    record_repository_for_worktrees, repo_slug, repository_owning_worktrees, worktree_root,
+    worktrees_root_given, write_meta,
 };
 use std::fs;
 use std::path::Path;
@@ -25,69 +25,106 @@ fn returns_none_outside_a_repo() {
 }
 
 #[test]
-fn allocates_monotonic_run_ids() {
+fn allocates_monotonic_job_ids() {
     let tmp = tempfile::tempdir().unwrap();
-    let root = runs_root(tmp.path());
+    let root = jobs_root(tmp.path());
 
-    assert_eq!(next_run_id(&root).unwrap(), 1);
-    assert_eq!(latest_run_id(&root).unwrap(), None);
+    assert_eq!(next_job_id(&root).unwrap(), 1);
+    assert_eq!(latest_job_id(&root).unwrap(), None);
 
-    create_run(&root, 1).unwrap();
-    assert_eq!(next_run_id(&root).unwrap(), 2);
-    assert_eq!(latest_run_id(&root).unwrap(), Some(1));
+    create_job(&root, 1).unwrap();
+    assert_eq!(next_job_id(&root).unwrap(), 2);
+    assert_eq!(latest_job_id(&root).unwrap(), Some(1));
 
-    create_run(&root, 2).unwrap();
-    assert_eq!(next_run_id(&root).unwrap(), 3);
-    assert_eq!(latest_run_id(&root).unwrap(), Some(2));
+    create_job(&root, 2).unwrap();
+    assert_eq!(next_job_id(&root).unwrap(), 3);
+    assert_eq!(latest_job_id(&root).unwrap(), Some(2));
 }
 
 #[test]
 fn ignores_non_numeric_directories_when_allocating() {
     let tmp = tempfile::tempdir().unwrap();
-    let root = runs_root(tmp.path());
+    let root = jobs_root(tmp.path());
     fs::create_dir_all(root.join("scratch")).unwrap();
-    create_run(&root, 7).unwrap();
-    assert_eq!(next_run_id(&root).unwrap(), 8);
+    create_job(&root, 7).unwrap();
+    assert_eq!(next_job_id(&root).unwrap(), 8);
 }
 
 #[test]
-fn create_run_lays_out_the_directory() {
+fn create_job_lays_out_the_directory() {
     let tmp = tempfile::tempdir().unwrap();
-    let root = runs_root(tmp.path());
-    let p = create_run(&root, 42).unwrap();
+    let root = jobs_root(tmp.path());
+    let p = create_job(&root, 42).unwrap();
 
     assert_eq!(p.id, 42);
     assert!(p.dir.is_dir());
-    assert!(p.logs_dir().is_dir());
     assert_eq!(p.events(), p.dir.join("events.jsonl"));
     assert_eq!(p.meta(), p.dir.join("meta.json"));
-    assert_eq!(p.log("impl-auth"), p.logs_dir().join("impl-auth.log"));
+    assert_eq!(p.log(), p.dir.join("job.log"), "one job, one log");
 
-    assert_eq!(open_run(&root, 42).unwrap().dir, p.dir);
+    assert_eq!(open_job(&root, 42).unwrap().dir, p.dir);
 }
 
 #[test]
-fn open_run_fails_for_a_missing_run() {
+fn open_job_fails_for_a_missing_job() {
     let tmp = tempfile::tempdir().unwrap();
-    assert!(open_run(&runs_root(tmp.path()), 99).is_err());
+    assert!(open_job(&jobs_root(tmp.path()), 99).is_err());
+}
+
+/// The checkout sits below the job's worktree directory rather than being it,
+/// so discarding the checkout still leaves `gc` something to find.
+#[test]
+fn a_jobs_checkout_lives_below_its_worktree_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = create_job(&jobs_root(tmp.path()), 3).unwrap();
+    let repo = Path::new("/work/acme");
+
+    let checkout = p
+        .worktree(repo)
+        .expect("HOME is set in the test environment");
+    assert!(checkout.starts_with(worktree_root(repo, 3).unwrap()));
+    assert_ne!(checkout, worktree_root(repo, 3).unwrap());
 }
 
 #[test]
 fn meta_round_trips() {
     let tmp = tempfile::tempdir().unwrap();
-    let p = create_run(&runs_root(tmp.path()), 1).unwrap();
+    let p = create_job(&jobs_root(tmp.path()), 1).unwrap();
     write_meta(
         &p,
-        &RunMeta {
-            graph: "graphs/a.toml".into(),
-            jobs: 3,
+        &JobMeta {
+            repo: "/work/acme".into(),
+            base_ref: "main".into(),
+            prompt: "add authentication".into(),
+            provider: "claude".into(),
+            branch: Some("al/job-1".into()),
         },
     )
     .unwrap();
 
     let back = read_meta(&p).unwrap();
-    assert_eq!(back.graph, std::path::PathBuf::from("graphs/a.toml"));
-    assert_eq!(back.jobs, 3);
+    assert_eq!(back.repo, std::path::PathBuf::from("/work/acme"));
+    assert_eq!(back.base_ref, "main");
+    assert_eq!(back.prompt, "add authentication");
+    assert_eq!(back.provider, "claude");
+    assert_eq!(back.branch.as_deref(), Some("al/job-1"));
+}
+
+/// `revise` needs the prompt and the ref by id alone, which is exactly why
+/// they live here rather than only in the event log.
+#[test]
+fn meta_deserializes_before_the_branch_exists() {
+    let tmp = tempfile::tempdir().unwrap();
+    let job = create_job(&jobs_root(tmp.path()), 1).unwrap();
+    fs::write(
+        job.meta(),
+        r#"{"repo":"/work/acme","base_ref":"main","prompt":"go","provider":"claude"}"#,
+    )
+    .unwrap();
+
+    let meta = read_meta(&job).unwrap();
+    assert_eq!(meta.prompt, "go");
+    assert!(meta.branch.is_none(), "a job that has not published yet");
 }
 
 #[test]
@@ -109,9 +146,9 @@ fn worktrees_live_under_home_not_in_the_repo() {
 }
 
 #[test]
-fn two_repositories_on_the_same_run_id_do_not_share_a_worktree_root() {
-    // Run ids restart at 1 in every repository, so the id alone cannot key the
-    // directory — the first run of two repos would land in the same place.
+fn two_repositories_on_the_same_job_id_do_not_share_a_worktree_root() {
+    // Job ids restart at 1 in every repository, so the id alone cannot key the
+    // directory — the first job of two repos would land in the same place.
     let alpha = worktree_root(Path::new("/work/alpha"), 1).unwrap();
     let beta = worktree_root(Path::new("/work/beta"), 1).unwrap();
     assert_ne!(alpha, beta);
@@ -159,18 +196,6 @@ fn the_repository_owning_a_worktree_directory_can_be_read_back() {
 fn a_worktree_directory_without_a_marker_owns_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     assert!(repository_owning_worktrees(tmp.path()).is_none());
-}
-
-#[test]
-fn meta_deserializes_from_a_minimal_document() {
-    // An M1 meta.json carries only these two fields; resume must not choke on
-    // extra fields a hand-edited or newer file might carry either.
-    let tmp = tempfile::tempdir().unwrap();
-    let run = create_run(&runs_root(tmp.path()), 1).unwrap();
-    fs::write(run.meta(), r#"{"graph":"g.toml","jobs":4}"#).unwrap();
-
-    let meta = read_meta(&run).unwrap();
-    assert_eq!(meta.jobs, 4);
 }
 
 #[test]

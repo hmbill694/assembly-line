@@ -2,7 +2,7 @@
 
 use crate::config::Provider;
 
-/// The placeholder a provider's `args` use to receive the node's prompt.
+/// The placeholder a provider's `args` use to receive the job's prompt.
 pub const PROMPT_PLACEHOLDER: &str = "{prompt}";
 
 /// A command as the OS takes it: a program and an argument vector.

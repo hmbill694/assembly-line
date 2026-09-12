@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Writes a partial change, then fails — the work must reach the node's branch.
+# Writes a partial change, then fails — the work must reach the job's branch.
 set -euo pipefail
 echo "fake-agent: starting work on $1"
 printf 'half done\n' > partial.txt

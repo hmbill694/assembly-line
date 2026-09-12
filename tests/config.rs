@@ -1,63 +1,46 @@
-use assembly_line::config::{ValidationError, Warning, parse_duration, parse_graph, validate};
+use assembly_line::config::{ConfigError, RepoConfig, Warning, parse_duration};
 use std::time::Duration;
 
 const FULL: &str = r#"
-[workspace]
-copy = [".env"]
+provider = "claude"
+verify = "cargo test"
+base = "develop"
+max_duration = "20m"
+copy = [".env", ".claude/settings.local.json"]
+
+[delivery]
+mode = "none"
 
 [providers.claude]
 cmd = "claude"
 args = ["-p", "{prompt}"]
-
-[[task]]
-id = "build"
-prompt = "cargo build"
-
-[[task]]
-id = "impl-auth"
-prompt = "do the thing"
-provider = "claude"
-verify = "cargo test"
-retries = 2
-max_duration = "20m"
-
-[[hook]]
-on = "run_complete"
-when = "success"
-run = "echo done"
 "#;
 
 #[test]
-fn parses_a_full_graph() {
-    let g = parse_graph(FULL).expect("should parse");
+fn parses_everything_a_repository_can_declare() {
+    let config = RepoConfig::parse(FULL).expect("should parse");
 
-    assert_eq!(g.workspace.copy, vec![".env".to_string()]);
-    assert_eq!(g.providers["claude"].cmd, "claude");
-    assert_eq!(g.providers["claude"].args, vec!["-p", "{prompt}"]);
-    assert_eq!(g.hooks.len(), 1);
-    assert_eq!(g.hooks[0].on, "run_complete");
-
-    assert_eq!(g.tasks.len(), 2);
-    assert_eq!(g.tasks[0].prompt.as_deref(), Some("cargo build"));
-
-    let agent = &g.tasks[1];
-    assert_eq!(agent.provider.as_deref(), Some("claude"));
-    assert_eq!(agent.retries, 2);
-    assert_eq!(agent.max_duration.as_deref(), Some("20m"));
+    assert_eq!(config.provider.as_deref(), Some("claude"));
+    assert_eq!(config.verify.as_deref(), Some("cargo test"));
+    assert_eq!(config.base.as_deref(), Some("develop"));
+    assert_eq!(config.max_duration.as_deref(), Some("20m"));
+    assert_eq!(config.copy.len(), 2);
+    assert_eq!(config.providers["claude"].cmd, "claude");
+    assert_eq!(config.providers["claude"].args, vec!["-p", "{prompt}"]);
 }
 
 #[test]
-fn applies_defaults() {
-    let g = parse_graph("[[task]]\nid = \"a\"\nprompt = \"x\"\n").unwrap();
-    let t = &g.tasks[0];
-    assert!(t.copy.is_empty());
-    assert_eq!(t.retries, 0);
-    assert!(t.max_cost_usd.is_none());
+fn an_empty_config_is_valid_and_declares_nothing() {
+    let config = RepoConfig::parse("").unwrap();
+
+    assert_eq!(config, RepoConfig::default());
+    assert!(config.copy.is_empty());
+    assert!(config.providers.is_empty());
 }
 
 #[test]
 fn rejects_unknown_fields() {
-    let err = parse_graph("[[task]]\nid = \"a\"\nprompt = \"x\"\nnope = 1\n")
+    let err = RepoConfig::parse("provider = \"p\"\nnope = 1\n")
         .expect_err("unknown field must be rejected");
     assert!(err.to_string().contains("nope"), "got: {err}");
 }
@@ -73,158 +56,102 @@ fn parses_durations() {
     assert!(parse_duration("soon").is_err());
 }
 
-// Validation: tasks have no dependencies to order any more, but an id still
-// becomes a filename and a branch name, and an agent still needs a prompt and
-// a real provider. These checks survive even though task ids themselves are
-// on their way out — this revision's tree still has them, and still must
-// validate them.
+// Validation. There are no task ids any more — job ids are integers
+// assembly-line allocates — so what is left to get wrong is the provider and
+// the duration.
 
 #[test]
-fn rejects_duplicate_ids() {
-    let graph = parse_graph(
-        "[[task]]\nid=\"a\"\nprompt=\"x\"\n\
-         [[task]]\nid=\"a\"\nprompt=\"x\"\n",
-    )
-    .unwrap();
-    let errs = validate(&graph).errors;
-    assert!(
-        errs.contains(&ValidationError::DuplicateId("a".into())),
-        "{errs:?}"
+fn a_provider_the_repository_never_declared_is_rejected() {
+    let config = RepoConfig::parse("[providers.real]\ncmd = \"true\"\n").unwrap();
+
+    assert_eq!(
+        config.problems("ghost"),
+        vec![ConfigError::UnknownProvider("ghost".into())]
     );
 }
 
 #[test]
-fn an_id_that_cannot_be_a_branch_name_is_rejected() {
-    let graph = parse_graph(
-        r#"
-        [[task]]
-        id = "impl auth"
-        prompt = "go"
-        "#,
+fn a_repository_naming_no_provider_at_all_is_rejected() {
+    let config = RepoConfig::parse("[providers.real]\ncmd = \"true\"\n").unwrap();
+
+    assert_eq!(config.problems(""), vec![ConfigError::NoProviderDeclared]);
+}
+
+#[test]
+fn a_declared_provider_is_accepted() {
+    let config = RepoConfig::parse(
+        "provider = \"real\"\nverify = \"true\"\n[providers.real]\ncmd = \"true\"\n",
     )
     .unwrap();
 
-    assert!(
-        validate(&graph)
-            .errors
-            .iter()
-            .any(|e| matches!(e, ValidationError::InvalidId(id) if id == "impl auth")),
-    );
+    assert!(config.problems("real").is_empty());
 }
 
 #[test]
-fn rejects_an_id_that_starts_with_the_reserved_underscore_prefix() {
-    let graph = parse_graph("[[task]]\nid=\"_scratch\"\nprompt=\"x\"\n").unwrap();
-    let errs = validate(&graph).errors;
-    assert!(
-        errs.contains(&ValidationError::ReservedId("_scratch".into())),
-        "{errs:?}"
-    );
-}
-
-#[test]
-fn a_task_without_a_prompt_is_rejected() {
-    let graph = parse_graph(
-        r#"
-        [[task]]
-        id = "impl"
-        "#,
+fn rejects_an_unparseable_max_duration() {
+    let config = RepoConfig::parse(
+        "provider = \"p\"\nmax_duration = \"soon\"\n[providers.p]\ncmd = \"true\"\n",
     )
     .unwrap();
 
-    let validation = validate(&graph);
-    assert!(
-        validation
-            .errors
-            .iter()
-            .any(|e| matches!(e, ValidationError::AgentMissingPrompt(id) if id == "impl")),
-        "expected a missing-prompt error, got {:?}",
-        validation.errors
-    );
-}
-
-#[test]
-fn rejects_unknown_provider() {
-    let graph = parse_graph("[[task]]\nid=\"a\"\nprompt=\"hi\"\nprovider=\"nope\"\n").unwrap();
-    let v = validate(&graph);
-    assert!(
-        v.errors.contains(&ValidationError::UnknownProvider {
-            task: "a".into(),
-            provider: "nope".into()
-        }),
-        "{:?}",
-        v.errors
-    );
-}
-
-#[test]
-fn rejects_invalid_max_duration() {
-    let graph = parse_graph("[[task]]\nid=\"a\"\nprompt=\"x\"\nmax_duration=\"soon\"\n").unwrap();
-    let v = validate(&graph);
-    assert!(
-        v.errors
-            .iter()
-            .any(|e| matches!(e, ValidationError::InvalidDuration { .. })),
-        "{:?}",
-        v.errors
+    assert_eq!(
+        config.problems("p"),
+        vec![ConfigError::UnparseableMaxDuration("soon".into())]
     );
 }
 
 #[test]
 fn reports_every_problem_at_once() {
-    let graph = parse_graph(
-        "[[task]]\nid=\"a\"\n\
-         [[task]]\nid=\"b\"\nprompt=\"x\"\nprovider=\"ghost\"\n",
-    )
-    .unwrap();
-    let errs = validate(&graph).errors;
-    assert_eq!(errs.len(), 2, "{errs:?}");
-}
+    let config = RepoConfig::parse("max_duration = \"soon\"\n").unwrap();
 
-#[test]
-fn warns_on_agent_without_verify() {
-    let graph = parse_graph(
-        "[providers.p]\ncmd=\"true\"\n\
-         [[task]]\nid=\"a\"\nprompt=\"hi\"\nprovider=\"p\"\n",
-    )
-    .unwrap();
-    let v = validate(&graph);
-    assert!(v.errors.is_empty(), "{:?}", v.errors);
-    assert!(
-        v.warnings
-            .contains(&Warning::AgentWithoutVerify("a".into())),
-        "{:?}",
-        v.warnings
+    assert_eq!(
+        config.problems(""),
+        vec![
+            ConfigError::NoProviderDeclared,
+            ConfigError::UnparseableMaxDuration("soon".into())
+        ],
+        "a user should fix every problem in one pass, not one per run"
     );
 }
 
 #[test]
-fn warns_when_cost_cap_has_no_adapter() {
-    let graph = parse_graph(
-        "[providers.p]\ncmd=\"true\"\n\
-         [[task]]\nid=\"a\"\nprompt=\"hi\"\nprovider=\"p\"\n\
-         verify=\"true\"\nmax_cost_usd=5.0\n",
-    )
-    .unwrap();
-    let v = validate(&graph);
+fn every_config_error_says_what_to_do_about_it() {
     assert!(
-        v.warnings.contains(&Warning::CostCapWithoutAdapter {
-            task: "a".into(),
-            provider: "p".into()
-        }),
-        "{:?}",
-        v.warnings
+        ConfigError::UnknownProvider("ghost".into())
+            .to_string()
+            .contains("add a block for it")
+    );
+    assert!(
+        ConfigError::NoProviderDeclared
+            .to_string()
+            .contains("[providers]")
+    );
+    assert!(
+        ConfigError::UnparseableMaxDuration("soon".into())
+            .to_string()
+            .contains("20m")
     );
 }
 
 #[test]
-fn no_cost_warning_when_the_provider_has_an_adapter() {
-    let graph = parse_graph(
-        "[providers.p]\ncmd=\"true\"\nadapter=\"wrap.sh\"\n\
-         [[task]]\nid=\"a\"\nprompt=\"hi\"\nprovider=\"p\"\n\
-         verify=\"true\"\nmax_cost_usd=5.0\n",
+fn a_repository_with_no_verify_is_warned_about_but_still_runnable() {
+    let config = RepoConfig::parse("provider = \"p\"\n[providers.p]\ncmd = \"true\"\n").unwrap();
+
+    assert!(config.problems("p").is_empty());
+    assert_eq!(config.warnings(), vec![Warning::NoVerify]);
+    assert!(
+        config.warnings()[0]
+            .to_string()
+            .contains("nothing will check")
+    );
+}
+
+#[test]
+fn a_repository_that_declares_verify_warns_about_nothing() {
+    let config = RepoConfig::parse(
+        "provider = \"p\"\nverify = \"cargo test\"\n[providers.p]\ncmd = \"true\"\n",
     )
     .unwrap();
-    let v = validate(&graph);
-    assert!(v.warnings.is_empty(), "{:?}", v.warnings);
+
+    assert!(config.warnings().is_empty());
 }

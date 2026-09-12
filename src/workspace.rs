@@ -1,25 +1,25 @@
-//! One node's sandbox: a git worktree, optionally seeded with files the
+//! One job's sandbox: a git worktree, optionally seeded with files the
 //! repository does not carry.
 
 use crate::git;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
-pub struct NodeWorkspace {
+pub struct JobWorkspace {
     pub path: PathBuf,
     pub branch: String,
     /// Relative paths copied in, which must never reach a commit.
     pub seeded: Vec<String>,
 }
 
-/// The remote a run publishes node branches to unless configured otherwise.
+/// The remote a job publishes its branch to unless configured otherwise.
 pub const DEFAULT_REMOTE: &str = "origin";
 
-/// A node's branch name. Git refs are paths, so this must never nest under
+/// A job's branch name. Git refs are paths, so this must never nest under
 /// another ref assembly-line creates.
 #[must_use]
-pub fn node_branch_name(run_id: u64, node: &str) -> String {
-    format!("al/run-{run_id}-{node}")
+pub fn job_branch_name(job_id: u64) -> String {
+    format!("al/job-{job_id}")
 }
 
 /// Where a job's checkout begins.
@@ -27,7 +27,7 @@ pub fn node_branch_name(run_id: u64, node: &str) -> String {
 pub enum StartPoint<'a> {
     /// Cut a fresh branch at this commit, superseding any earlier attempt's.
     FreshBranch(&'a str),
-    /// Continue the node's existing branch. A revise round is a new job, but
+    /// Continue the job's existing branch. A revise round is a new job, but
     /// it appends to the branch rather than replacing the record of what came
     /// before — which is also how the agent sees its own prior work, as files
     /// on disk, with no session replay.
@@ -48,7 +48,7 @@ pub async fn create(
     start: StartPoint<'_>,
     seed_from: impl AsRef<Path>,
     copy_paths: &[String],
-) -> anyhow::Result<NodeWorkspace> {
+) -> anyhow::Result<JobWorkspace> {
     let (repo, path, seed_from) = (repo.as_ref(), path.as_ref(), seed_from.as_ref());
 
     if let Some(missing) = copy_paths.iter().find(|rel| !seed_from.join(rel).exists()) {
@@ -81,7 +81,7 @@ pub async fn create(
                 .map_err(|e| anyhow::anyhow!("copying '{rel}' into the workspace: {e}"))
         })?;
 
-    Ok(NodeWorkspace {
+    Ok(JobWorkspace {
         path: path.to_path_buf(),
         branch: branch.to_string(),
         seeded: copy_paths.to_vec(),
@@ -91,7 +91,7 @@ pub async fn create(
 /// Free the checkout path, whatever is holding it.
 ///
 /// Jobs discard their own scratch, so anything found here is the residue of a
-/// run that died mid-node. Git will not reuse the path while it is claimed —
+/// job that died mid-round. Git will not reuse the path while it is claimed —
 /// and a worktree whose directory is already gone still holds its
 /// administrative entry, which alone is enough to make the name unusable.
 async fn clear_previous_checkout(repo: &Path, path: &Path) -> anyhow::Result<()> {
@@ -121,11 +121,11 @@ async fn clear_previous_attempt(repo: &Path, path: &Path, branch: &str) -> anyho
 ///
 /// See [`git::commit_all_except`] — notably, an error if the agent committed a
 /// seeded file itself.
-pub async fn commit(ws: &NodeWorkspace, message: &str) -> anyhow::Result<Option<String>> {
+pub async fn commit(ws: &JobWorkspace, message: &str) -> anyhow::Result<Option<String>> {
     git::commit_all_except(&ws.path, message, &ws.seeded).await
 }
 
-/// Make the node's branch durable, returning the remote it reached.
+/// Make the job's branch durable, returning the remote it reached.
 ///
 /// A job is stateless: its checkout is scratch and the branch is the only
 /// thing that outlives it. `None` means the repository has no such remote, so
@@ -137,7 +137,7 @@ pub async fn commit(ws: &NodeWorkspace, message: &str) -> anyhow::Result<Option<
 /// rejected.
 pub async fn publish(
     repo: impl AsRef<Path>,
-    ws: &NodeWorkspace,
+    ws: &JobWorkspace,
     remote: &str,
 ) -> anyhow::Result<Option<String>> {
     let repo = repo.as_ref();
@@ -150,11 +150,11 @@ pub async fn publish(
 }
 
 /// Remove the checkout. The branch survives, because it is the record of what
-/// the node did.
+/// the job did.
 ///
 /// # Errors
 ///
 /// Returns an error if git cannot remove the worktree.
-pub async fn discard(repo: impl AsRef<Path>, ws: &NodeWorkspace) -> anyhow::Result<()> {
+pub async fn discard(repo: impl AsRef<Path>, ws: &JobWorkspace) -> anyhow::Result<()> {
     git::remove_worktree(repo, &ws.path).await
 }

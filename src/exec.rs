@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
-/// Why a command stopped. Every variant except `Exited(0)` fails its node.
+/// Why a command stopped. Every variant except `Exited(0)` fails its job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellOutcome {
     Exited(i32),
@@ -51,7 +51,7 @@ fn open_log_for_append(path: &Path) -> std::io::Result<std::fs::File> {
 ///
 /// Returns an error if the log file cannot be opened or `sh` cannot be
 /// spawned. A command that runs and fails is *not* an error — that is a
-/// `ShellOutcome`, because a failing node is a normal part of a run.
+/// `ShellOutcome`, because a failing job is a normal part of using this.
 pub async fn run_shell(
     cmd: &str,
     cwd: impl AsRef<Path>,

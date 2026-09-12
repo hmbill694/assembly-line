@@ -1,122 +1,45 @@
-use crate::config::Task;
-use crate::event::{Event, EventKind, RunStatus};
-use std::collections::BTreeMap;
+use crate::event::{Event, EventKind};
 
-pub type TaskMap<'a> = BTreeMap<&'a str, &'a Task>;
-
-#[must_use]
-pub fn task_map(tasks: &[Task]) -> TaskMap<'_> {
-    tasks.iter().map(|t| (t.id.as_str(), t)).collect()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeState {
+/// A job's state, derived purely from its event stream.
+///
+/// Nothing may live here that cannot be reconstructed from `events.jsonl`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum JobState {
+    #[default]
     Pending,
     Running,
-    Done,
+    Succeeded,
     Failed,
 }
 
-/// Counts of terminal and non-terminal nodes, for summaries and exit codes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Counts {
-    pub done: usize,
-    pub failed: usize,
-    /// Pending and Running together — anything not yet resolved.
-    pub outstanding: usize,
-}
-
-/// A run's state, derived purely from its event stream.
-///
-/// Nothing may live here that cannot be reconstructed from `events.jsonl`;
-/// that invariant is what makes resume a replay.
-#[derive(Debug, Clone, Default)]
-pub struct RunState {
-    pub nodes: BTreeMap<String, NodeState>,
-    pub status: Option<RunStatus>,
-}
-
-impl RunState {
+impl JobState {
     #[must_use]
-    pub fn new(ids: &[String]) -> Self {
-        RunState {
-            nodes: ids
-                .iter()
-                .map(|id| (id.clone(), NodeState::Pending))
-                .collect(),
-            status: None,
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
         }
-    }
-
-    #[must_use]
-    pub fn state(&self, id: &str) -> NodeState {
-        self.nodes.get(id).copied().unwrap_or(NodeState::Pending)
     }
 
     pub fn apply(&mut self, kind: &EventKind) {
-        let transition = match kind {
-            EventKind::NodeStarted { .. } => Some(NodeState::Running),
-            EventKind::NodeFinished { .. } => Some(NodeState::Done),
-            EventKind::NodeFailed { .. } => Some(NodeState::Failed),
-            // Progress markers, not transitions: a node stays Running until it
-            // finishes or fails. Listed one by one rather than behind a
-            // catch-all arm, so a new event type is a compile error here
+        *self = match kind {
+            EventKind::JobStarted { .. } => JobState::Running,
+            EventKind::JobFinished { .. } => JobState::Succeeded,
+            EventKind::JobFailed { .. } => JobState::Failed,
+            // Progress markers, not transitions. Listed one by one rather than
+            // behind a catch-all, so a new event is a compile error here
             // instead of a silent omission.
-            EventKind::RunStarted { .. }
-            | EventKind::NodeCommitted { .. }
-            | EventKind::NodeBranchPublished { .. } => None,
-            EventKind::RunFinished { status } => {
-                self.status = Some(*status);
-                None
-            }
+            EventKind::JobCommitted { .. } | EventKind::JobBranchPublished { .. } => *self,
         };
-
-        if let (Some(node), Some(next)) = (kind.node(), transition) {
-            self.nodes.insert(node.to_string(), next);
-        }
-    }
-
-    pub fn replay<'a>(ids: &[String], events: impl IntoIterator<Item = &'a Event>) -> Self {
-        events.into_iter().fold(RunState::new(ids), |mut st, e| {
-            st.apply(&e.kind);
-            st
-        })
-    }
-
-    /// Nodes that were in flight when the process died must run again.
-    pub fn reset_running(&mut self) -> Vec<String> {
-        let interrupted: Vec<String> = self
-            .nodes
-            .iter()
-            .filter(|(_, state)| **state == NodeState::Running)
-            .map(|(id, _)| id.clone())
-            .collect();
-
-        self.nodes.extend(
-            interrupted
-                .iter()
-                .map(|id| (id.clone(), NodeState::Pending)),
-        );
-        interrupted
     }
 
     #[must_use]
-    pub fn counts(&self) -> Counts {
-        self.nodes
-            .values()
-            .fold(Counts::default(), |acc, state| match state {
-                NodeState::Done => Counts {
-                    done: acc.done + 1,
-                    ..acc
-                },
-                NodeState::Failed => Counts {
-                    failed: acc.failed + 1,
-                    ..acc
-                },
-                NodeState::Pending | NodeState::Running => Counts {
-                    outstanding: acc.outstanding + 1,
-                    ..acc
-                },
-            })
+    pub fn replay<'a>(events: impl IntoIterator<Item = &'a Event>) -> Self {
+        events.into_iter().fold(JobState::default(), |mut st, e| {
+            st.apply(&e.kind);
+            st
+        })
     }
 }

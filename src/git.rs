@@ -35,8 +35,16 @@ impl GitOutput {
 
     /// Trimmed stdout, or an error carrying git's own message.
     fn stdout_or_error(self, operation: &str) -> anyhow::Result<String> {
+        self.stdout_verbatim_or_error(operation)
+            .map(|out| out.trim().to_string())
+    }
+
+    /// Stdout exactly as git produced it, or an error carrying git's own
+    /// message. For file contents, where a trailing newline is part of the
+    /// file rather than noise.
+    fn stdout_verbatim_or_error(self, operation: &str) -> anyhow::Result<String> {
         match self.succeeded() {
-            true => Ok(self.stdout.trim().to_string()),
+            true => Ok(self.stdout),
             false => Err(anyhow::anyhow!(
                 "{operation} failed (exit {}): {}",
                 self.exit_code,
@@ -80,6 +88,47 @@ async fn run_expecting_success(
 
 pub async fn head_sha(repo: impl AsRef<Path>) -> anyhow::Result<String> {
     run_expecting_success(repo, &["rev-parse", "HEAD"], "rev-parse HEAD").await
+}
+
+/// The commit `git_ref` names — a branch, a tag, `HEAD`, or a raw sha.
+///
+/// A job is cut from a ref the user names, so the ref has to be resolved once
+/// and the resulting commit used everywhere after: a branch that moves
+/// mid-job must not silently change what the job was based on.
+pub async fn sha_at_ref(repo: impl AsRef<Path>, git_ref: &str) -> anyhow::Result<String> {
+    run_expecting_success(
+        repo,
+        &["rev-parse", &format!("{git_ref}^{{commit}}")],
+        &format!("rev-parse {git_ref}"),
+    )
+    .await
+}
+
+/// One file's contents as of `git_ref`, or `None` when that ref does not carry
+/// it.
+///
+/// Reading configuration from a ref rather than from a checkout is what stops
+/// a job editing the settings that govern it: the agent's branch can say
+/// anything, and this never looks at it.
+pub async fn file_at_ref(
+    repo: impl AsRef<Path>,
+    git_ref: &str,
+    path: &str,
+) -> anyhow::Result<Option<String>> {
+    let spec = format!("{git_ref}:{path}");
+    let present = run_allowing_failure(&repo, &["cat-file", "-e", &spec])
+        .await?
+        .succeeded();
+
+    match present {
+        false => Ok(None),
+        // Deliberately not `run_expecting_success`, which trims: a config file
+        // read back must be the bytes the ref carries, not a tidied copy.
+        true => run_allowing_failure(&repo, &["show", &spec])
+            .await?
+            .stdout_verbatim_or_error(&format!("show {spec}"))
+            .map(Some),
+    }
 }
 
 /// The commit `branch` points at. A revise round starts here, so the agent
@@ -172,7 +221,7 @@ pub async fn add_worktree_for_existing_branch(
 
 /// Delete a branch whether or not it was merged.
 ///
-/// Only ever called on a branch assembly-line created for a node attempt that
+/// Only ever called on a branch assembly-line created for a job attempt that
 /// a later attempt supersedes; the force is what makes an unmerged failed
 /// attempt collectable.
 pub async fn delete_branch(repo: impl AsRef<Path>, branch: &str) -> anyhow::Result<()> {
@@ -188,7 +237,7 @@ pub async fn delete_branch(repo: impl AsRef<Path>, branch: &str) -> anyhow::Resu
 /// Whether `remote` is configured.
 ///
 /// A repository with no remote is an ordinary local run, not a fault: the
-/// caller keeps the node's branch as a local ref instead of publishing it.
+/// caller keeps the job's branch as a local ref instead of publishing it.
 pub async fn remote_exists(repo: impl AsRef<Path>, remote: &str) -> anyhow::Result<bool> {
     let configured = run_expecting_success(repo, &["remote"], "remote").await?;
     Ok(configured.lines().map(str::trim).any(|name| name == remote))
@@ -303,7 +352,7 @@ pub async fn commit_all_except(
 /// Fail loudly if a path that must never be committed ended up tracked.
 ///
 /// Unstaging covers commits assembly-line makes; this catches the case where
-/// the agent committed the file itself. For a seeded credential, a failed node
+/// the agent committed the file itself. For a seeded credential, a failed job
 /// is far better than a silent leak onto a branch bound for a remote.
 async fn ensure_untracked(worktree: &Path, never_commit: &[String]) -> anyhow::Result<()> {
     if never_commit.is_empty() {

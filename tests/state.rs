@@ -1,123 +1,110 @@
-use assembly_line::event::{Event, EventKind, RunStatus};
-use assembly_line::state::{Counts, NodeState, RunState};
+use assembly_line::event::{Event, EventKind};
+use assembly_line::state::JobState;
 
-fn ids() -> Vec<String> {
-    vec!["build".into(), "left".into(), "right".into()]
-}
-
-fn finished(node: &str) -> EventKind {
-    EventKind::NodeFinished {
-        node: node.into(),
-        exit_code: 0,
-    }
-}
-
-fn started(node: &str) -> EventKind {
-    EventKind::NodeStarted {
-        node: node.into(),
-        round: 1,
-    }
-}
-
-#[test]
-fn every_task_starts_pending() {
-    let st = RunState::new(&ids());
-    assert_eq!(st.state("build"), NodeState::Pending);
-    assert_eq!(st.state("left"), NodeState::Pending);
-    assert_eq!(st.state("right"), NodeState::Pending);
-}
-
-#[test]
-fn starting_and_finishing_a_node_moves_it_through_running_to_done() {
-    let mut st = RunState::new(&ids());
-
-    st.apply(&started("build"));
-    assert_eq!(st.state("build"), NodeState::Running);
-
-    st.apply(&finished("build"));
-    assert_eq!(st.state("build"), NodeState::Done);
-}
-
-#[test]
-fn a_failed_node_is_recorded_as_failed() {
-    let mut st = RunState::new(&ids());
-    st.apply(&EventKind::NodeFailed {
-        node: "build".into(),
-        reason: "exit 1".into(),
-    });
-    assert_eq!(st.state("build"), NodeState::Failed);
-}
-
-#[test]
-fn replay_reconstructs_state_and_reset_running_requeues() {
+fn stream(kinds: Vec<EventKind>) -> Vec<Event> {
     let now = chrono::Utc::now();
-    let events: Vec<Event> = [
-        EventKind::RunStarted { run_id: 1, jobs: 4 },
-        started("build"),
-        finished("build"),
-        started("left"),
-    ]
-    .into_iter()
-    .map(|kind| Event { at: now, kind })
-    .collect();
-
-    let mut st = RunState::replay(&ids(), &events);
-    assert_eq!(st.state("build"), NodeState::Done);
-    assert_eq!(st.state("left"), NodeState::Running);
-
-    assert_eq!(st.reset_running(), vec!["left".to_string()]);
-    assert_eq!(st.state("left"), NodeState::Pending);
+    kinds
+        .into_iter()
+        .map(|kind| Event { at: now, kind })
+        .collect()
 }
 
 #[test]
-fn counts_summarize_the_run() {
-    let mut st = RunState::new(&ids());
+fn a_job_starts_pending() {
+    assert_eq!(JobState::default(), JobState::Pending);
+    assert_eq!(JobState::replay(&[]), JobState::Pending);
+}
 
-    st.apply(&finished("build"));
-    st.apply(&EventKind::NodeFailed {
-        node: "left".into(),
+#[test]
+fn starting_and_finishing_moves_a_job_through_running_to_succeeded() {
+    let mut st = JobState::default();
+
+    st.apply(&EventKind::JobStarted { round: 1 });
+    assert_eq!(st, JobState::Running);
+
+    st.apply(&EventKind::JobFinished { exit_code: 0 });
+    assert_eq!(st, JobState::Succeeded);
+}
+
+#[test]
+fn a_failed_job_is_recorded_as_failed() {
+    let mut st = JobState::default();
+    st.apply(&EventKind::JobFailed {
         reason: "exit 1".into(),
     });
-
-    assert_eq!(
-        st.counts(),
-        Counts {
-            done: 1,
-            failed: 1,
-            outstanding: 1,
-        }
-    );
+    assert_eq!(st, JobState::Failed);
 }
 
 #[test]
-fn run_finished_is_recorded() {
-    let mut st = RunState::new(&ids());
+fn a_commit_is_progress_not_completion() {
+    let mut st = JobState::default();
 
-    assert!(st.status.is_none());
-    st.apply(&EventKind::RunFinished {
-        status: RunStatus::Partial,
-    });
-    assert_eq!(st.status, Some(RunStatus::Partial));
-}
-
-#[test]
-fn a_commit_event_does_not_change_node_state() {
-    let mut st = RunState::new(&ids());
-
-    st.apply(&started("build"));
-    st.apply(&EventKind::NodeCommitted {
-        node: "build".into(),
+    st.apply(&EventKind::JobStarted { round: 1 });
+    st.apply(&EventKind::JobCommitted {
         sha: "abc".into(),
         files: 2,
         insertions: 10,
         deletions: 1,
     });
-    assert_eq!(
-        st.state("build"),
-        NodeState::Running,
-        "a commit is not completion"
-    );
+    assert_eq!(st, JobState::Running, "a commit is not completion");
 
-    st.apply(&finished("build"));
-    assert_eq!(st.state("build"), NodeState::Done);
+    st.apply(&EventKind::JobFinished { exit_code: 0 });
+    assert_eq!(st, JobState::Succeeded);
+}
+
+/// A job's branch is published before its success is judged, so publishing
+/// must not decide the outcome either way.
+#[test]
+fn publishing_a_branch_does_not_decide_the_outcome() {
+    let failed = JobState::replay(&stream(vec![
+        EventKind::JobStarted { round: 1 },
+        EventKind::JobBranchPublished {
+            branch: "al/job-1".into(),
+            pushed_to: None,
+        },
+        EventKind::JobFailed {
+            reason: "exit 3".into(),
+        },
+    ]));
+
+    assert_eq!(failed, JobState::Failed);
+}
+
+#[test]
+fn a_revise_round_puts_a_finished_job_back_into_running() {
+    let st = JobState::replay(&stream(vec![
+        EventKind::JobStarted { round: 1 },
+        EventKind::JobFinished { exit_code: 0 },
+        EventKind::JobStarted { round: 2 },
+    ]));
+
+    assert_eq!(st, JobState::Running);
+}
+
+#[test]
+fn replay_reconstructs_the_final_state_from_the_log_alone() {
+    let st = JobState::replay(&stream(vec![
+        EventKind::JobStarted { round: 1 },
+        EventKind::JobCommitted {
+            sha: "abc".into(),
+            files: 1,
+            insertions: 1,
+            deletions: 0,
+        },
+        EventKind::JobBranchPublished {
+            branch: "al/job-1".into(),
+            pushed_to: Some("origin".into()),
+        },
+        EventKind::JobFinished { exit_code: 0 },
+    ]));
+
+    assert_eq!(st, JobState::Succeeded);
+}
+
+#[test]
+fn every_state_has_a_label() {
+    assert_eq!(JobState::Pending.label(), "pending");
+    assert_eq!(JobState::Running.label(), "running");
+    assert_eq!(JobState::Succeeded.label(), "succeeded");
+    assert_eq!(JobState::Failed.label(), "failed");
 }

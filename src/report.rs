@@ -1,11 +1,9 @@
-use crate::event::{Event, EventKind, RunStatus};
-use crate::state::NodeState;
+use crate::event::{Event, EventKind};
+use crate::state::JobState;
 use chrono::{DateTime, Utc};
-use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::time::Duration;
 
-/// How much a node changed, as recorded when its work was committed.
+/// How much a job changed, as recorded when its work was committed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiffSummary {
     pub files: usize,
@@ -29,82 +27,57 @@ impl std::fmt::Display for DiffSummary {
     }
 }
 
+/// Everything a job's event log says about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NodeReport {
-    pub id: String,
-    pub state: NodeState,
-    /// Wall time of the node's most recent attempt.
-    pub duration: Option<Duration>,
-    /// What the node committed, for nodes that produced work. `None` for an
-    /// agent that correctly decided nothing needed changing.
-    pub diff: Option<DiffSummary>,
-    /// Failure reason or skip cause, when there is one.
-    pub detail: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunReport {
+pub struct JobReport {
     pub id: u64,
-    pub status: Option<RunStatus>,
-    pub nodes: Vec<NodeReport>,
+    pub state: JobState,
+    /// How many rounds this job has had. 1 unless it has been revised.
+    pub rounds: u32,
+    /// Wall time of the most recent round.
+    pub duration: Option<Duration>,
+    /// What the job committed, or `None` if the agent changed nothing.
+    pub diff: Option<DiffSummary>,
+    /// Failure reason, when there is one.
+    pub detail: Option<String>,
+    /// The branch the job's work is on, once it has been published. This is
+    /// the job's whole durable output, so a report without it is a job that
+    /// has not produced anything yet.
+    pub branch: Option<String>,
 }
 
-/// One node's facts, accumulated as the event stream is folded.
+/// A job's facts, accumulated as its event stream is folded.
 #[derive(Debug, Clone, Default)]
-struct NodeProgress {
-    state: Option<NodeState>,
+struct JobProgress {
+    state: JobState,
+    rounds: u32,
     attempt_started_at: Option<DateTime<Utc>>,
     last_attempt_duration: Option<Duration>,
     committed_diff: Option<DiffSummary>,
     detail: Option<String>,
+    branch: Option<String>,
 }
 
-/// The whole run's progress, mid-fold.
-#[derive(Debug, Default)]
-struct RunProgress {
-    nodes: BTreeMap<String, NodeProgress>,
-    status: Option<RunStatus>,
-}
-
-impl RunProgress {
+impl JobProgress {
     /// Fold one event in. Written to be passed directly to `Iterator::fold`.
-    fn after_event(mut self, event: &Event) -> Self {
+    fn after_event(self, event: &Event) -> Self {
         match &event.kind {
-            EventKind::RunStarted { .. } => {}
-            EventKind::RunFinished { status } => self.status = Some(*status),
-            _ => {
-                if let Some(node) = event.kind.node() {
-                    let updated = self.progress_for(node).after_node_event(event);
-                    self.nodes.insert(node.to_string(), updated);
-                }
-            }
-        }
-        self
-    }
-
-    fn progress_for(&self, node: &str) -> NodeProgress {
-        self.nodes.get(node).cloned().unwrap_or_default()
-    }
-}
-
-impl NodeProgress {
-    fn after_node_event(self, event: &Event) -> Self {
-        match &event.kind {
-            // A new attempt restarts the clock and clears the previous reason
-            // and diff, so a retried node reports its final attempt.
-            EventKind::NodeStarted { .. } => NodeProgress {
-                state: Some(NodeState::Running),
+            // A new round restarts the clock and clears the previous round's
+            // reason and diff, so a revised job reports its final round.
+            EventKind::JobStarted { round } => JobProgress {
+                state: JobState::Running,
+                rounds: (*round).max(self.rounds + 1),
                 attempt_started_at: Some(event.at),
                 committed_diff: None,
                 detail: None,
                 ..self
             },
-            EventKind::NodeCommitted {
+            EventKind::JobCommitted {
                 files,
                 insertions,
                 deletions,
                 ..
-            } => NodeProgress {
+            } => JobProgress {
                 committed_diff: Some(DiffSummary {
                     files: *files,
                     insertions: *insertions,
@@ -112,21 +85,23 @@ impl NodeProgress {
                 }),
                 ..self
             },
-            EventKind::NodeFinished { .. } => NodeProgress {
-                state: Some(NodeState::Done),
+            // Publishing moves a ref, not the job's own progress — but it is
+            // where the branch's name enters the record.
+            EventKind::JobBranchPublished { branch, .. } => JobProgress {
+                branch: Some(branch.clone()),
+                ..self
+            },
+            EventKind::JobFinished { .. } => JobProgress {
+                state: JobState::Succeeded,
                 last_attempt_duration: self.time_spent_until(event.at),
                 ..self
             },
-            EventKind::NodeFailed { reason, .. } => NodeProgress {
-                state: Some(NodeState::Failed),
+            EventKind::JobFailed { reason, .. } => JobProgress {
+                state: JobState::Failed,
                 last_attempt_duration: self.time_spent_until(event.at),
                 detail: Some(reason.clone()),
                 ..self
             },
-            // Publishing moves a ref, not the node's own progress.
-            EventKind::RunStarted { .. }
-            | EventKind::NodeBranchPublished { .. }
-            | EventKind::RunFinished { .. } => self,
         }
     }
 
@@ -136,104 +111,56 @@ impl NodeProgress {
     }
 }
 
-impl RunReport {
-    /// Fold an event stream into a per-node summary, in the graph's declared
-    /// order. Nodes with no events yet appear as `Pending`.
-    pub fn from_events<'a>(
-        run_id: u64,
-        ids: &[String],
-        events: impl IntoIterator<Item = &'a Event>,
-    ) -> Self {
+impl JobReport {
+    /// Fold a job's event stream into the account `status` prints.
+    ///
+    /// A job with no events yet reports as `Pending` with one round, which is
+    /// what a directory allocated but not yet run looks like.
+    pub fn from_events<'a>(id: u64, events: impl IntoIterator<Item = &'a Event>) -> Self {
         let progress = events
             .into_iter()
-            .fold(RunProgress::default(), RunProgress::after_event);
+            .fold(JobProgress::default(), JobProgress::after_event);
 
-        RunReport {
-            id: run_id,
-            status: progress.status,
-            nodes: ids
-                .iter()
-                .map(|id| {
-                    let node = progress.progress_for(id);
-                    NodeReport {
-                        id: id.clone(),
-                        state: node.state.unwrap_or(NodeState::Pending),
-                        duration: node.last_attempt_duration,
-                        diff: node.committed_diff,
-                        detail: node.detail,
-                    }
-                })
-                .collect(),
+        JobReport {
+            id,
+            state: progress.state,
+            rounds: progress.rounds.max(1),
+            duration: progress.last_attempt_duration,
+            diff: progress.committed_diff,
+            detail: progress.detail,
+            branch: progress.branch,
         }
     }
 
-    #[must_use]
-    pub fn count_in_state(&self, want: NodeState) -> usize {
-        self.nodes.iter().filter(|n| n.state == want).count()
-    }
-
-    /// A node tree plus a one-line summary, for `assembly status`.
-    #[must_use]
-    pub fn to_terminal_tree(&self) -> String {
-        let id_column = self.nodes.iter().map(|n| n.id.len()).max().unwrap_or(0);
-        // `None` for a run that committed nothing — it should not pay for a
-        // column it never fills.
-        let diff_column = self
-            .nodes
-            .iter()
-            .filter_map(|n| n.diff)
-            .map(|d| d.to_string().len())
-            .max();
-
-        let rows = self.nodes.iter().fold(String::new(), |mut out, node| {
-            let _ = writeln!(
-                out,
-                "  {} {:<id_column$}  {:>7}{}  {}",
-                state_glyph(node.state),
-                node.id,
-                format_duration(node.duration),
-                format_diff_column(node.diff, diff_column),
-                node.detail.as_deref().unwrap_or(""),
-            );
-            out
-        });
-
-        format!("{rows}\n{}\n", self.to_summary_line())
-    }
-
-    /// The single line printed at the end of a run.
+    /// The single line printed at the end of a job:
+    /// `job 7: failed (round 2, 3 files +40/-2) — verify failed`.
     #[must_use]
     pub fn to_summary_line(&self) -> String {
+        let facts = [
+            Some(format!("round {}", self.rounds)),
+            self.diff.map(|d| d.to_string()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ");
+
         format!(
-            "run {}: {} — {} done, {} failed",
+            "job {}: {} ({facts}){}",
             self.id,
-            self.status.map_or("in progress", RunStatus::label),
-            self.count_in_state(NodeState::Done),
-            self.count_in_state(NodeState::Failed),
+            self.state.label(),
+            self.detail
+                .as_ref()
+                .map(|why| format!(" — {why}"))
+                .unwrap_or_default(),
         )
     }
-}
 
-fn state_glyph(state: NodeState) -> char {
-    match state {
-        NodeState::Done => '✓',
-        NodeState::Failed => '✗',
-        NodeState::Running => '⠙',
-        NodeState::Pending => '·',
+    /// How long the last round took, as `status` prints it. `None` for a job
+    /// whose last round has not ended.
+    #[must_use]
+    pub fn to_duration_line(&self) -> Option<String> {
+        self.duration
+            .map(|d| format!("took {:.1}s", d.as_secs_f64()))
     }
-}
-
-/// The diff cell, padded to `width`, or nothing at all when the run has no
-/// diff column.
-fn format_diff_column(diff: Option<DiffSummary>, width: Option<usize>) -> String {
-    width.map_or_else(String::new, |width| {
-        let cell = diff.map(|d| d.to_string()).unwrap_or_default();
-        format!("  {cell:<width$}")
-    })
-}
-
-fn format_duration(duration: Option<Duration>) -> String {
-    duration
-        .map(|d| format!("{:.1}s", d.as_secs_f64()))
-        .unwrap_or_default()
 }

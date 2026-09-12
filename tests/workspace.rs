@@ -1,5 +1,5 @@
 use assembly_line::git::{self, commit_all, head_sha};
-use assembly_line::workspace::{self, StartPoint, node_branch_name};
+use assembly_line::workspace::{self, StartPoint, job_branch_name};
 use std::path::PathBuf;
 
 struct Fixture {
@@ -40,12 +40,12 @@ impl Fixture {
 }
 
 #[test]
-fn node_branch_name_identifies_the_run_and_the_node() {
-    assert_eq!(node_branch_name(42, "impl-auth"), "al/run-42-impl-auth");
+fn a_branch_name_identifies_the_job_that_produced_it() {
+    assert_eq!(job_branch_name(42), "al/job-42");
     assert_ne!(
-        node_branch_name(42, "impl-auth"),
-        node_branch_name(43, "impl-auth"),
-        "two runs must not share a node's branch name"
+        job_branch_name(42),
+        job_branch_name(43),
+        "two jobs must not share a branch name"
     );
 }
 
@@ -57,7 +57,7 @@ async fn creating_a_workspace_checks_out_the_base_commit() {
     let ws = workspace::create(
         &fx.repo,
         fx.wt_root.join("impl-auth"),
-        "al/run-1-impl-auth",
+        "al/job-1",
         StartPoint::FreshBranch(&base),
         &fx.seed,
         &[],
@@ -66,7 +66,7 @@ async fn creating_a_workspace_checks_out_the_base_commit() {
     .unwrap();
 
     assert!(ws.path.join("README.md").is_file());
-    assert_eq!(ws.branch, "al/run-1-impl-auth");
+    assert_eq!(ws.branch, "al/job-1");
     assert!(ws.seeded.is_empty());
     assert!(!fx.repo.join("should-not-exist").exists());
 }
@@ -80,7 +80,7 @@ async fn seeded_files_are_copied_in_and_kept_out_of_the_commit() {
     let ws = workspace::create(
         &fx.repo,
         fx.wt_root.join("n"),
-        "al/run-1-n",
+        "al/job-1",
         StartPoint::FreshBranch(&base),
         &fx.seed,
         &[".env".to_string()],
@@ -118,7 +118,7 @@ async fn seeding_preserves_nested_paths() {
     let ws = workspace::create(
         &fx.repo,
         fx.wt_root.join("n"),
-        "al/run-1-n",
+        "al/job-1",
         StartPoint::FreshBranch(&base),
         &fx.seed,
         &[".claude/settings.local.json".to_string()],
@@ -138,7 +138,7 @@ async fn a_missing_seed_path_names_the_file_and_leaves_no_worktree() {
     let err = workspace::create(
         &fx.repo,
         &path,
-        "al/run-1-n",
+        "al/job-1",
         StartPoint::FreshBranch(&base),
         &fx.seed,
         &["nope.env".to_string()],
@@ -149,7 +149,7 @@ async fn a_missing_seed_path_names_the_file_and_leaves_no_worktree() {
 
     assert!(err.contains("nope.env"), "{err}");
     assert!(!path.exists(), "a typo should cost nothing");
-    assert!(!git::branch_exists(&fx.repo, "al/run-1-n").await.unwrap());
+    assert!(!git::branch_exists(&fx.repo, "al/job-1").await.unwrap());
 }
 
 #[tokio::test]
@@ -159,7 +159,7 @@ async fn committing_an_untouched_workspace_produces_nothing() {
     let ws = workspace::create(
         &fx.repo,
         fx.wt_root.join("n"),
-        "al/run-1-n",
+        "al/job-1",
         StartPoint::FreshBranch(&base),
         &fx.seed,
         &[],
@@ -183,7 +183,7 @@ async fn discarding_a_workspace_removes_it_but_keeps_the_branch() {
     let ws = workspace::create(
         &fx.repo,
         fx.wt_root.join("n"),
-        "al/run-1-n",
+        "al/job-1",
         StartPoint::FreshBranch(&base),
         &fx.seed,
         &[],
@@ -195,7 +195,7 @@ async fn discarding_a_workspace_removes_it_but_keeps_the_branch() {
 
     assert!(!ws.path.exists());
     assert!(
-        git::branch_exists(&fx.repo, "al/run-1-n").await.unwrap(),
+        git::branch_exists(&fx.repo, "al/job-1").await.unwrap(),
         "the branch is the record of the work; only the checkout is disposable"
     );
 }
@@ -213,7 +213,7 @@ async fn continuing_a_branch_restores_the_previous_rounds_work() {
     let round_one = workspace::create(
         &fx.repo,
         &path,
-        "al/run-1-n",
+        "al/job-1",
         StartPoint::FreshBranch(&base),
         &fx.seed,
         &[],
@@ -231,7 +231,7 @@ async fn continuing_a_branch_restores_the_previous_rounds_work() {
     let round_two = workspace::create(
         &fx.repo,
         &path,
-        "al/run-1-n",
+        "al/job-1",
         StartPoint::ContinueBranch,
         &fx.seed,
         &[],
@@ -249,7 +249,7 @@ async fn continuing_a_branch_restores_the_previous_rounds_work() {
 
 #[tokio::test]
 async fn a_second_attempt_supersedes_the_worktree_and_branch_of_the_first() {
-    // A run that died mid-node can orphan a checkout, and its branch outlives
+    // A job that died mid-round can orphan a checkout, and its branch outlives
     // that. Git will reuse neither name, so a fresh attempt has to clear both —
     // otherwise it fails on the sandbox instead of on the work.
     let fx = Fixture::new().await;
@@ -259,7 +259,7 @@ async fn a_second_attempt_supersedes_the_worktree_and_branch_of_the_first() {
     let first = workspace::create(
         &fx.repo,
         &path,
-        "al/run-1-n",
+        "al/job-1",
         StartPoint::FreshBranch(&base),
         &fx.seed,
         &[],
@@ -272,7 +272,7 @@ async fn a_second_attempt_supersedes_the_worktree_and_branch_of_the_first() {
     let second = workspace::create(
         &fx.repo,
         &path,
-        "al/run-1-n",
+        "al/job-1",
         StartPoint::FreshBranch(&base),
         &fx.seed,
         &[],
@@ -298,7 +298,7 @@ async fn a_branch_left_without_its_worktree_does_not_block_the_next_attempt() {
     let first = workspace::create(
         &fx.repo,
         &path,
-        "al/run-1-n",
+        "al/job-1",
         StartPoint::FreshBranch(&base),
         &fx.seed,
         &[],
@@ -306,12 +306,12 @@ async fn a_branch_left_without_its_worktree_does_not_block_the_next_attempt() {
     .await
     .unwrap();
     workspace::discard(&fx.repo, &first).await.unwrap();
-    assert!(git::branch_exists(&fx.repo, "al/run-1-n").await.unwrap());
+    assert!(git::branch_exists(&fx.repo, "al/job-1").await.unwrap());
 
     let second = workspace::create(
         &fx.repo,
         &path,
-        "al/run-1-n",
+        "al/job-1",
         StartPoint::FreshBranch(&base),
         &fx.seed,
         &[],

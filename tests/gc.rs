@@ -1,9 +1,9 @@
 use assembly_line::gc::reason_to_collect;
-use assembly_line::paths::{create_run, runs_root};
+use assembly_line::paths::{create_job, jobs_root};
 use std::time::Duration;
 
-/// A repository whose run 1 has a state directory, plus a worktree directory
-/// standing in for that run's checkouts.
+/// A repository whose job 1 has a state directory, plus a worktree directory
+/// standing in for that job's checkout.
 struct Fixture {
     _tmp: tempfile::TempDir,
     repo: std::path::PathBuf,
@@ -17,7 +17,7 @@ impl Fixture {
         let worktree = tmp.path().join("wt/1");
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::create_dir_all(&worktree).unwrap();
-        create_run(&runs_root(&repo), 1).unwrap();
+        create_job(&jobs_root(&repo), 1).unwrap();
 
         Fixture {
             _tmp: tmp,
@@ -28,7 +28,7 @@ impl Fixture {
 }
 
 #[test]
-fn a_live_runs_worktrees_are_kept_however_old() {
+fn a_live_jobs_worktrees_are_kept_however_old() {
     let fx = Fixture::new();
 
     assert_eq!(
@@ -37,12 +37,12 @@ fn a_live_runs_worktrees_are_kept_however_old() {
     );
 }
 
-/// The rule the whole module reduces to: a run's worktrees are wanted exactly
-/// as long as the run is.
+/// The rule the whole module reduces to: a job's worktrees are wanted exactly
+/// as long as the job is.
 #[test]
-fn a_run_whose_state_is_gone_is_collectable() {
+fn a_job_whose_state_is_gone_is_collectable() {
     let fx = Fixture::new();
-    std::fs::remove_dir_all(runs_root(&fx.repo)).unwrap();
+    std::fs::remove_dir_all(jobs_root(&fx.repo)).unwrap();
 
     let reason = reason_to_collect(Some(&fx.repo), 1, &fx.worktree, None).unwrap();
     assert!(reason.contains("no state directory"), "{reason}");
@@ -58,7 +58,7 @@ fn worktrees_of_a_repository_that_is_gone_are_collectable() {
 }
 
 /// Without the marker naming its repository there is no way to tell whether
-/// the run still exists, so the leftovers are collectable by default.
+/// the job still exists, so the leftovers are collectable by default.
 #[test]
 fn worktrees_with_no_known_repository_are_collectable() {
     let fx = Fixture::new();
@@ -75,7 +75,7 @@ fn age_collects_only_when_asked_for() {
     assert_eq!(
         reason_to_collect(Some(&fx.repo), 1, &fx.worktree, None),
         None,
-        "a live run's worktree must survive with no --older-than"
+        "a live job's worktree must survive with no --older-than"
     );
 
     let reason = reason_to_collect(Some(&fx.repo), 1, &fx.worktree, Some(Duration::ZERO))

@@ -1,4 +1,4 @@
-//! assembly-line: run a set of independent coding-agent tasks in parallel.
+//! assembly-line: run one coding-agent job and keep the branch it leaves.
 
 pub mod cli;
 pub mod config;

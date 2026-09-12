@@ -4,81 +4,43 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RunStatus {
-    Ok,
-    Partial,
-    Aborted,
-}
-
-impl RunStatus {
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Ok => "ok",
-            Self::Partial => "partial",
-            Self::Aborted => "aborted",
-        }
-    }
-}
-
+/// Everything that happens to one job.
+///
+/// A job's identity — its repository, ref, prompt and provider — lives in
+/// `meta.json`, so no event repeats it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum EventKind {
-    RunStarted {
-        run_id: u64,
-        jobs: usize,
-    },
-    NodeStarted {
-        node: String,
+    /// A round began. Round 1 is the first attempt; higher rounds are revises.
+    JobStarted {
         round: u32,
     },
-    /// The node's worktree had changes, now recorded on its own branch.
-    NodeCommitted {
-        node: String,
+    /// The checkout had changes, now recorded on the job's branch.
+    JobCommitted {
         sha: String,
         files: usize,
         insertions: usize,
         deletions: usize,
     },
-    /// The node's branch was made durable. `pushed_to` names the remote it
-    /// reached, or is `None` when the repository has none and the branch is
-    /// only a local ref — a complete outcome, not a degraded one.
+    /// The branch was made durable. `pushed_to` names the remote it reached,
+    /// or is `None` when the branch stayed a local ref — because the
+    /// repository has no such remote, or because the remote refused the push.
+    /// Both are complete outcomes, not degraded ones: the branch exists and
+    /// holds the work.
     ///
-    /// Emitted for failed nodes too: a job leaves nothing but its branch, so
-    /// this is what makes a failure inspectable at all.
-    NodeBranchPublished {
-        node: String,
+    /// Emitted for failed jobs too, and whatever became of the push: a job
+    /// leaves nothing but its branch, so this is what makes the work
+    /// findable at all.
+    JobBranchPublished {
         branch: String,
         pushed_to: Option<String>,
     },
-    NodeFinished {
-        node: String,
+    JobFinished {
         exit_code: i32,
     },
-    NodeFailed {
-        node: String,
+    JobFailed {
         reason: String,
     },
-    RunFinished {
-        status: RunStatus,
-    },
-}
-
-impl EventKind {
-    /// The node this event concerns, if any.
-    #[must_use]
-    pub fn node(&self) -> Option<&str> {
-        match self {
-            Self::NodeStarted { node, .. }
-            | Self::NodeCommitted { node, .. }
-            | Self::NodeBranchPublished { node, .. }
-            | Self::NodeFinished { node, .. }
-            | Self::NodeFailed { node, .. } => Some(node),
-            Self::RunStarted { .. } | Self::RunFinished { .. } => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,7 +78,7 @@ pub fn read_events(src: impl BufRead) -> io::Result<Vec<Event>> {
         })
 }
 
-/// Append-only event sink. The log is the source of truth for a run; it is
+/// Append-only event sink. The log is the source of truth for a job; it is
 /// never rewritten or truncated.
 ///
 /// Generic over its sink so tests can write into a buffer, defaulting to the
@@ -172,7 +134,7 @@ impl EventLog<File> {
     }
 
     /// Read a log from disk. A missing file is an empty log, not an error —
-    /// a run that has not written its first event yet is a legitimate state.
+    /// a job that has not written its first event yet is a legitimate state.
     ///
     /// # Errors
     ///

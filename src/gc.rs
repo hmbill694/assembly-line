@@ -1,9 +1,9 @@
-//! Collecting what runs leave behind.
+//! Collecting what jobs leave behind.
 //!
-//! Jobs discard their own checkouts as they finish, so what is found here is
-//! narrow: whatever a run that died mid-node orphaned. That makes the policy
-//! small — **a run's worktrees are wanted exactly as long as the run is** —
-//! and `--older-than` exists only for the leftovers of runs whose state was
+//! A job discards its own checkout as it finishes, so what is found here is
+//! narrow: whatever a job that died mid-round orphaned. That makes the policy
+//! small — **a job's worktrees are wanted exactly as long as the job is** —
+//! and `--older-than` exists only for the leftovers of jobs whose state was
 //! never cleaned up.
 //!
 //! Deciding and doing are separate: [`collectable`] reports what could go and
@@ -15,7 +15,7 @@ use crate::paths;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// A run's worktree directory that nothing needs any more.
+/// A job's worktree directory that nothing needs any more.
 #[derive(Debug, Clone)]
 pub struct StaleWorktree {
     pub path: PathBuf,
@@ -33,8 +33,8 @@ pub struct RepositoryLeftovers {
     pub stale: Vec<StaleWorktree>,
 }
 
-/// Directories directly under `dir` whose names are run ids.
-fn run_directories(dir: &Path) -> Vec<(u64, PathBuf)> {
+/// Directories directly under `dir` whose names are job ids.
+fn job_directories(dir: &Path) -> Vec<(u64, PathBuf)> {
     std::fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -64,16 +64,16 @@ fn idle_time(path: &Path) -> Option<Duration> {
         .and_then(|written| written.elapsed().ok())
 }
 
-/// Why a run's worktree directory is collectable, or `None` while the run it
+/// Why a job's worktree directory is collectable, or `None` while the job it
 /// belongs to still exists.
 #[must_use]
 pub fn reason_to_collect(
     repo: Option<&Path>,
-    run_id: u64,
+    job_id: u64,
     path: &Path,
     keep_for: Option<Duration>,
 ) -> Option<String> {
-    // Age only collects when the user asked for it: a worktree whose run still
+    // Age only collects when the user asked for it: a worktree whose job still
     // exists is still wanted however old it is.
     let too_old = || {
         let keep_for = keep_for?;
@@ -89,8 +89,8 @@ pub fn reason_to_collect(
     match repo {
         None => Some("its repository is unknown".to_string()),
         Some(repo) if !repo.exists() => Some(format!("{} no longer exists", repo.display())),
-        Some(repo) if !paths::runs_root(repo).join(run_id.to_string()).is_dir() => {
-            Some(format!("run {run_id} has no state directory"))
+        Some(repo) if !paths::jobs_root(repo).join(job_id.to_string()).is_dir() => {
+            Some(format!("job {job_id} has no state directory"))
         }
         Some(_) => too_old(),
     }
@@ -109,10 +109,10 @@ pub fn collectable(keep_for: Option<Duration>) -> Vec<RepositoryLeftovers> {
         .map(|per_repo| {
             let repo = paths::repository_owning_worktrees(&per_repo);
             RepositoryLeftovers {
-                stale: run_directories(&per_repo)
+                stale: job_directories(&per_repo)
                     .into_iter()
-                    .filter_map(|(run_id, path)| {
-                        reason_to_collect(repo.as_deref(), run_id, &path, keep_for)
+                    .filter_map(|(job_id, path)| {
+                        reason_to_collect(repo.as_deref(), job_id, &path, keep_for)
                             .map(|because| StaleWorktree { path, because })
                     })
                     .collect(),
