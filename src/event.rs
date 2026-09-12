@@ -30,12 +30,6 @@ pub enum EventKind {
         run_id: u64,
         jobs: usize,
     },
-    /// The run needs somewhere for agent work to land, so it branched off HEAD.
-    /// Only emitted when the graph contains an agent node.
-    RunBranchCreated {
-        branch: String,
-        base_sha: String,
-    },
     NodeStarted {
         node: String,
         round: u32,
@@ -58,17 +52,6 @@ pub enum EventKind {
         node: String,
         branch: String,
         pushed_to: Option<String>,
-    },
-    /// The node's branch reached the run branch.
-    NodeMerged {
-        node: String,
-        sha: String,
-    },
-    /// The node's branch could not be merged. The scheduler decides what that
-    /// means for the node; this only records what git reported.
-    NodeMergeConflicted {
-        node: String,
-        paths: Vec<String>,
     },
     NodeFinished {
         node: String,
@@ -95,14 +78,10 @@ impl EventKind {
             Self::NodeStarted { node, .. }
             | Self::NodeCommitted { node, .. }
             | Self::NodeBranchPublished { node, .. }
-            | Self::NodeMerged { node, .. }
-            | Self::NodeMergeConflicted { node, .. }
             | Self::NodeFinished { node, .. }
             | Self::NodeFailed { node, .. }
             | Self::NodeSkipped { node, .. } => Some(node),
-            Self::RunStarted { .. } | Self::RunBranchCreated { .. } | Self::RunFinished { .. } => {
-                None
-            }
+            Self::RunStarted { .. } | Self::RunFinished { .. } => None,
         }
     }
 }

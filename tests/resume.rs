@@ -240,8 +240,6 @@ fn resume_reports_the_node_it_requeued() {
         &assembly_line::paths::RunMeta {
             graph: "graph.toml".into(),
             jobs: 4,
-            run_branch: None,
-            base_sha: None,
         },
     )
     .unwrap();

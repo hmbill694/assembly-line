@@ -246,11 +246,11 @@ fn rejects_invalid_max_duration() {
 }
 
 #[test]
-fn rejects_an_id_that_would_collide_with_the_integration_worktree() {
-    let src = "[[task]]\nid=\"_integration\"\nprompt=\"x\"\n";
+fn rejects_an_id_that_starts_with_the_reserved_underscore_prefix() {
+    let src = "[[task]]\nid=\"_scratch\"\nprompt=\"x\"\n";
     let errs = Dag::build(&tasks(src)).unwrap_err();
     assert!(
-        errs.contains(&ValidationError::ReservedId("_integration".into())),
+        errs.contains(&ValidationError::ReservedId("_scratch".into())),
         "{errs:?}"
     );
 }

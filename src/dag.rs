@@ -24,7 +24,7 @@ impl std::fmt::Display for ValidationError {
             ),
             Self::ReservedId(id) => write!(
                 f,
-                "task id '{id}' is reserved: ids may not start with '_', which assembly-line uses for its own worktrees"
+                "task id '{id}' is reserved: ids may not start with '_', which assembly-line keeps for itself"
             ),
             Self::SelfDep(id) => write!(f, "task '{id}' depends on itself"),
             Self::UnknownDep { task, dep } => {
@@ -96,8 +96,9 @@ fn id_naming_errors(tasks: &[Task]) -> impl Iterator<Item = ValidationError> + '
         .filter(|(i, t)| tasks[..*i].iter().any(|prior| prior.id == t.id))
         .map(|(_, t)| ValidationError::DuplicateId(t.id.clone()));
 
-    // Ids become directory names beside the integration worktree, whose name
-    // starts with `_`. Reserving the whole prefix keeps that space ours.
+    // Ids become directory names beside assembly-line's own bookkeeping
+    // entries, whose names start with `_`. Reserving the whole prefix keeps
+    // that space ours.
     let reserved = tasks
         .iter()
         .filter(|t| t.id.starts_with('_'))

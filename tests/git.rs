@@ -1,6 +1,6 @@
 use assembly_line::git::{
-    self, DiffStat, MergeOutcome, add_worktree, commit_all, commit_all_except, conflicted_paths,
-    diff_stat_against, head_sha, is_dirty, merge_branch, remove_worktree,
+    self, DiffStat, add_worktree, commit_all, commit_all_except, diff_stat_against, head_sha,
+    is_dirty, remove_worktree,
 };
 use std::path::{Path, PathBuf};
 
@@ -137,30 +137,6 @@ async fn a_worktree_leaves_the_original_tree_untouched() {
     assert!(!node.exists());
 }
 
-/// Git refs are paths, so a run branch cannot be a directory prefix of its
-/// node branches. This is why node branches are flat siblings.
-#[tokio::test]
-async fn a_node_branch_nested_under_the_run_branch_is_rejected_by_git() {
-    let fx = Fixture::new().await;
-    fx.worktree("run", "al/run-1").await;
-
-    let base = fx.base().await;
-    let nested = add_worktree(
-        &fx.repo,
-        fx.worktrees.join("nested"),
-        "al/run-1/node",
-        &base,
-    )
-    .await;
-
-    assert!(
-        nested.is_err(),
-        "git accepted a ref nested under an existing ref"
-    );
-    // The flat sibling form is fine.
-    assert!(fx.worktree("flat", "al/run-1-node").await.is_dir());
-}
-
 #[tokio::test]
 async fn is_dirty_tracks_uncommitted_work() {
     let fx = Fixture::new().await;
@@ -168,79 +144,6 @@ async fn is_dirty_tracks_uncommitted_work() {
 
     std::fs::write(fx.repo.join("scratch.txt"), "wip").unwrap();
     assert!(is_dirty(&fx.repo).await.unwrap());
-}
-
-#[tokio::test]
-async fn merging_a_node_branch_advances_the_integration_worktree_only() {
-    let fx = Fixture::new().await;
-    let integration = fx.worktree("run", "al/run-1").await;
-    let node = fx.worktree("a", "al/run-1-a").await;
-
-    write_and_commit(&node, "a.txt", "from a\n", "add a").await;
-    let outcome = merge_branch(&integration, "al/run-1-a", "merge a")
-        .await
-        .unwrap();
-
-    assert!(matches!(outcome, MergeOutcome::Merged(_)));
-    assert!(integration.join("a.txt").is_file());
-    assert!(!fx.repo.join("a.txt").exists(), "user tree was modified");
-}
-
-#[tokio::test]
-async fn merging_twice_reports_already_up_to_date() {
-    let fx = Fixture::new().await;
-    let integration = fx.worktree("run", "al/run-1").await;
-    let node = fx.worktree("a", "al/run-1-a").await;
-    write_and_commit(&node, "a.txt", "from a\n", "add a").await;
-
-    merge_branch(&integration, "al/run-1-a", "merge a")
-        .await
-        .unwrap();
-    let second = merge_branch(&integration, "al/run-1-a", "merge a again")
-        .await
-        .unwrap();
-
-    assert_eq!(second, MergeOutcome::AlreadyUpToDate);
-}
-
-#[tokio::test]
-async fn two_nodes_touching_the_same_file_conflict_on_the_second_merge() {
-    let fx = Fixture::new().await;
-    let integration = fx.worktree("run", "al/run-1").await;
-
-    for (dir, branch, body) in [
-        ("a", "al/run-1-a", "written by a\n"),
-        ("b", "al/run-1-b", "written by b\n"),
-    ] {
-        let node = fx.worktree(dir, branch).await;
-        write_and_commit(&node, "shared.txt", body, "edit shared").await;
-    }
-
-    assert!(matches!(
-        merge_branch(&integration, "al/run-1-a", "merge a")
-            .await
-            .unwrap(),
-        MergeOutcome::Merged(_)
-    ));
-
-    let second = merge_branch(&integration, "al/run-1-b", "merge b")
-        .await
-        .unwrap();
-    match second {
-        MergeOutcome::Conflicted(paths) => assert_eq!(paths, vec!["shared.txt".to_string()]),
-        other => panic!("expected a conflict, got {other:?}"),
-    }
-
-    // Left mid-merge on purpose: the markers are what a resolver acts on.
-    let body = std::fs::read_to_string(integration.join("shared.txt")).unwrap();
-    assert!(body.contains("<<<<<<<"), "{body}");
-    assert_eq!(
-        conflicted_paths(&integration).await.unwrap(),
-        vec!["shared.txt".to_string()]
-    );
-
-    git::abort_merge(&integration).await.unwrap();
-    assert!(conflicted_paths(&integration).await.unwrap().is_empty());
 }
 
 #[tokio::test]

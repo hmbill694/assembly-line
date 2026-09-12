@@ -341,14 +341,6 @@ fn gc_collects_a_runs_worktrees_only_once_its_run_state_is_gone() {
         !worktrees.join("n").exists(),
         "a job's checkout is scratch — even a failed one discards it"
     );
-    // What is left is the run's own integration checkout, which lives as long
-    // as the run does.
-    assert!(
-        worktrees
-            .join(assembly_line::paths::INTEGRATION_WORKTREE)
-            .is_dir(),
-        "the integration worktree is the run's, not a node's"
-    );
 
     // The run still exists, so its worktrees are still wanted.
     assembly(&tmp)
@@ -401,7 +393,7 @@ fn a_revise_round_continues_the_branch_instead_of_starting_over() {
         // The node's own outcome, not the run's. Reprinting the run summary
         // here reads as a contradiction: it belongs to the run that already
         // finished, so it would say "ok" beside a freshly failed node.
-        .stdout(contains("round 2").and(contains("merged")))
+        .stdout(contains("round 2").and(contains("done")))
         .stdout(contains("run 1:").not());
 
     // Two commits on the node's branch, not one replaced by another.

@@ -1,10 +1,10 @@
 //! Collecting what runs leave behind.
 //!
-//! Jobs discard their own checkouts, so what is found here is narrow: the
-//! integration worktree a run keeps for as long as it exists, plus anything a
-//! run that died mid-node orphaned. That makes the policy small — **a run's
-//! worktrees are wanted exactly as long as the run is** — and `--older-than`
-//! exists only for the leftovers of runs whose state was never cleaned up.
+//! Jobs discard their own checkouts as they finish, so what is found here is
+//! narrow: whatever a run that died mid-node orphaned. That makes the policy
+//! small — **a run's worktrees are wanted exactly as long as the run is** —
+//! and `--older-than` exists only for the leftovers of runs whose state was
+//! never cleaned up.
 //!
 //! Deciding and doing are separate: [`collectable`] reports what could go and
 //! why, which is what `--dry-run` prints, and [`remove`] is the only part that

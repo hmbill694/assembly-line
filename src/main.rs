@@ -5,7 +5,7 @@ use assembly_line::paths::{RunMeta, RunPaths};
 use assembly_line::report::RunReport;
 use assembly_line::scheduler::{RunOpts, execute};
 use assembly_line::state::RunState;
-use assembly_line::{config, dag, delivery, gc, git, paths};
+use assembly_line::{config, dag, gc, paths};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -159,38 +159,6 @@ async fn drive_run(
     Ok((status, state))
 }
 
-/// Copy the run branch into `meta.json`, so `status` and future tooling can
-/// find the work without replaying the log.
-///
-/// Read back from the event log rather than threaded out of the scheduler: the
-/// log is the record of what happened, and a graph without agent nodes creates
-/// no branch to record. A failure here is reported but does not fail the run —
-/// the branch exists either way.
-fn record_run_branch_in_meta(run: &RunPaths, meta: &RunMeta) {
-    let Some((run_branch, base_sha)) = EventLog::read(run.events())
-        .ok()
-        .and_then(|events| events.into_iter().find_map(branch_creation))
-    else {
-        return;
-    };
-
-    let recorded = RunMeta {
-        run_branch: Some(run_branch),
-        base_sha: Some(base_sha),
-        ..meta.clone()
-    };
-    if let Err(e) = paths::write_meta(run, &recorded) {
-        eprintln!("warn: could not record the run branch in meta.json: {e}");
-    }
-}
-
-fn branch_creation(event: assembly_line::event::Event) -> Option<(String, String)> {
-    match event.kind {
-        EventKind::RunBranchCreated { branch, base_sha } => Some((branch, base_sha)),
-        _ => None,
-    }
-}
-
 fn report_for(run: &RunPaths, graph_path: &Path) -> Result<RunReport, String> {
     let graph = config::load_graph(graph_path).map_err(|e| e.to_string())?;
     let ids: Vec<String> = graph.tasks.iter().map(|t| t.id.clone()).collect();
@@ -226,8 +194,6 @@ async fn start_new_run(graph_path: PathBuf, jobs: usize) -> ExitCode {
     let meta = RunMeta {
         graph: graph_path.clone(),
         jobs,
-        run_branch: None,
-        base_sha: None,
     };
     if let Err(e) = paths::write_meta(&run, &meta) {
         return fail_with_usage_error(format!("writing meta.json: {e}"));
@@ -237,56 +203,10 @@ async fn start_new_run(graph_path: PathBuf, jobs: usize) -> ExitCode {
     match drive_run(&graph_path, &run, jobs, initial).await {
         Err(e) => fail_with_usage_error(e),
         Ok((status, state)) => {
-            record_run_branch_in_meta(&run, &meta);
             print_run_outcome(&run, &graph_path, status, &state);
-            deliver_if_complete(&run, &graph, status).await;
             println!("state: {}", run.dir.display());
             exit_code_for(status)
         }
-    }
-}
-
-/// Hand a finished run's branch on, once the whole graph succeeded.
-///
-/// A partial run still leaves a real branch, but opening a pull request for
-/// work that did not finish is noise — the branch name is printed instead, so
-/// acting on it stays a decision rather than a default.
-async fn deliver_if_complete(run: &RunPaths, graph: &config::Graph, status: RunStatus) {
-    let Some(run_branch) = paths::read_meta(run).ok().and_then(|m| m.run_branch) else {
-        return; // A run given no repository creates no branch to deliver.
-    };
-
-    if status != RunStatus::Ok {
-        println!("branch: {run_branch} (not delivered — the run did not finish)");
-        return;
-    }
-
-    let Ok(repo) = enclosing_repo_root() else {
-        return;
-    };
-    // Never an assumed `main`: the base is what the user was standing on. The
-    // repository's own HEAD is untouched by a run, so it still says so.
-    let base = match graph.delivery.base.clone() {
-        Some(declared) => Some(declared),
-        None => git::current_branch(&repo).await.ok().flatten(),
-    };
-    let Some(base) = base else {
-        eprintln!("warn: could not tell what branch to deliver onto; branch is {run_branch}");
-        return;
-    };
-
-    let delivered = delivery::deliver(
-        &repo,
-        &graph.delivery,
-        assembly_line::workspace::DEFAULT_REMOTE,
-        &run_branch,
-        &base,
-    )
-    .await;
-
-    match delivered {
-        Ok(outcome) => println!("{outcome}"),
-        Err(e) => eprintln!("warn: delivering {run_branch}: {e}"),
     }
 }
 
@@ -465,7 +385,7 @@ fn print_node_outcome(run: &RunPaths, graph_path: &Path, node: &str) {
     };
 
     let outcome = match reported.state {
-        assembly_line::state::NodeState::Done => "merged",
+        assembly_line::state::NodeState::Done => "done",
         assembly_line::state::NodeState::Failed => "failed",
         assembly_line::state::NodeState::Skipped => "skipped",
         assembly_line::state::NodeState::Running | assembly_line::state::NodeState::Pending => {

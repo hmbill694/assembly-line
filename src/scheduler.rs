@@ -2,16 +2,14 @@ use crate::config::{Graph, OnFailure, Task, parse_duration};
 use crate::dag::Dag;
 use crate::event::{EventKind, EventLog, RunStatus};
 use crate::exec::{ShellOutcome, run_command};
-use crate::git::{self, MergeOutcome};
+use crate::git;
 use crate::paths::{self, RunPaths};
 use crate::provider::{CommandSpec, render_command};
 use crate::state::{NodeState, RunState, TaskMap, task_map};
-use crate::workspace::{self, node_branch_name, run_branch_name};
+use crate::workspace::{self, node_branch_name};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -28,46 +26,6 @@ pub struct RunOpts {
     /// The remote node branches are published to. A repository that has no
     /// remote by this name keeps its branches locally instead.
     pub remote: String,
-}
-
-/// The branch every agent node's work merges into, and the checkout it lives
-/// in. Kept out of the user's own working tree, which is never a merge target.
-#[derive(Debug, Clone)]
-struct RunBranch {
-    repo: PathBuf,
-    name: String,
-    /// The commit the branch was cut from, or `None` when this run re-opened a
-    /// branch an earlier attempt created — there is nothing new to record.
-    branched_from_sha: Option<String>,
-    worktree: PathBuf,
-    /// Every merge targets the one worktree above, so they cannot overlap.
-    /// Held only around a merge; holding it while an agent runs would make
-    /// the whole run serial.
-    merge_lock: Arc<Mutex<()>>,
-}
-
-impl RunBranch {
-    /// The branch's current tip, so each node starts from everything merged
-    /// before it rather than from the run's original base.
-    async fn current_tip(&self) -> anyhow::Result<String> {
-        let _merging = self.merge_lock.lock().await;
-        git::head_sha(&self.worktree).await
-    }
-
-    /// Merge a node's branch in, serialized against every other merge.
-    ///
-    /// A conflict is backed out before the lock is released: git leaves the
-    /// worktree mid-merge, and the next node to merge would inherit it.
-    async fn merge(&self, node: &str, branch: &str) -> anyhow::Result<MergeOutcome> {
-        let _merging = self.merge_lock.lock().await;
-
-        let outcome =
-            git::merge_branch(&self.worktree, branch, &format!("merge node '{node}'")).await?;
-        if matches!(outcome, MergeOutcome::Conflicted(_)) {
-            git::abort_merge(&self.worktree).await?;
-        }
-        Ok(outcome)
-    }
 }
 
 /// What an agent left behind, recorded on its own branch.
@@ -89,14 +47,11 @@ struct AgentWork {
 enum NodeResult {
     /// An agent that correctly decided nothing needed doing.
     Succeeded,
-    /// An agent left work, which was committed, published, and then offered to
-    /// the run branch — successfully or not.
-    Committed {
-        work: AgentWork,
-        merge: MergeOutcome,
-    },
+    /// An agent left work, which was committed and published. The branch is
+    /// the whole durable output of a job.
+    Committed { work: AgentWork },
     /// `work` carries whatever the agent had produced before it failed. That
-    /// work is preserved on the node's branch and never merged.
+    /// work is preserved on the node's branch.
     Failed {
         reason: String,
         work: Option<AgentWork>,
@@ -126,25 +81,6 @@ impl NodeResult {
     }
 }
 
-/// What reached the run branch, from the node's point of view.
-enum MergeRecord {
-    /// The run branch now carries this commit.
-    Landed(String),
-    Blocked(Vec<String>),
-}
-
-impl MergeRecord {
-    /// `AlreadyUpToDate` produces no merge commit, so the node's own commit is
-    /// what the run branch carries.
-    fn of(merge: MergeOutcome, committed: &str) -> Self {
-        match merge {
-            MergeOutcome::Merged(sha) => Self::Landed(sha),
-            MergeOutcome::AlreadyUpToDate => Self::Landed(committed.to_string()),
-            MergeOutcome::Conflicted(paths) => Self::Blocked(paths),
-        }
-    }
-}
-
 /// What a finished node reports back to the loop.
 struct NodeCompletion {
     node: String,
@@ -156,8 +92,8 @@ struct NodeCompletion {
 /// config mistake becomes a failed node with a clear reason rather than a
 /// panic inside a task.
 struct AgentNodePlan {
-    node: String,
-    run_branch: RunBranch,
+    repo: PathBuf,
+    base_sha: String,
     workspace_path: PathBuf,
     branch: String,
     seed_from: PathBuf,
@@ -165,7 +101,7 @@ struct AgentNodePlan {
     command: CommandSpec,
     commit_message: String,
     remote: String,
-    /// A first attempt cuts a fresh branch off the run branch; a revise round
+    /// A first attempt cuts a fresh branch off the base; a revise round
     /// continues the node's own branch, so the agent starts from its prior
     /// work.
     continues_branch: bool,
@@ -254,10 +190,10 @@ fn agent_node_plan(
     task: &Task,
     paths: &RunPaths,
     opts: &RunOpts,
-    run_branch: Option<&RunBranch>,
+    repo_and_base: Option<(&Path, &str)>,
     revision: Option<&str>,
 ) -> Result<AgentNodePlan, String> {
-    let run_branch = run_branch.ok_or(
+    let (repo, base_sha) = repo_and_base.ok_or(
         "agent nodes need a git repository to create worktrees from, and this run has none",
     )?;
 
@@ -271,7 +207,7 @@ fn agent_node_plan(
         .ok_or_else(|| format!("undefined provider '{provider_name}'"))?;
 
     let workspace_path = paths
-        .node_worktree(&run_branch.repo, &task.id)
+        .node_worktree(repo, &task.id)
         .ok_or("HOME is unset, so assembly-line has nowhere to put worktrees")?;
 
     let original = task.prompt.clone().unwrap_or_default();
@@ -283,8 +219,8 @@ fn agent_node_plan(
     );
 
     Ok(AgentNodePlan {
-        node: task.id.clone(),
-        run_branch: run_branch.clone(),
+        repo: repo.to_path_buf(),
+        base_sha: base_sha.to_string(),
         workspace_path,
         branch: node_branch_name(paths.id, &task.id),
         seed_from: opts.seed_from.clone(),
@@ -340,10 +276,19 @@ pub async fn revise_node(
         .repo
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("revising needs a git repository"))?;
-    let run_branch = prepare_run_branch(repo, paths).await?;
+    paths::record_repository_for_worktrees(repo)?;
+    let branch = node_branch_name(paths.id, node);
+    let base_sha = git::branch_tip(repo, &branch).await?;
 
-    let plan = agent_node_plan(graph, task, paths, opts, Some(&run_branch), Some(feedback))
-        .map_err(|reason| anyhow::anyhow!(reason))?;
+    let plan = agent_node_plan(
+        graph,
+        task,
+        paths,
+        opts,
+        Some((repo, base_sha.as_str())),
+        Some(feedback),
+    )
+    .map_err(|reason| anyhow::anyhow!(reason))?;
 
     let ev = log.append(EventKind::NodeStarted {
         node: node.to_string(),
@@ -366,7 +311,7 @@ pub async fn revise_node(
     record_completion(log, state, node, result)
 }
 
-/// Run one agent node end to end: sandbox, agent, commit, publish, merge.
+/// Run one agent node end to end: sandbox, agent, commit, publish.
 ///
 /// The job is stateless — its checkout is scratch and is discarded whatever
 /// happened, including on failure. What survives is the node's branch, which
@@ -378,20 +323,16 @@ async fn agent_node_result(
     timeout: Option<Duration>,
     cancel: CancellationToken,
 ) -> anyhow::Result<NodeResult> {
-    // A first attempt branches from everything merged so far; a revise round
+    // A first attempt branches from the repository's own base; a revise round
     // branches from its own last round, so its diff reports what *this* round
     // changed.
-    let base_sha = match plan.continues_branch {
-        true => git::branch_tip(&plan.run_branch.repo, &plan.branch).await?,
-        false => plan.run_branch.current_tip().await?,
-    };
     let start = match plan.continues_branch {
         true => workspace::StartPoint::ContinueBranch,
-        false => workspace::StartPoint::FreshBranch(&base_sha),
+        false => workspace::StartPoint::FreshBranch(&plan.base_sha),
     };
 
     let ws = workspace::create(
-        &plan.run_branch.repo,
+        &plan.repo,
         &plan.workspace_path,
         &plan.branch,
         start,
@@ -411,84 +352,41 @@ async fn agent_node_result(
         Some(sha) => Some(AgentWork {
             branch: ws.branch.clone(),
             sha,
-            stat: git::diff_stat_against(&ws.path, &base_sha).await?,
-            pushed_to: workspace::publish(&plan.run_branch.repo, &ws, &plan.remote).await?,
+            stat: git::diff_stat_against(&ws.path, &plan.base_sha).await?,
+            pushed_to: workspace::publish(&plan.repo, &ws, &plan.remote).await?,
         }),
     };
 
-    // Merging reads the branch, not the checkout, so the scratch directory is
-    // already surplus by this point.
-    workspace::discard(&plan.run_branch.repo, &ws).await?;
+    workspace::discard(&plan.repo, &ws).await?;
 
     if let Some(reason) = ran.failure_reason() {
         return Ok(NodeResult::Failed { reason, work });
     }
 
-    let Some(work) = work else {
-        return Ok(NodeResult::Succeeded);
-    };
-
-    let merge = plan.run_branch.merge(&plan.node, &work.branch).await?;
-    Ok(NodeResult::Committed { work, merge })
+    Ok(match work {
+        None => NodeResult::Succeeded,
+        Some(work) => NodeResult::Committed { work },
+    })
 }
 
-/// Create, or on resume re-open, the branch agent work merges into.
+/// Confirm the repository has something to branch from, and return its
+/// current `HEAD` — the base every fresh node branch in this run is cut from.
 ///
 /// # Errors
 ///
-/// Returns an error if the repository has no commits to branch from, if
-/// `$HOME` is unset, or if git cannot produce the worktree.
-async fn prepare_run_branch(repo: &Path, paths: &RunPaths) -> anyhow::Result<RunBranch> {
+/// Returns an error if the repository has no commits, or if the marker
+/// naming it for `gc` cannot be written.
+async fn base_for_fresh_branches(repo: &Path) -> anyhow::Result<String> {
     anyhow::ensure!(
         git::has_commits(repo).await?,
         "the repository has no commits, so an agent node has nothing to branch from"
     );
 
-    let worktree = paths.integration_worktree(repo).ok_or_else(|| {
-        anyhow::anyhow!("HOME is unset, so assembly-line has nowhere to put worktrees")
-    })?;
-    let name = run_branch_name(paths.id);
-
     // Records which repository these worktrees belong to, so `gc` can collect
     // them without being run from the repository itself.
     paths::record_repository_for_worktrees(repo)?;
-    // A checkout whose directory is gone still holds its administrative entry,
-    // which is enough to make the path unusable.
-    git::prune_worktrees(repo).await?;
 
-    let branched_from_sha = check_out_run_branch(repo, &worktree, &name).await?;
-
-    Ok(RunBranch {
-        repo: repo.to_path_buf(),
-        name,
-        branched_from_sha,
-        worktree,
-        merge_lock: Arc::new(Mutex::new(())),
-    })
-}
-
-/// Put `branch` in a worktree at `path`, reusing whatever an earlier attempt
-/// left. Returns the commit the branch was cut from, or `None` when it already
-/// existed and this run is only re-opening it.
-async fn check_out_run_branch(
-    repo: &Path,
-    path: &Path,
-    branch: &str,
-) -> anyhow::Result<Option<String>> {
-    match (path.exists(), git::branch_exists(repo, branch).await?) {
-        // Resuming: the checkout survived, and it is still ours.
-        (true, _) => Ok(None),
-        // The branch outlived its checkout — `gc` removed it, or a crash did.
-        (false, true) => {
-            git::add_worktree_for_existing_branch(repo, path, branch).await?;
-            Ok(None)
-        }
-        (false, false) => {
-            let base_sha = git::head_sha(repo).await?;
-            git::add_worktree(repo, path, branch, &base_sha).await?;
-            Ok(Some(base_sha))
-        }
-    }
+    git::head_sha(repo).await
 }
 
 /// Write every event a completion implies, in order, and report whether the
@@ -561,38 +459,13 @@ fn events_for_completion(node: &str, result: NodeResult) -> (Vec<EventKind>, boo
                 .collect(),
             true,
         ),
-        NodeResult::Committed { work, merge } => {
-            let recorded = work_recorded(node, Some(&work)).into_iter();
-            match MergeRecord::of(merge, &work.sha) {
-                MergeRecord::Landed(sha) => (
-                    recorded
-                        .chain([
-                            EventKind::NodeMerged {
-                                node: node.to_string(),
-                                sha,
-                            },
-                            finished,
-                        ])
-                        .collect(),
-                    false,
-                ),
-                MergeRecord::Blocked(paths) => {
-                    let reason = format!("merge conflict in {}", paths.join(", "));
-                    (
-                        recorded
-                            .chain([
-                                EventKind::NodeMergeConflicted {
-                                    node: node.to_string(),
-                                    paths,
-                                },
-                                failed(reason),
-                            ])
-                            .collect(),
-                        true,
-                    )
-                }
-            }
-        }
+        NodeResult::Committed { work } => (
+            work_recorded(node, Some(&work))
+                .into_iter()
+                .chain([finished])
+                .collect(),
+            false,
+        ),
     }
 }
 
@@ -601,10 +474,11 @@ fn events_for_completion(node: &str, result: NodeResult) -> (Vec<EventKind>, boo
 /// # Errors
 ///
 /// Returns an error only if the run cannot be *administered* — the event log
-/// cannot be appended to, a task's `max_duration` is unparseable, the run
-/// branch cannot be created, or a spawned task panicked. A node that fails,
-/// times out, or is cancelled is not an error: that is reflected in the
-/// returned [`RunStatus`], because a partial run is a normal outcome.
+/// cannot be appended to, a task's `max_duration` is unparseable, the
+/// repository has no commits for a fresh node branch to start from, or a
+/// spawned task panicked. A node that fails, times out, or is cancelled is not
+/// an error: that is reflected in the returned [`RunStatus`], because a
+/// partial run is a normal outcome.
 ///
 /// # Panics
 ///
@@ -633,20 +507,10 @@ pub async fn execute(
     })?;
     state.apply(&ev.kind);
 
-    let run_branch = match &opts.repo {
+    let repo_and_base = match &opts.repo {
         None => None,
-        Some(repo) => Some(prepare_run_branch(repo, paths).await?),
+        Some(repo) => Some((repo.clone(), base_for_fresh_branches(repo).await?)),
     };
-
-    if let Some(branch) = &run_branch
-        && let Some(base_sha) = branch.branched_from_sha.clone()
-    {
-        let ev = log.append(EventKind::RunBranchCreated {
-            branch: branch.name.clone(),
-            base_sha,
-        })?;
-        state.apply(&ev.kind);
-    }
 
     // A state machine over time: launch what fits, await one completion,
     // re-derive readiness. Not expressible as an iterator chain.
@@ -672,7 +536,10 @@ pub async fn execute(
                 let log_path = paths.log(&id);
                 let cancel = opts.cancel.clone();
 
-                match agent_node_plan(graph, task, paths, opts, run_branch.as_ref(), None) {
+                let repo_and_base = repo_and_base
+                    .as_ref()
+                    .map(|(repo, base_sha)| (repo.as_path(), base_sha.as_str()));
+                match agent_node_plan(graph, task, paths, opts, repo_and_base, None) {
                     Err(reason) => {
                         in_flight.spawn(async move {
                             NodeCompletion {

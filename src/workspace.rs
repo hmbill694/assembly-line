@@ -15,13 +15,8 @@ pub struct NodeWorkspace {
 /// The remote a run publishes node branches to unless configured otherwise.
 pub const DEFAULT_REMOTE: &str = "origin";
 
-#[must_use]
-pub fn run_branch_name(run_id: u64) -> String {
-    format!("al/run-{run_id}")
-}
-
-/// Node branches are flat siblings of the run branch. Git refs are paths, so
-/// `al/run-42` and `al/run-42/node` cannot both exist.
+/// A node's branch name. Git refs are paths, so this must never nest under
+/// another ref assembly-line creates.
 #[must_use]
 pub fn node_branch_name(run_id: u64, node: &str) -> String {
     format!("al/run-{run_id}-{node}")

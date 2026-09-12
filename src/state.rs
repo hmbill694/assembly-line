@@ -67,11 +67,8 @@ impl RunState {
             // catch-all arm, so a new event type is a compile error here
             // instead of a silent omission.
             EventKind::RunStarted { .. }
-            | EventKind::RunBranchCreated { .. }
             | EventKind::NodeCommitted { .. }
-            | EventKind::NodeBranchPublished { .. }
-            | EventKind::NodeMerged { .. }
-            | EventKind::NodeMergeConflicted { .. } => None,
+            | EventKind::NodeBranchPublished { .. } => None,
             EventKind::RunFinished { status } => {
                 self.status = Some(*status);
                 None

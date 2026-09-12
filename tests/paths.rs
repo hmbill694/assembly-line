@@ -81,8 +81,6 @@ fn meta_round_trips() {
         &RunMeta {
             graph: "graphs/a.toml".into(),
             jobs: 3,
-            run_branch: None,
-            base_sha: None,
         },
     )
     .unwrap();
@@ -164,49 +162,15 @@ fn a_worktree_directory_without_a_marker_owns_nothing() {
 }
 
 #[test]
-fn node_and_integration_worktrees_are_siblings() {
-    let tmp = tempfile::tempdir().unwrap();
-    let run = create_run(&runs_root(tmp.path()), 7).unwrap();
-
-    let node = run.node_worktree(tmp.path(), "impl-auth").unwrap();
-    let integration = run.integration_worktree(tmp.path()).unwrap();
-
-    assert_eq!(node.parent(), integration.parent());
-    assert!(node.ends_with("impl-auth"));
-    assert!(integration.ends_with("_integration"));
-}
-
-#[test]
-fn meta_without_a_run_branch_still_deserializes() {
-    // An M1 meta.json has no branch fields; resume must not choke on it.
+fn meta_deserializes_from_a_minimal_document() {
+    // An M1 meta.json carries only these two fields; resume must not choke on
+    // extra fields a hand-edited or newer file might carry either.
     let tmp = tempfile::tempdir().unwrap();
     let run = create_run(&runs_root(tmp.path()), 1).unwrap();
     fs::write(run.meta(), r#"{"graph":"g.toml","jobs":4}"#).unwrap();
 
     let meta = read_meta(&run).unwrap();
     assert_eq!(meta.jobs, 4);
-    assert!(meta.run_branch.is_none());
-    assert!(meta.base_sha.is_none());
-}
-
-#[test]
-fn meta_round_trips_the_run_branch() {
-    let tmp = tempfile::tempdir().unwrap();
-    let run = create_run(&runs_root(tmp.path()), 1).unwrap();
-    write_meta(
-        &run,
-        &RunMeta {
-            graph: "g.toml".into(),
-            jobs: 2,
-            run_branch: Some("al/run-1".into()),
-            base_sha: Some("abc123".into()),
-        },
-    )
-    .unwrap();
-
-    let back = read_meta(&run).unwrap();
-    assert_eq!(back.run_branch.as_deref(), Some("al/run-1"));
-    assert_eq!(back.base_sha.as_deref(), Some("abc123"));
 }
 
 #[test]

@@ -5,7 +5,7 @@ use assembly_line::git::{self, commit_all, head_sha};
 use assembly_line::paths::{create_run, repo_worktrees_root, runs_root};
 use assembly_line::scheduler::{RunOpts, execute};
 use assembly_line::state::{NodeState, RunState};
-use assembly_line::workspace::{self, run_branch_name};
+use assembly_line::workspace::{self, node_branch_name};
 use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
@@ -122,7 +122,34 @@ impl Harness {
 }
 
 #[tokio::test]
-async fn an_agent_node_runs_commits_and_merges_into_the_run_branch() {
+async fn a_node_branches_from_the_repository_head() {
+    let h = Harness::new().await;
+    let base = head_sha(&h.repo).await.unwrap();
+
+    let outcome = h
+        .run(
+            &format!(
+                "{}\n[[task]]\nid = \"impl\"\nprovider = \"fake\"\nprompt = \"go\"\n",
+                provider_block("fake-agent.sh", "one")
+            ),
+            1,
+        )
+        .await;
+
+    assert_eq!(outcome.status, RunStatus::Ok);
+    let branch = format!("al/run-{}-impl", outcome.run_id);
+    let parent = git::run_allowing_failure(&h.repo, &["rev-parse", &format!("{branch}^")])
+        .await
+        .unwrap();
+    assert_eq!(
+        parent.stdout.trim(),
+        base,
+        "branch should sit directly on HEAD"
+    );
+}
+
+#[tokio::test]
+async fn an_agent_node_runs_and_commits_to_its_own_branch() {
     let h = Harness::new().await;
     let base = head_sha(&h.repo).await.unwrap();
     let src = format!(
@@ -136,7 +163,6 @@ async fn an_agent_node_runs_commits_and_merges_into_the_run_branch() {
     assert_eq!(out.status, RunStatus::Ok);
     assert_eq!(out.state.state("impl-auth"), NodeState::Done);
     assert!(out.has(|k| matches!(k, EventKind::NodeCommitted { node, .. } if node == "impl-auth")));
-    assert!(out.has(|k| matches!(k, EventKind::NodeMerged { node, .. } if node == "impl-auth")));
 
     // The user's checkout and branch are untouched.
     assert_eq!(head_sha(&h.repo).await.unwrap(), base);
@@ -147,8 +173,8 @@ async fn an_agent_node_runs_commits_and_merges_into_the_run_branch() {
     assert!(!h.repo.join("agent-output.txt").exists());
     assert!(!git::is_dirty(&h.repo).await.unwrap());
 
-    // The work is on the run branch.
-    let branch = run_branch_name(out.run_id);
+    // The work is on the node's own branch.
+    let branch = node_branch_name(out.run_id, "impl-auth");
     assert!(git::branch_exists(&h.repo, &branch).await.unwrap());
     let listed = git::run_allowing_failure(&h.repo, &["ls-tree", "--name-only", &branch])
         .await
@@ -173,7 +199,7 @@ async fn the_prompt_reaches_the_agent_intact() {
         &h.repo,
         &[
             "show",
-            &format!("{}:agent-output.txt", run_branch_name(out.run_id)),
+            &format!("{}:agent-output.txt", node_branch_name(out.run_id, "n")),
         ],
     )
     .await
@@ -204,8 +230,6 @@ async fn a_failing_agent_preserves_its_work_on_a_branch_and_leaves_no_worktree()
     assert!(
         out.has(|k| matches!(k, EventKind::NodeFailed { reason, .. } if reason.contains("exit 3")))
     );
-    // Preserved, but never merged: failed work does not reach the run branch.
-    assert!(!out.has(|k| matches!(k, EventKind::NodeMerged { .. })));
     assert!(out.has(|k| matches!(k, EventKind::NodeCommitted { node, .. } if node == "broken")));
     assert!(out.has(
         |k| matches!(k, EventKind::NodeBranchPublished { branch, .. } if branch == "al/run-1-broken")
@@ -286,7 +310,7 @@ async fn publishing_without_a_remote_keeps_the_branch_local() {
 }
 
 #[tokio::test]
-async fn an_agent_that_changes_nothing_succeeds_without_a_merge() {
+async fn an_agent_that_changes_nothing_succeeds_without_committing() {
     let h = Harness::new().await;
     let src = format!(
         "{}\n[[task]]\nid = \"n\"\nprovider = \"fake\"\nprompt = \"x\"\n",
@@ -298,62 +322,10 @@ async fn an_agent_that_changes_nothing_succeeds_without_a_merge() {
     assert_eq!(out.status, RunStatus::Ok);
     assert_eq!(out.state.state("n"), NodeState::Done);
     assert!(!out.has(|k| matches!(k, EventKind::NodeCommitted { .. })));
-    assert!(!out.has(|k| matches!(k, EventKind::NodeMerged { .. })));
 }
 
 #[tokio::test]
-async fn a_second_node_sees_the_first_nodes_merged_work() {
-    let h = Harness::new().await;
-    let src = format!(
-        "{}\n\
-         [providers.check]\ncmd = \"bash\"\nargs = [\"-c\", \"test -f agent-output.txt\"]\n\n\
-         [[task]]\nid = \"first\"\nprovider = \"fake\"\nprompt = \"one\"\n\
-         [[task]]\nid = \"second\"\nneeds = [\"first\"]\n\
-         provider = \"check\"\nprompt = \"x\"\n",
-        provider_block("fake-agent.sh", "a")
-    );
-
-    let out = h.run(&src, 1).await;
-
-    assert_eq!(
-        out.state.state("second"),
-        NodeState::Done,
-        "a dependent must run against the merged run branch, not the pristine repo"
-    );
-    assert_eq!(out.status, RunStatus::Ok);
-}
-
-#[tokio::test]
-async fn two_agents_editing_the_same_file_conflict_on_the_second_merge() {
-    let h = Harness::new().await;
-    let src = format!(
-        "[providers.a]\ncmd = \"bash\"\nargs = [\"{script}\", \"{{prompt}}\", \"a\"]\n\
-         [providers.b]\ncmd = \"bash\"\nargs = [\"{script}\", \"{{prompt}}\", \"b\"]\n\
-         [[task]]\nid = \"one\"\nprovider = \"a\"\nprompt = \"x\"\n\
-         [[task]]\nid = \"two\"\nprovider = \"b\"\nprompt = \"y\"\n",
-        script = fixture("conflicting-agent.sh").display()
-    );
-
-    let out = h.run(&src, 2).await;
-
-    assert_eq!(out.status, RunStatus::Partial);
-    assert!(
-        out.has(
-            |k| matches!(k, EventKind::NodeMergeConflicted { paths, .. } if paths.contains(&"shared.txt".to_string()))
-        ),
-        "{:?}",
-        out.events
-    );
-
-    let done = [out.state.state("one"), out.state.state("two")];
-    assert!(
-        done.contains(&NodeState::Done) && done.contains(&NodeState::Failed),
-        "exactly one should land and one should conflict: {done:?}"
-    );
-}
-
-#[tokio::test]
-async fn seeded_files_reach_the_agent_but_never_the_run_branch() {
+async fn seeded_files_reach_the_agent_but_never_its_branch() {
     let h = Harness::new().await;
     std::fs::write(h.repo.join(".env"), "API_KEY=hunter2\n").unwrap();
     let src = format!(
@@ -367,7 +339,12 @@ async fn seeded_files_reach_the_agent_but_never_the_run_branch() {
 
     let listed = git::run_allowing_failure(
         &h.repo,
-        &["ls-tree", "--name-only", "-r", &run_branch_name(out.run_id)],
+        &[
+            "ls-tree",
+            "--name-only",
+            "-r",
+            &node_branch_name(out.run_id, "n"),
+        ],
     )
     .await
     .unwrap()

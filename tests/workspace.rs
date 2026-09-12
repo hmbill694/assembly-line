@@ -1,5 +1,5 @@
 use assembly_line::git::{self, commit_all, head_sha};
-use assembly_line::workspace::{self, StartPoint, node_branch_name, run_branch_name};
+use assembly_line::workspace::{self, StartPoint, node_branch_name};
 use std::path::PathBuf;
 
 struct Fixture {
@@ -40,12 +40,12 @@ impl Fixture {
 }
 
 #[test]
-fn branch_names_are_flat_siblings() {
-    assert_eq!(run_branch_name(42), "al/run-42");
+fn node_branch_name_identifies_the_run_and_the_node() {
     assert_eq!(node_branch_name(42, "impl-auth"), "al/run-42-impl-auth");
-    assert!(
-        !node_branch_name(42, "impl-auth").starts_with(&format!("{}/", run_branch_name(42))),
-        "a node branch must not nest under the run branch; git forbids it"
+    assert_ne!(
+        node_branch_name(42, "impl-auth"),
+        node_branch_name(43, "impl-auth"),
+        "two runs must not share a node's branch name"
     );
 }
 

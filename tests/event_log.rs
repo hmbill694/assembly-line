@@ -130,36 +130,17 @@ fn node_is_reported_for_node_events_only() {
 }
 
 #[test]
-fn merge_events_round_trip_through_the_log() {
+fn a_branch_published_event_round_trips_through_the_log() {
     let mut log = EventLog::new(Vec::new());
-    log.append(EventKind::NodeMergeConflicted {
+    log.append(EventKind::NodeBranchPublished {
         node: "impl-api".into(),
-        paths: vec!["src/routes.rs".into(), "src/lib.rs".into()],
+        branch: "al/run-1-impl-api".into(),
+        pushed_to: Some("origin".into()),
     })
     .unwrap();
 
     let raw = String::from_utf8(log.sink().clone()).unwrap();
     let v: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
-    assert_eq!(v["t"], "node_merge_conflicted");
-    assert_eq!(v["paths"][0], "src/routes.rs");
-}
-
-#[test]
-fn a_run_branch_event_belongs_to_no_node() {
-    assert_eq!(
-        EventKind::RunBranchCreated {
-            branch: "al/run-1".into(),
-            base_sha: "abc".into(),
-        }
-        .node(),
-        None
-    );
-    assert_eq!(
-        EventKind::NodeMerged {
-            node: "a".into(),
-            sha: "abc".into(),
-        }
-        .node(),
-        Some("a")
-    );
+    assert_eq!(v["t"], "node_branch_published");
+    assert_eq!(v["branch"], "al/run-1-impl-api");
 }

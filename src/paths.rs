@@ -24,10 +24,6 @@ pub fn runs_root(git_root: &Path) -> PathBuf {
     git_root.join(".assembly").join("runs")
 }
 
-/// Directory name for the worktree holding the run branch. Task ids may not
-/// start with `_`, so this cannot collide with a node.
-pub const INTEGRATION_WORKTREE: &str = "_integration";
-
 /// File inside a repository's worktree directory naming the repository it
 /// belongs to.
 const REPOSITORY_MARKER: &str = "repo";
@@ -220,13 +216,6 @@ impl RunPaths {
     pub fn node_worktree(&self, repo: &Path, node: &str) -> Option<PathBuf> {
         worktree_root(repo, self.id).map(|root| root.join(node))
     }
-
-    /// Where the run branch is checked out, so merges never target the user's
-    /// own working tree.
-    #[must_use]
-    pub fn integration_worktree(&self, repo: &Path) -> Option<PathBuf> {
-        worktree_root(repo, self.id).map(|root| root.join(INTEGRATION_WORKTREE))
-    }
 }
 
 /// Create the directory layout for a new run.
@@ -265,13 +254,6 @@ pub struct RunMeta {
     /// Path to the graph file, exactly as given on the command line.
     pub graph: PathBuf,
     pub jobs: usize,
-    /// Set once the run creates a branch, which only happens when the graph
-    /// contains at least one agent node. Defaulted so a `meta.json` written
-    /// before branches existed still reads back.
-    #[serde(default)]
-    pub run_branch: Option<String>,
-    #[serde(default)]
-    pub base_sha: Option<String>,
 }
 
 /// # Errors

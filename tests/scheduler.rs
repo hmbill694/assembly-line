@@ -5,7 +5,7 @@ use assembly_line::git::{self, commit_all};
 use assembly_line::paths::{create_run, repo_worktrees_root, runs_root};
 use assembly_line::scheduler::{RunOpts, execute};
 use assembly_line::state::{NodeState, RunState};
-use assembly_line::workspace::{self, run_branch_name};
+use assembly_line::workspace;
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
@@ -29,7 +29,6 @@ impl Drop for Harness {
 struct Outcome {
     status: RunStatus,
     events: Vec<EventKind>,
-    run_id: u64,
 }
 
 impl Harness {
@@ -89,11 +88,7 @@ impl Harness {
             .map(|e| e.kind)
             .collect();
 
-        Outcome {
-            status,
-            events,
-            run_id: paths.id,
-        }
+        Outcome { status, events }
     }
 
     /// Highest concurrency the probe observed.
@@ -134,30 +129,42 @@ fn agent_tasks_with_resource(bodies: &[(&str, &str, &str)]) -> String {
     format!("{RUN_PROVIDER}\n{tasks}")
 }
 
-/// Dependency order is what the scheduler exists to enforce, so it must still
-/// hold once every node is an agent: each node's workspace starts from
-/// whatever the run branch carries when it launches, which is only ever what
-/// finished before it.
+/// Dependency order is what the scheduler exists to enforce, and it must still
+/// hold once every node branches independently from the same base: a
+/// dependent must not be launched until everything it needs has finished.
 #[tokio::test]
 async fn runs_a_linear_chain_in_order() {
     let h = Harness::new().await;
     let src = format!(
         "{RUN_PROVIDER}\n\
-         [[task]]\nid = \"one\"\nprovider = \"run\"\nprompt = \"printf 'one\\\\n' >> order.txt\"\n\
-         [[task]]\nid = \"two\"\nneeds = [\"one\"]\nprovider = \"run\"\nprompt = \"printf 'two\\\\n' >> order.txt\"\n\
-         [[task]]\nid = \"three\"\nneeds = [\"two\"]\nprovider = \"run\"\nprompt = \"printf 'three\\\\n' >> order.txt\"\n"
+         [[task]]\nid = \"one\"\nprovider = \"run\"\nprompt = \"true\"\n\
+         [[task]]\nid = \"two\"\nneeds = [\"one\"]\nprovider = \"run\"\nprompt = \"true\"\n\
+         [[task]]\nid = \"three\"\nneeds = [\"two\"]\nprovider = \"run\"\nprompt = \"true\"\n"
     );
     let out = h.run(&src, 4).await;
 
     assert_eq!(out.status, RunStatus::Ok);
-    let branch = run_branch_name(out.run_id);
-    let content = git::run_allowing_failure(&h.repo, &["show", &format!("{branch}:order.txt")])
-        .await
-        .unwrap()
-        .stdout;
-    assert_eq!(
-        content.lines().collect::<Vec<_>>(),
-        vec!["one", "two", "three"]
+
+    let started = |node: &'static str| {
+        out.events
+            .iter()
+            .position(|k| matches!(k, EventKind::NodeStarted { node: n, .. } if n == node))
+            .unwrap_or_else(|| panic!("'{node}' never started"))
+    };
+    let finished = |node: &'static str| {
+        out.events
+            .iter()
+            .position(|k| matches!(k, EventKind::NodeFinished { node: n, .. } if n == node))
+            .unwrap_or_else(|| panic!("'{node}' never finished"))
+    };
+
+    assert!(
+        finished("one") < started("two"),
+        "'two' must not start before 'one' finished"
+    );
+    assert!(
+        finished("two") < started("three"),
+        "'three' must not start before 'two' finished"
     );
 }
 
