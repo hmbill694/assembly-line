@@ -165,9 +165,6 @@ pub enum DeliveryMode {
 pub struct Delivery {
     #[serde(default)]
     pub mode: DeliveryMode,
-    /// What the work lands on. Defaults to the branch the job was cut from —
-    /// never an assumed `main`.
-    pub base: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -176,9 +173,6 @@ pub struct Provider {
     pub cmd: String,
     #[serde(default)]
     pub args: Vec<String>,
-    /// Optional enrichment wrapper emitting assembly-line NDJSON. Unused so
-    /// far; declared so a repository can name one without being rejected.
-    pub adapter: Option<String>,
 }
 
 /// Parse a human-written duration such as `"20m"` or `"1h 30m"`.

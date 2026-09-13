@@ -5,7 +5,7 @@ use assembly_line::paths::{JobMeta, JobPaths};
 use assembly_line::report::JobReport;
 use assembly_line::scheduler::{JobSpec, Revision, RunOpts, revise_job, run_job};
 use assembly_line::state::JobState;
-use assembly_line::{config, gc, paths};
+use assembly_line::{config, delivery, gc, paths};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -220,7 +220,8 @@ async fn start_new_job(
     match outcome {
         Err(e) => fail_with_usage_error(e),
         Ok(job_failed) => {
-            report_and_record_branch(&paths, meta);
+            let meta = report_and_record_branch(&paths, meta);
+            deliver_if_verified(&repo, &config, &meta, job_failed).await;
             println!("state: {}", paths.dir.display());
             exit_code_for(job_failed)
         }
@@ -282,19 +283,57 @@ fn events_of(paths: &JobPaths) -> Result<Vec<Event>, String> {
 
 /// Print what the job's own log says became of it, and record the branch it
 /// left in `meta.json` so `revise` and delivery can find it by id alone.
-fn report_and_record_branch(paths: &JobPaths, meta: JobMeta) {
-    let Ok(events) = events_of(paths) else { return };
+///
+/// Returns the meta as recorded, branch included, so the caller can hand it
+/// straight to delivery without re-reading what was just written.
+fn report_and_record_branch(paths: &JobPaths, meta: JobMeta) -> JobMeta {
+    let Ok(events) = events_of(paths) else {
+        return meta;
+    };
     let report = JobReport::from_events(paths.id, &events);
     println!("{}", report.to_summary_line());
 
-    if let Some(branch) = report.branch {
-        let _ = paths::write_meta(
-            paths,
-            &JobMeta {
+    match report.branch {
+        Some(branch) => {
+            let meta = JobMeta {
                 branch: Some(branch),
                 ..meta
-            },
-        );
+            };
+            let _ = paths::write_meta(paths, &meta);
+            meta
+        }
+        None => meta,
+    }
+}
+
+/// Hand a finished job's branch on, once `verify` accepted it.
+///
+/// A failed job still leaves a real branch, but opening a pull request for
+/// work that did not pass is noise — the branch name is printed instead, so
+/// acting on it stays a decision rather than a default.
+async fn deliver_if_verified(repo: &Path, config: &RepoConfig, meta: &JobMeta, failed: bool) {
+    let Some(branch) = &meta.branch else {
+        return; // The agent changed nothing, so there is nothing to deliver.
+    };
+
+    if failed {
+        println!("branch: {branch} (not delivered — the job did not pass)");
+        return;
+    }
+
+    let base = config.base.clone().unwrap_or_else(|| meta.base_ref.clone());
+
+    match delivery::deliver(
+        repo,
+        &config.delivery,
+        assembly_line::workspace::DEFAULT_REMOTE,
+        branch,
+        &base,
+    )
+    .await
+    {
+        Ok(outcome) => println!("{outcome}"),
+        Err(e) => eprintln!("warn: delivering {branch}: {e}"),
     }
 }
 
@@ -378,7 +417,7 @@ async fn revise_existing_job(job_id: u64, feedback: String, repo: Option<PathBuf
     let round = rounds_so_far(&events) + 1;
     println!("revising job {job_id} (round {round})");
 
-    let opts = machine_opts(&meta.repo.clone());
+    let opts = machine_opts(&meta.repo);
     let revision = Revision {
         feedback: &feedback,
         round,
@@ -390,7 +429,8 @@ async fn revise_existing_job(job_id: u64, feedback: String, repo: Option<PathBuf
     {
         Err(e) => fail_with_usage_error(e),
         Ok(job_failed) => {
-            report_and_record_branch(&paths, meta);
+            let meta = report_and_record_branch(&paths, meta);
+            deliver_if_verified(&meta.repo, &config, &meta, job_failed).await;
             exit_code_for(job_failed)
         }
     }

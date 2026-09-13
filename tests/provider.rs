@@ -5,7 +5,6 @@ fn provider(cmd: &str, args: &[&str]) -> Provider {
     Provider {
         cmd: cmd.to_string(),
         args: args.iter().map(|a| (*a).to_string()).collect(),
-        adapter: None,
     }
 }
 

@@ -1,7 +1,12 @@
 use assembly_line::config::{Delivery, DeliveryMode, RepoConfig};
 use assembly_line::delivery::{Delivered, deliver};
 use assembly_line::git::{self, commit_all, head_sha};
+use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
+use predicates::str::contains;
 use std::path::PathBuf;
+
+mod support;
 
 /// A repository with one commit, and optionally a bare sibling as `origin`.
 /// No network, no credentials, no `gh`.
@@ -66,7 +71,7 @@ impl Fixture {
 }
 
 fn mode(mode: DeliveryMode) -> Delivery {
-    Delivery { mode, base: None }
+    Delivery { mode }
 }
 
 #[tokio::test]
@@ -178,15 +183,136 @@ fn delivery_defaults_to_a_pull_request_and_the_branch_you_started_from() {
 
     assert_eq!(config.delivery.mode, DeliveryMode::Pr);
     assert_eq!(
-        config.delivery.base, None,
+        config.base, None,
         "an unset base means the branch the job started from, never an assumed main"
     );
 }
 
 #[test]
 fn delivery_is_configurable_from_the_repositorys_own_config() {
-    let config = RepoConfig::parse("[delivery]\nmode = \"none\"\nbase = \"develop\"\n").unwrap();
+    let config = RepoConfig::parse("base = \"develop\"\n[delivery]\nmode = \"none\"\n").unwrap();
 
     assert_eq!(config.delivery.mode, DeliveryMode::None);
-    assert_eq!(config.delivery.base.as_deref(), Some("develop"));
+    assert_eq!(config.base.as_deref(), Some("develop"));
+}
+
+// The line below prints only from `src/main.rs`, once a job's outcome is
+// known — the library's `Harness` has no stdout to assert on — so this one
+// test drives the real binary, the way `tests/cli.rs` does.
+
+/// Where this test's worktrees go, kept out of the shared `$HOME` default so
+/// a leftover cannot confuse another test's `gc`.
+fn worktree_root_for(tmp: &tempfile::TempDir) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "assembly-test-wt-{}",
+        tmp.path().file_name().unwrap().to_string_lossy()
+    ))
+}
+
+fn assembly(tmp: &tempfile::TempDir) -> Command {
+    let mut cmd = Command::cargo_bin("assembly").unwrap();
+    cmd.current_dir(tmp.path());
+    cmd.env(
+        assembly_line::paths::WORKTREE_ROOT_VAR,
+        worktree_root_for(tmp),
+    );
+    cmd
+}
+
+fn discard_worktrees(tmp: &tempfile::TempDir) {
+    let _ = std::fs::remove_dir_all(worktree_root_for(tmp));
+}
+
+/// A repository opted in with `verify` set to `verify`, running the given
+/// fixture script.
+async fn repo_running(script: &str, verify: &str) -> tempfile::TempDir {
+    let tmp = support::repo_with_initial_commit().await;
+    std::fs::create_dir_all(tmp.path().join(".assembly")).unwrap();
+    std::fs::write(
+        tmp.path().join(assembly_line::config::REPO_CONFIG_PATH),
+        format!("verify = \"{verify}\"\n{}", support::config_running(script)),
+    )
+    .unwrap();
+    commit_all(tmp.path(), "opt in").await.unwrap().unwrap();
+    tmp
+}
+
+/// A bare sibling repository added as `origin`, so a real delivery would have
+/// somewhere to push to. No network, no credentials.
+async fn add_origin(tmp: &tempfile::TempDir) {
+    let origin = tmp.path().join("origin.git");
+    let arg = origin.to_string_lossy().into_owned();
+    for args in [
+        vec!["init", "--bare", "--initial-branch=main", &arg],
+        vec!["remote", "add", "origin", &arg],
+    ] {
+        let out = git::run_allowing_failure(tmp.path(), &args).await.unwrap();
+        assert!(out.succeeded(), "git {args:?}: {}", out.stderr);
+    }
+    git::push_branch(tmp.path(), "origin", "main")
+        .await
+        .unwrap();
+}
+
+/// The gate this task implements: a job's branch is real work either way, but
+/// a pull request for work that failed `verify` is noise. If delivery were
+/// not gated on `failed`, this job's branch would reach `deliver` in `Pr`
+/// mode; with no `gh` on the test machine, that prints "pushed ... no pull
+/// request opened", never "not delivered" — so this assertion only passes
+/// when the gate is in place.
+#[tokio::test]
+async fn a_failed_job_is_not_delivered() {
+    let tmp = repo_running("fake-agent.sh", "exit 1").await;
+    add_origin(&tmp).await;
+
+    assembly(&tmp)
+        .args(["run", "--prompt", "write a file"])
+        .assert()
+        .code(1)
+        .stdout(contains("not delivered"));
+
+    discard_worktrees(&tmp);
+}
+
+/// The gate above is wired into `run`, but `revise` has its own call site
+/// (`src/main.rs`'s `revise_existing_job`) which nothing else exercises — a
+/// regression that dropped it would pass the whole suite. A passing revise
+/// round must deliver just as a passing `run` does.
+///
+/// The assertion has to hold whether or not `gh` is installed on the test
+/// machine, so it checks two things that are true either way: the printed
+/// line is never "not delivered" (that only happens when the gate skips
+/// delivery), and — decisively — the round's branch actually reached the
+/// bare `origin`, which only happens once `deliver` runs.
+#[tokio::test]
+async fn a_passing_revise_round_is_delivered() {
+    let tmp = repo_running("revising-agent.sh", "true").await;
+    add_origin(&tmp).await;
+
+    assembly(&tmp)
+        .args(["run", "--prompt", "hi"])
+        .assert()
+        .success();
+
+    assembly(&tmp)
+        .args(["revise", "1", "add error handling"])
+        .assert()
+        .success()
+        .stdout(contains("round 2"))
+        .stdout(contains("pushed").or(contains("opened")));
+
+    let local = git::run_allowing_failure(tmp.path(), &["rev-parse", "al/job-1"])
+        .await
+        .unwrap();
+    let on_remote =
+        git::run_allowing_failure(&tmp.path().join("origin.git"), &["rev-parse", "al/job-1"])
+            .await
+            .unwrap();
+    assert_eq!(
+        on_remote.stdout.trim(),
+        local.stdout.trim(),
+        "revise's branch never reached the remote — delivery is not wired into revise"
+    );
+
+    discard_worktrees(&tmp);
 }
