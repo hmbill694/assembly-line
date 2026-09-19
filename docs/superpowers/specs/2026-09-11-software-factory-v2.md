@@ -403,7 +403,7 @@ real-agent smoke tests.
 
 | | Scope |
 |---|---|
-| **F1** | Subtraction. Delete the DAG, run branch, merge, shell nodes, graph loading, review inbox. `assembly run --repo --ref --prompt` is a single job. `verify` enforced. `.assembly/config.toml`. |
+| **F1** ✅ | Subtraction. Delete the DAG, run branch, merge, shell nodes, graph loading, review inbox. `assembly run --repo --ref --prompt` is a single job. `verify` enforced. `.assembly/config.toml`. |
 | **F2** | The runner seam. One trait; local, `docker run`, and k8s Job implementors. NDJSON on stdout. Daemon-injected per-job credentials. |
 | **F3** | The daemon. Long-lived process, fold across all jobs, job state under its own root, CLI driving it. |
 | **F4** | Sources and the watcher. Source trait; GitHub issues and Slack. Claim-by-ref, ordering, fairness, dispatch, pull request delivery. |

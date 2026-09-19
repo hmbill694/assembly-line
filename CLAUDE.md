@@ -1,10 +1,11 @@
 # assembly-line
 
-A Rust CLI that executes a DAG of tasks — shell commands and coding-agent
-sessions — in parallel, supervised or unsupervised.
+A Rust CLI that runs one coding-agent job — a repo, a ref, and a prompt — as a
+branch, decides whether it succeeded with `verify`, and opens a pull request
+when it did.
 
-- Design decisions: `docs/superpowers/specs/2026-08-15-assembly-line.md`
-- Current milestone: `docs/superpowers/plans/2026-08-15-assembly-line-m2.md`
+- Design decisions: `docs/superpowers/specs/2026-09-11-software-factory-v2.md`
+- Current milestone: `docs/superpowers/plans/2026-09-11-software-factory-f1.md`
 
 ## Toolchain
 
@@ -84,19 +85,25 @@ state, and `std::iter::successors` for "keep going until" sequences.
 ```rust
 // no
 let mut out = Vec::new();
-for t in tasks {
-    if t.kind == TaskKind::Agent {
-        out.push(t.id.clone());
+for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+    if let Some(id) = entry.file_name().to_str().and_then(|s| s.parse::<u64>().ok()) {
+        out.push((id, entry.path()));
     }
 }
 
 // yes
-let out: Vec<String> = tasks
-    .iter()
-    .filter(|t| t.kind == TaskKind::Agent)
-    .map(|t| t.id.clone())
-    .collect();
+std::fs::read_dir(dir)
+    .into_iter()
+    .flatten()
+    .flatten()
+    .filter_map(|entry| {
+        let id = entry.file_name().to_str()?.parse::<u64>().ok()?;
+        Some((id, entry.path()))
+    })
+    .collect()
 ```
+
+(`src/gc.rs`'s `job_directories`.)
 
 ### Prefer pattern matching to if-else chains
 
@@ -106,21 +113,25 @@ arm usually means the tuple should have been wider.
 
 ```rust
 // no
-if t.kind == TaskKind::Shell && t.run.is_none() {
-    Some(ShellMissingRun(t.id.clone()))
-} else if t.kind == TaskKind::Agent && t.prompt.is_none() {
-    Some(AgentMissingPrompt(t.id.clone()))
+if let Some(text) = prompt {
+    Ok(text)
+} else if let Some(path) = prompt_file {
+    std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))
 } else {
-    None
+    Err("a job needs --prompt or --prompt-file".into())
 }
 
 // yes
-match (t.kind, &t.run, &t.prompt) {
-    (TaskKind::Shell, None, _) => Some(ShellMissingRun(t.id.clone())),
-    (TaskKind::Agent, _, None) => Some(AgentMissingPrompt(t.id.clone())),
-    _ => None,
+match (prompt, prompt_file) {
+    (Some(text), _) => Ok(text),
+    (None, Some(path)) => {
+        std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))
+    }
+    (None, None) => Err("a job needs --prompt or --prompt-file".into()),
 }
 ```
+
+(`src/main.rs`'s `prompt_text`.)
 
 ### Build values, don't mutate them
 

@@ -1,5 +1,7 @@
 # Software Factory F1 Implementation Plan — subtraction
 
+**Status:** shipped 2026-09-18
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Reduce assembly-line from a DAG engine to a single-job executor —
@@ -1307,7 +1309,8 @@ work that does not build — not publication.
 **Interfaces:**
 - Consumes: Task 5's `run_job`, `JobState`, `EventKind`.
 - Produces: `EventKind::JobVerifyFailed { output: String }`, appended before
-  `JobFailed` when `verify` exits non-zero.
+  `JobFailed` when `verify` exits non-zero. (Shipped as
+  `JobVerifyFailed { reason: String }` — see Step 3.)
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1370,6 +1373,8 @@ In `src/event.rs`:
     /// so a reader can tell a rejected job from one whose agent crashed.
     JobVerifyFailed { output: String },
 ```
+
+(The field shipped as `reason: String`, not `output` — see `src/event.rs`.)
 
 Add it to the progress-marker arm in `JobState::apply` — the transition to
 `Failed` comes from the `JobFailed` that follows it — and to the exhaustive

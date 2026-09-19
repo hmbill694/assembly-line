@@ -85,6 +85,36 @@ verify-stack:
 
     exit $failed
 
+# Run one job end to end against a throwaway repo, to see real output.
+#
+# The repo, its opt-in config, and the job state it produces are all thrown
+# away with it — this never touches the repo you're standing in.
+demo:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --quiet
+    bin="$CARGO_TARGET_DIR/debug/assembly"
+    fake="$PWD/tests/fixtures/fake-agent.sh"
+    dir=$(mktemp -d)
+    cd "$dir"
+    git init -q --initial-branch=main .
+    git config user.email t@e.com && git config user.name T
+    git config commit.gpgsign false
+    mkdir -p .assembly
+    cat > .assembly/config.toml <<EOF
+    provider = "fake"
+    verify = "git show --name-only --format= HEAD | grep -q agent-output.txt"
+
+    [providers.fake]
+    cmd = "bash"
+    args = ["$fake", "{prompt}", "demo"]
+    EOF
+    git add -A && git commit -qm "opt in to the factory"
+    "$bin" run --prompt "make a change" || true
+    echo
+    "$bin" status
+    echo "demo job left in $dir"
+
 # Prune build artifacts and the out-of-repo target directory.
 clean:
     cargo clean || true
