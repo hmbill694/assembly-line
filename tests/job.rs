@@ -33,24 +33,6 @@ async fn a_job_leaves_one_branch_carrying_its_work() {
     );
 }
 
-#[tokio::test]
-async fn a_job_branches_from_the_ref_it_was_cut_from() {
-    let h = Harness::new().await;
-    let base = head_sha(&h.repo).await.unwrap();
-
-    let outcome = h.run_job("go").await;
-
-    let branch = job_branch_name(outcome.job_id);
-    let parent = git::run_allowing_failure(&h.repo, &["rev-parse", &format!("{branch}^")])
-        .await
-        .unwrap();
-    assert_eq!(
-        parent.stdout.trim(),
-        base,
-        "the branch should sit directly on the ref the job named"
-    );
-}
-
 /// A job is cut from the ref it names, not from whatever happens to be
 /// checked out when it starts.
 #[tokio::test]
@@ -163,7 +145,8 @@ async fn a_job_leaves_the_target_repositorys_working_tree_untouched() {
 async fn the_prompt_reaches_the_agent_intact() {
     let h = Harness::new().await;
 
-    let outcome = h.run_job("quotes \" and $HOME and ; semicolons").await;
+    let prompt = "quotes \" and $HOME and ; semicolons";
+    let outcome = h.run_job(prompt).await;
 
     let content = git::run_allowing_failure(
         &h.repo,
@@ -175,11 +158,9 @@ async fn the_prompt_reaches_the_agent_intact() {
     .await
     .unwrap()
     .stdout;
-    assert!(
-        content.contains("$HOME"),
-        "the shell expanded the prompt: {content}"
-    );
-    assert!(content.contains("; semicolons"), "{content}");
+    // Equality, not `contains`: the quote is a hazard too, and a `contains`
+    // pair would pass with it stripped.
+    assert_eq!(content.trim_end_matches('\n'), prompt);
 }
 
 /// A half-finished failure is exactly the case where the diff is worth

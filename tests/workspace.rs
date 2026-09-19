@@ -21,8 +21,8 @@ impl Fixture {
 
         for args in [
             vec!["init", "--initial-branch=main"],
-            vec!["config", "user.email", "t@e.com"],
-            vec!["config", "user.name", "T"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
             vec!["config", "commit.gpgsign", "false"],
         ] {
             git::run_allowing_failure(&repo, &args).await.unwrap();
@@ -65,10 +65,14 @@ async fn creating_a_workspace_checks_out_the_base_commit() {
     .await
     .unwrap();
 
+    assert_eq!(
+        head_sha(&ws.path).await.unwrap(),
+        base,
+        "the checkout should start at the commit it was given"
+    );
     assert!(ws.path.join("README.md").is_file());
     assert_eq!(ws.branch, "al/job-1");
     assert!(ws.seeded.is_empty());
-    assert!(!fx.repo.join("should-not-exist").exists());
 }
 
 #[tokio::test]

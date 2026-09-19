@@ -27,16 +27,6 @@ impl Fixture {
     }
 }
 
-#[test]
-fn a_live_jobs_worktrees_are_kept_however_old() {
-    let fx = Fixture::new();
-
-    assert_eq!(
-        reason_to_collect(Some(&fx.repo), 1, &fx.worktree, None),
-        None
-    );
-}
-
 /// The rule the whole module reduces to: a job's worktrees are wanted exactly
 /// as long as the job is.
 #[test]

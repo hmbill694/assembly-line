@@ -46,8 +46,8 @@ async fn init_git_repo(at: &Path) {
     std::fs::create_dir_all(at).unwrap();
     for args in [
         vec!["init", "--initial-branch=main"],
-        vec!["config", "user.email", "t@e.com"],
-        vec!["config", "user.name", "T"],
+        vec!["config", "user.email", "test@example.com"],
+        vec!["config", "user.name", "Test"],
         vec!["config", "commit.gpgsign", "false"],
     ] {
         let out = git::run_allowing_failure(at, &args).await.unwrap();

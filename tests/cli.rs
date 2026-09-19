@@ -340,10 +340,9 @@ async fn a_revise_round_continues_the_branch_instead_of_starting_over() {
     let count: usize = git(&tmp, &["rev-list", "--count", "al/job-1"])
         .parse()
         .unwrap();
-    assert!(
-        count >= 3,
-        "expected base + two rounds, got {count} commits"
-    );
+    // README, the opt-in commit, then one per round. Three would mean round 2
+    // cut a fresh branch off the base instead of continuing round 1's.
+    assert_eq!(count, 4, "expected base + two rounds");
 
     let body = git(&tmp, &["show", "al/job-1:rounds.txt"]);
     assert!(

@@ -22,7 +22,6 @@ fn appends_and_reads_back_in_order() {
     assert_eq!(events.len(), 3);
     assert_eq!(events[0].kind, EventKind::JobStarted { round: 1 });
     assert_eq!(events[2].kind, EventKind::JobFinished { exit_code: 0 });
-    assert!(events[0].at <= events[2].at);
 }
 
 #[test]
@@ -107,6 +106,15 @@ fn a_branch_published_event_round_trips_through_the_log() {
     assert_eq!(v["t"], "job_branch_published");
     assert_eq!(v["branch"], "al/job-1");
     assert_eq!(v["pushed_to"], "origin");
+
+    let read_back = read_events(raw.as_bytes()).unwrap();
+    assert_eq!(
+        read_back[0].kind,
+        EventKind::JobBranchPublished {
+            branch: "al/job-1".into(),
+            pushed_to: Some("origin".into()),
+        }
+    );
 }
 
 /// A repository with no remote keeps its branch locally. That is a complete

@@ -156,8 +156,10 @@ fn two_repositories_on_the_same_job_id_do_not_share_a_worktree_root() {
 fn a_repo_slug_names_the_repository_and_still_separates_same_named_ones() {
     let slug = repo_slug(Path::new("/work/my-repo"));
 
-    assert!(slug.starts_with("my-repo-"), "{slug}");
-    assert_eq!(slug, repo_slug(Path::new("/work/my-repo")), "not stable");
+    // The digest is pinned, not merely recomputed: a slug that moves orphans
+    // every job already on disk, and calling the same pure function twice in
+    // one process cannot notice that.
+    assert_eq!(slug, "my-repo-a4d82cedfd38e369");
     assert_ne!(
         slug,
         repo_slug(Path::new("/elsewhere/my-repo")),

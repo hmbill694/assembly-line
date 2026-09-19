@@ -34,8 +34,6 @@ fn an_empty_config_is_valid_and_declares_nothing() {
     let config = RepoConfig::parse("").unwrap();
 
     assert_eq!(config, RepoConfig::default());
-    assert!(config.copy.is_empty());
-    assert!(config.providers.is_empty());
 }
 
 #[test]

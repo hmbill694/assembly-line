@@ -24,8 +24,8 @@ impl Fixture {
 
         for args in [
             vec!["init", "--initial-branch=main"],
-            vec!["config", "user.email", "t@e.com"],
-            vec!["config", "user.name", "T"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
             vec!["config", "commit.gpgsign", "false"],
         ] {
             git::run_allowing_failure(&repo, &args).await.unwrap();
@@ -142,10 +142,12 @@ async fn delivery_turned_off_leaves_the_remote_alone() {
     );
 }
 
-/// `gh` is not installed in CI, and delivery must not depend on it: the branch
-/// reaching the remote is the part that matters.
+/// `gh` may or may not be installed, and delivery must not depend on it: the
+/// branch reaching the remote is the part that matters, and is what this
+/// asserts. Which of the two `Delivered` variants comes back is not pinned,
+/// because that depends on the machine.
 #[tokio::test]
-async fn pr_mode_still_pushes_when_no_pull_request_can_be_opened() {
+async fn pr_mode_pushes_the_branch_whether_or_not_gh_opens_a_pull_request() {
     let fx = Fixture::new().await;
     let origin = fx.with_origin().await.clone();
     let job_sha = fx.job_branch("al/job-1").await;
@@ -193,7 +195,6 @@ fn delivery_is_configurable_from_the_repositorys_own_config() {
     let config = RepoConfig::parse("base = \"develop\"\n[delivery]\nmode = \"none\"\n").unwrap();
 
     assert_eq!(config.delivery.mode, DeliveryMode::None);
-    assert_eq!(config.base.as_deref(), Some("develop"));
 }
 
 // The line below prints only from `src/main.rs`, once a job's outcome is

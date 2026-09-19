@@ -247,11 +247,19 @@ async fn a_secret_committed_by_the_agent_fails_the_job() {
 #[tokio::test]
 async fn a_failed_git_command_carries_gits_own_message() {
     let fx = Fixture::new().await;
-    let err = head_sha(fx.repo.join("does-not-exist"))
+
+    // A ref git itself rejects, so the error is git's stderr rather than a
+    // spawn failure — which would never reach `stdout_or_error` at all.
+    let err = git::sha_at_ref(&fx.repo, "no-such-ref")
         .await
         .unwrap_err()
         .to_string();
-    assert!(!err.is_empty());
+
+    assert!(err.contains("no-such-ref"), "{err}");
+    assert!(
+        err.contains("unknown revision") || err.contains("Needed a single revision"),
+        "not git's own message: {err}"
+    );
 }
 
 #[tokio::test]
