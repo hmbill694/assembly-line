@@ -1,6 +1,8 @@
-use assembly_line::git::{self, commit_all, head_sha};
+use assembly_line::git::{self, head_sha};
 use assembly_line::workspace::{self, StartPoint, job_branch_name};
 use std::path::PathBuf;
+
+mod support;
 
 struct Fixture {
     _tmp: tempfile::TempDir,
@@ -15,20 +17,9 @@ impl Fixture {
         let repo = tmp.path().join("repo");
         let seed = tmp.path().join("seed");
         let wt_root = tmp.path().join("wt");
-        std::fs::create_dir_all(&repo).unwrap();
         std::fs::create_dir_all(&seed).unwrap();
         std::fs::create_dir_all(&wt_root).unwrap();
-
-        for args in [
-            vec!["init", "--initial-branch=main"],
-            vec!["config", "user.email", "test@example.com"],
-            vec!["config", "user.name", "Test"],
-            vec!["config", "commit.gpgsign", "false"],
-        ] {
-            git::run_allowing_failure(&repo, &args).await.unwrap();
-        }
-        std::fs::write(repo.join("README.md"), "base\n").unwrap();
-        commit_all(&repo, "initial").await.unwrap().unwrap();
+        support::init_git_repo(&repo).await;
 
         Fixture {
             _tmp: tmp,

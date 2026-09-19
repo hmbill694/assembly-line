@@ -4,6 +4,8 @@ use assembly_line::git::{
 };
 use std::path::{Path, PathBuf};
 
+mod support;
+
 /// A repository with one commit, plus a sibling directory for worktrees.
 ///
 /// Both live under one tempdir so parallel tests never collide — worktrees
@@ -19,24 +21,8 @@ impl Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let worktrees = tmp.path().join("wt");
-        std::fs::create_dir_all(&repo).unwrap();
         std::fs::create_dir_all(&worktrees).unwrap();
-
-        for args in [
-            vec!["init", "--initial-branch=main"],
-            vec!["config", "user.email", "test@example.com"],
-            vec!["config", "user.name", "Test"],
-            vec!["config", "commit.gpgsign", "false"],
-        ] {
-            let out = git::run_allowing_failure(&repo, &args).await.unwrap();
-            assert!(out.succeeded(), "git {args:?} failed: {}", out.stderr);
-        }
-
-        std::fs::write(repo.join("README.md"), "base\n").unwrap();
-        commit_all(&repo, "initial")
-            .await
-            .unwrap()
-            .expect("a commit");
+        support::init_git_repo(&repo).await;
 
         Fixture {
             _tmp: tmp,
@@ -49,19 +35,9 @@ impl Fixture {
         head_sha(&self.repo).await.unwrap()
     }
 
-    /// Add a bare repository as `origin`. A push then exercises the real git
-    /// path with no network and no credentials.
     async fn with_origin(&self) -> PathBuf {
         let origin = self.repo.parent().expect("a parent").join("origin.git");
-        let origin_arg = origin.to_string_lossy().into_owned();
-
-        for args in [
-            vec!["init", "--bare", "--initial-branch=main", &origin_arg],
-            vec!["remote", "add", "origin", &origin_arg],
-        ] {
-            let out = git::run_allowing_failure(&self.repo, &args).await.unwrap();
-            assert!(out.succeeded(), "git {args:?} failed: {}", out.stderr);
-        }
+        support::add_origin(&self.repo, &origin).await;
         origin
     }
 

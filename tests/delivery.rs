@@ -20,18 +20,7 @@ impl Fixture {
     async fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-
-        for args in [
-            vec!["init", "--initial-branch=main"],
-            vec!["config", "user.email", "test@example.com"],
-            vec!["config", "user.name", "Test"],
-            vec!["config", "commit.gpgsign", "false"],
-        ] {
-            git::run_allowing_failure(&repo, &args).await.unwrap();
-        }
-        std::fs::write(repo.join("README.md"), "base\n").unwrap();
-        commit_all(&repo, "initial").await.unwrap().unwrap();
+        support::init_git_repo(&repo).await;
 
         Fixture {
             origin: tmp.path().join("origin.git"),
@@ -41,14 +30,7 @@ impl Fixture {
     }
 
     async fn with_origin(&self) -> &PathBuf {
-        let arg = self.origin.to_string_lossy().into_owned();
-        for args in [
-            vec!["init", "--bare", "--initial-branch=main", &arg],
-            vec!["remote", "add", "origin", &arg],
-        ] {
-            let out = git::run_allowing_failure(&self.repo, &args).await.unwrap();
-            assert!(out.succeeded(), "git {args:?}: {}", out.stderr);
-        }
+        support::add_origin(&self.repo, &self.origin).await;
         // The base has to exist on the remote before anything can land on it.
         git::push_branch(&self.repo, "origin", "main")
             .await
@@ -256,17 +238,9 @@ async fn repo_running_with_base(script: &str, verify: &str, base: &str) -> tempf
 }
 
 /// A bare sibling repository added as `origin`, so a real delivery would have
-/// somewhere to push to. No network, no credentials.
+/// somewhere to push to.
 async fn add_origin(tmp: &tempfile::TempDir) {
-    let origin = tmp.path().join("origin.git");
-    let arg = origin.to_string_lossy().into_owned();
-    for args in [
-        vec!["init", "--bare", "--initial-branch=main", &arg],
-        vec!["remote", "add", "origin", &arg],
-    ] {
-        let out = git::run_allowing_failure(tmp.path(), &args).await.unwrap();
-        assert!(out.succeeded(), "git {args:?}: {}", out.stderr);
-    }
+    support::add_origin(tmp.path(), &tmp.path().join("origin.git")).await;
     git::push_branch(tmp.path(), "origin", "main")
         .await
         .unwrap();

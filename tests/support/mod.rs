@@ -41,8 +41,8 @@ pub fn config_running(script: &str) -> String {
 }
 
 /// Turn `at` into a git repository with one commit, so a job has somewhere to
-/// branch from.
-async fn init_git_repo(at: &Path) {
+/// branch from. The one definition of "a git repo with a commit in it".
+pub async fn init_git_repo(at: &Path) {
     std::fs::create_dir_all(at).unwrap();
     for args in [
         vec!["init", "--initial-branch=main"],
@@ -55,6 +55,20 @@ async fn init_git_repo(at: &Path) {
     }
     std::fs::write(at.join("README.md"), "base\n").unwrap();
     commit_all(at, "initial").await.unwrap().unwrap();
+}
+
+/// Add a bare repository at `origin` as `repo`'s `origin` remote, so a push
+/// exercises the real git path with no network and no credentials.
+pub async fn add_origin(repo: &Path, origin: &Path) {
+    let origin_arg = origin.to_string_lossy().into_owned();
+
+    for args in [
+        vec!["init", "--bare", "--initial-branch=main", &origin_arg],
+        vec!["remote", "add", "origin", &origin_arg],
+    ] {
+        let out = git::run_allowing_failure(repo, &args).await.unwrap();
+        assert!(out.succeeded(), "git {args:?} failed: {}", out.stderr);
+    }
 }
 
 /// A bare repository with one commit, and nothing else. The tempdir *is* the
@@ -105,19 +119,9 @@ impl Harness {
         Harness { tmp, repo }
     }
 
-    /// Add a bare repository as `origin`, so a publish exercises a real push
-    /// with no network and no credentials.
     pub async fn with_origin(&self) -> PathBuf {
         let origin = self.tmp.path().join("origin.git");
-        let origin_arg = origin.to_string_lossy().into_owned();
-
-        for args in [
-            vec!["init", "--bare", "--initial-branch=main", &origin_arg],
-            vec!["remote", "add", "origin", &origin_arg],
-        ] {
-            let out = git::run_allowing_failure(&self.repo, &args).await.unwrap();
-            assert!(out.succeeded(), "git {args:?} failed: {}", out.stderr);
-        }
+        add_origin(&self.repo, &origin).await;
         origin
     }
 
