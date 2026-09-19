@@ -142,28 +142,35 @@ a mutable binding and filling it in. `let ... else` for early exits;
 ### Functions return values, not side effects
 
 A function that both computes and writes is two functions. Keep the pure part
-separately testable — this is why `RunState` is a fold over events and why
-`report::summarize` is separate from `report::render`.
+separately testable — this is why `JobReport::from_events` folds a job's
+event stream into a report with no I/O of its own, and turning that report
+into text (`to_summary_line`, `to_duration_line`) is a separate step
+(`src/report.rs`).
 
 ### Where loops are still correct
 
-Don't contort these into iterator chains:
+Don't contort this into an iterator chain: sequential I/O with early return on
+error, where `?` inside a loop reads better than `collect::<Result<_, _>>()`
+would. `git::commit_all_except` unstages each `never_commit` path this way
+(`src/git.rs`) — a genuine loop, not a map in disguise.
 
-- **The scheduler's main loop.** It awaits completions, appends to the event
-  log, and re-derives readiness. It is genuinely a state machine over time.
-- **Sequential I/O with early return on error**, where `?` inside a loop reads
-  better than `collect::<Result<_, _>>()` would.
-
-When you do write a loop, it should be because the alternative is worse, and
-that should be obvious to the next reader.
+When you do write one, it should be because the alternative is worse, and
+that should be obvious to the next reader. F1 runs exactly one job at a time,
+so there is no scheduler loop any more to hold up as the headline case — if a
+later milestone's daemon brings one back, it belongs here.
 
 ### Cost
 
-Favor clarity; these graphs have tens of nodes, not millions. An O(n²)
-`contains` over a small `Vec` is fine and clearer than threading a `HashSet`.
-Where a naive functional formulation would be *asymptotically* bad — recursive
-DFS on a diamond graph — restructure the algorithm (Kahn's-style peeling)
-rather than reaching for mutable marks.
+The unit of work is one job, and the collections around it — a repository's
+declared providers, its `copy` list, the remotes `git remote` prints, a `gc`
+run's stale worktrees — are a handful of items, not millions. Favor clarity:
+`git::remote_exists` checks membership by scanning `git remote`'s output line
+by line rather than collecting it into a `HashSet` first (`src/git.rs`); with
+a handful of remotes the scan is clearer and the difference in cost does not
+exist. There is no graph left to traverse — no DFS, no Kahn's-style peeling;
+a job either runs or it doesn't. If a later milestone's daemon runs many jobs
+at once, the cost question becomes scheduling contention, not walking a data
+structure — revisit this section when that lands.
 
 ## Naming
 
@@ -171,17 +178,20 @@ A name should tell the reader what the thing *is* or *decides*, without them
 opening it. Bare verbs (`check`, `handle`, `process`, `absorb`, `skip`) and
 bare nouns (`data`, `info`, `result`, `entry`) fail that test.
 
-- **Predicates read as claims:** `dependency_is_satisfied`, not `satisfied`.
-- **Filters name what they select:** `nodes_clear_to_launch`, not `selectable`.
-- **Error producers name the fault:** `unresolvable_dependencies`,
-  `unparseable_max_duration` — not `edge_errors`, `duration_error`.
-- **Mutators name the transition, including its scope:**
-  `mark_pending_as_skipped`, not `skip` — the qualifier is the part that stops
-  a reader assuming it skips everything.
+- **Predicates read as claims:** `git::branch_exists`, not `exists`.
+- **Filters name what they select:** `gc::collectable`, not `filtered` — it
+  names the `RepositoryLeftovers` a `gc` run would actually remove
+  (`src/gc.rs`).
+- **Error producers name the fault:** `RepoConfig::reasons_it_cannot_run`,
+  `unparseable_max_duration` — not `problems`, `duration_error`
+  (`src/config.rs`).
+- **Mutators name the transition, including its scope:** `EventLog::append`,
+  not `write` — the log is append-only, so the half of the name that rules out
+  rewriting is the half that earns its place (`src/event.rs`).
 - **Fields carry their unit or role:** `attempt_started_at`,
-  `last_attempt_duration`, `resources_in_use` — not `started`, `duration`,
-  `busy`.
-- **Constructors say where the value came from:** `RunReport::from_events`,
+  `last_attempt_duration`, `committed_diff` — not `started`, `duration`,
+  `diff` (`JobProgress` in `src/report.rs`).
+- **Constructors say where the value came from:** `JobReport::from_events`,
   not `summarize`.
 
 Longer is fine. The name is read far more often than it is typed.
@@ -211,27 +221,43 @@ Where a type owns a sink or source, make it generic with a sensible default
 
 - `anyhow` at the binary and I/O boundary.
 - Validation returns a **`Vec` of typed errors**, not the first failure —
-  users want every problem in their graph file at once, not one per run.
+  users want every problem in their `.assembly/config.toml` at once, not one
+  per run.
 - Every error type implements `Display` with a message that says what to do
   about it, not just what went wrong.
 
 ## Testing
 
 - Integration tests in `tests/`, one file per module concern.
-- Test through the public API. `RunState` being a pure fold means most
-  behavior can be asserted by feeding it events, with no processes involved.
+- Test through the public API. `JobState::replay` and `JobReport::from_events`
+  are both pure folds over an event stream, so most behavior can be asserted
+  by feeding them events, with no processes involved (`src/state.rs`,
+  `src/report.rs`).
 - Agent execution is tested with **shell-script fakes**, never a real API. No
   test may touch the network or require credentials.
 - Prove concurrency with observable evidence — a wall-clock bound, or a probe
   that records how many copies of a command were live at once — not by
-  inspecting internal state.
+  inspecting internal state. This is forward-looking, not descriptive of F1's
+  own tests: F1 runs exactly one job at a time, so there is nothing concurrent
+  to observe today, and the DAG scheduler's wall-clock probes were deleted
+  with it. Apply this rule when a later milestone's daemon actually runs jobs
+  concurrently — don't go looking for the tests it describes before then.
 
 ## Invariants
 
 - The event log is **append-only**. Never rewrite or truncate it.
-- `RunState::apply` must stay a pure function of the event stream. Anything
-  that cannot be reconstructed from `events.jsonl` does not belong in it.
-- Task ids match `^[A-Za-z0-9_-]+$` — they become filenames and git branch
-  names. Validate, never sanitize.
-- The target repository is never modified. Run state lives under `.assembly/`;
-  worktrees live outside the repo entirely.
+- `JobState::apply` must stay a pure function of the event stream. Anything
+  that cannot be reconstructed from `events.jsonl` does not belong in
+  `JobState` or `JobReport`.
+- Job ids are never user input, so there is nothing to validate. A job's id is
+  a `u64` that `paths::next_job_id` allocates by scanning the existing job
+  directories and taking one past the max, and its branch name is derived
+  from that id alone (`al/job-{id}`, `workspace::job_branch_name`) — always a
+  well-formed git ref, with no pattern check needed because nothing
+  user-authored ever reaches it.
+- The target repository is never modified beyond `.assembly/jobs/`, where a
+  job's event log and metadata live until a later milestone moves that state
+  out of the repository entirely (`src/paths.rs`). Worktrees live under
+  `$HOME` (or `$ASSEMBLY_WORKTREE_ROOT`, which tests set), never inside the
+  repo: the target repo must stay untouched, and a worktree inside it would
+  need a `.gitignore` entry assembly-line is not entitled to add.

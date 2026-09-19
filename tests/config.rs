@@ -65,7 +65,7 @@ fn a_provider_the_repository_never_declared_is_rejected() {
     let config = RepoConfig::parse("[providers.real]\ncmd = \"true\"\n").unwrap();
 
     assert_eq!(
-        config.problems("ghost"),
+        config.reasons_it_cannot_run("ghost"),
         vec![ConfigError::UnknownProvider("ghost".into())]
     );
 }
@@ -74,7 +74,10 @@ fn a_provider_the_repository_never_declared_is_rejected() {
 fn a_repository_naming_no_provider_at_all_is_rejected() {
     let config = RepoConfig::parse("[providers.real]\ncmd = \"true\"\n").unwrap();
 
-    assert_eq!(config.problems(""), vec![ConfigError::NoProviderDeclared]);
+    assert_eq!(
+        config.reasons_it_cannot_run(""),
+        vec![ConfigError::NoProviderDeclared]
+    );
 }
 
 #[test]
@@ -84,7 +87,7 @@ fn a_declared_provider_is_accepted() {
     )
     .unwrap();
 
-    assert!(config.problems("real").is_empty());
+    assert!(config.reasons_it_cannot_run("real").is_empty());
 }
 
 #[test]
@@ -95,7 +98,7 @@ fn rejects_an_unparseable_max_duration() {
     .unwrap();
 
     assert_eq!(
-        config.problems("p"),
+        config.reasons_it_cannot_run("p"),
         vec![ConfigError::UnparseableMaxDuration("soon".into())]
     );
 }
@@ -105,7 +108,7 @@ fn reports_every_problem_at_once() {
     let config = RepoConfig::parse("max_duration = \"soon\"\n").unwrap();
 
     assert_eq!(
-        config.problems(""),
+        config.reasons_it_cannot_run(""),
         vec![
             ConfigError::NoProviderDeclared,
             ConfigError::UnparseableMaxDuration("soon".into())
@@ -137,10 +140,10 @@ fn every_config_error_says_what_to_do_about_it() {
 fn a_repository_with_no_verify_is_warned_about_but_still_runnable() {
     let config = RepoConfig::parse("provider = \"p\"\n[providers.p]\ncmd = \"true\"\n").unwrap();
 
-    assert!(config.problems("p").is_empty());
-    assert_eq!(config.warnings(), vec![Warning::NoVerify]);
+    assert!(config.reasons_it_cannot_run("p").is_empty());
+    assert_eq!(config.settings_worth_flagging(), vec![Warning::NoVerify]);
     assert!(
-        config.warnings()[0]
+        config.settings_worth_flagging()[0]
             .to_string()
             .contains("nothing will check")
     );
@@ -153,5 +156,5 @@ fn a_repository_that_declares_verify_warns_about_nothing() {
     )
     .unwrap();
 
-    assert!(config.warnings().is_empty());
+    assert!(config.settings_worth_flagging().is_empty());
 }

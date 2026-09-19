@@ -369,7 +369,7 @@ async fn revise_without_feedback_is_a_usage_error() {
 }
 
 #[tokio::test]
-async fn a_job_never_touches_the_target_repositorys_working_tree() {
+async fn a_job_writes_nothing_outside_dot_assembly_in_the_target_repository() {
     let tmp = repo_running("fake-agent.sh").await;
     let before = git(&tmp, &["rev-parse", "HEAD"]);
 
@@ -379,10 +379,19 @@ async fn a_job_never_touches_the_target_repositorys_working_tree() {
         .success();
 
     assert_eq!(before, git(&tmp, &["rev-parse", "HEAD"]), "HEAD moved");
-    assert!(
-        git(&tmp, &["status", "--porcelain", "--untracked-files=no"]).is_empty(),
-        "tracked files changed"
-    );
+
+    // Full porcelain, untracked files included: job state legitimately lands
+    // under `.assembly/` (until a later milestone moves it out of the repo
+    // entirely), but nothing else in the working tree may change — tracked
+    // or not. `--untracked-files=no` would blind this to exactly the files
+    // the binary just wrote.
+    let status = git(&tmp, &["status", "--porcelain"]);
+    let stray: Vec<&str> = status
+        .lines()
+        .filter(|line| !line[3..].starts_with(".assembly/"))
+        .collect();
+    assert!(stray.is_empty(), "wrote outside .assembly/: {stray:?}");
+
     assert!(!tmp.path().join("agent-output.txt").exists());
 
     discard_worktrees(&tmp);

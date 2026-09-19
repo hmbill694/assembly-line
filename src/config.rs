@@ -79,7 +79,10 @@ pub struct RepoConfig {
     /// assumed `main`. Unset, a pull request targets the branch the job was
     /// cut from.
     pub base: Option<String>,
-    /// Wall-clock cap on one agent invocation.
+    /// Wall-clock cap on one agent invocation. `verify`, when the repository
+    /// declares one, gets this same cap again on its own — so a round that
+    /// makes it to `verify` can take up to 2x this long end to end, not just
+    /// this long.
     pub max_duration: Option<String>,
     /// Untracked files a job's checkout needs — `.env`, local settings.
     #[serde(default)]
@@ -126,7 +129,7 @@ impl RepoConfig {
     /// `provider` is what the job will actually use — the command line's
     /// choice when it named one, otherwise [`RepoConfig::provider`].
     #[must_use]
-    pub fn problems(&self, provider: &str) -> Vec<ConfigError> {
+    pub fn reasons_it_cannot_run(&self, provider: &str) -> Vec<ConfigError> {
         let undeclared = match (provider.is_empty(), self.providers.contains_key(provider)) {
             (true, _) => Some(ConfigError::NoProviderDeclared),
             (false, false) => Some(ConfigError::UnknownProvider(provider.to_string())),
@@ -148,7 +151,7 @@ impl RepoConfig {
 
     /// Settings worth telling the user about, none of which stop a job.
     #[must_use]
-    pub fn warnings(&self) -> Vec<Warning> {
+    pub fn settings_worth_flagging(&self) -> Vec<Warning> {
         self.verify
             .is_none()
             .then_some(Warning::NoVerify)

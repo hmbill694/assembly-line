@@ -335,10 +335,13 @@ async fn round_result(
     // `verify` runs here too, in this same checkout, after the commit: it
     // judges exactly the tree the branch now carries, and what it gates is
     // delivery, never the branch's survival. A round whose agent already
-    // failed skips it: there is nothing to judge but an abandoned tree, the
-    // answer could not change the outcome, and `verify` is a user-authored
-    // shell line that gets its own full `max_duration` — running it on the
-    // failure path would silently double the wall-clock cap.
+    // failed skips it: there is nothing to judge but an abandoned tree, and
+    // the answer could not change the outcome — so at least the failure path
+    // does not also pay for a `verify` run. It is not a general budget,
+    // though: `verify` is a user-authored shell line that gets its own full
+    // `max_duration`, same as the agent, so a round that succeeds can still
+    // take up to 2x `max_duration` end to end. A shared remaining-budget is a
+    // later milestone's problem.
     let preserved = agent_work_on_branch(plan, &ws).await;
     let verdict = match agent_failure {
         Some(_) => Ok(VerifyVerdict::NoObjection),

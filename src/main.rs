@@ -128,11 +128,11 @@ fn config_and_provider(
         .unwrap_or_default();
 
     config
-        .warnings()
+        .settings_worth_flagging()
         .iter()
         .for_each(|w| eprintln!("warn: {w}"));
 
-    let problems = config.problems(&provider);
+    let problems = config.reasons_it_cannot_run(&provider);
     match problems.as_slice() {
         [] => Ok((config, provider)),
         problems => {

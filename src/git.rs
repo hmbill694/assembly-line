@@ -92,9 +92,15 @@ pub async fn head_sha(repo: impl AsRef<Path>) -> anyhow::Result<String> {
 
 /// The commit `git_ref` names — a branch, a tag, `HEAD`, or a raw sha.
 ///
-/// A job is cut from a ref the user names, so the ref has to be resolved once
-/// and the resulting commit used everywhere after: a branch that moves
-/// mid-job must not silently change what the job was based on.
+/// This pins the checkout to one commit rather than handing git the ref name
+/// and letting it re-resolve later. It does not, on its own, make the whole
+/// job atomic with respect to the ref: [`RepoConfig::from_ref`] resolves the
+/// same ref name earlier, to read config, and this resolves it again when the
+/// checkout starts. A branch that moves in between gives config from one
+/// commit and a tree from another — a narrow window (milliseconds, in
+/// practice) that this function does not close.
+///
+/// [`RepoConfig::from_ref`]: crate::config::RepoConfig::from_ref
 pub async fn sha_at_ref(repo: impl AsRef<Path>, git_ref: &str) -> anyhow::Result<String> {
     run_expecting_success(
         repo,
