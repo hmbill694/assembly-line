@@ -1,0 +1,6 @@
+provider = "claude"
+verify = "cargo build --quiet"
+
+[providers.claude]
+cmd = "claude"
+args = ["-p", "{prompt}", "--permission-mode", "acceptEdits"]
