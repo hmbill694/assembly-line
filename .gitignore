@@ -1,5 +1,10 @@
 /target
 
+# `.assembly/config.toml` is tracked configuration — the tool reads it from a
+# committed ref, so it must stay out of this ignore rule. `.assembly/jobs/`
+# is local job state and should never be committed, so it alone is ignored.
+.assembly/jobs/
+
 # macOS writes these into any directory Finder has looked at.
 .DS_Store
 

@@ -10,6 +10,10 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Where a repository declares its factory settings.
+///
+/// Until a later milestone moves job state out of the repository entirely,
+/// a repository that commits this file must also ignore `.assembly/jobs/`
+/// itself — nothing else does that for it.
 pub const REPO_CONFIG_PATH: &str = ".assembly/config.toml";
 
 /// A setting that makes a repository unrunnable as it stands.
@@ -69,7 +73,11 @@ pub struct RepoConfig {
     pub provider: Option<String>,
     /// The command that decides whether a job's work is correct.
     pub verify: Option<String>,
-    /// What work lands on. Defaults to the branch the job was cut from.
+    /// What branch a pull request targets. This is the only thing `base`
+    /// affects — it has no bearing on what the job is cut from; that is
+    /// always `--ref`, which defaults to the checked-out branch, never an
+    /// assumed `main`. Unset, a pull request targets the branch the job was
+    /// cut from.
     pub base: Option<String>,
     /// Wall-clock cap on one agent invocation.
     pub max_duration: Option<String>,

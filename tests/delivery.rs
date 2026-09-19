@@ -237,6 +237,23 @@ async fn repo_running(script: &str, verify: &str) -> tempfile::TempDir {
     tmp
 }
 
+/// Like [`repo_running`], but also declares `base`, so a test can assert on
+/// where delivery targets its pull request.
+async fn repo_running_with_base(script: &str, verify: &str, base: &str) -> tempfile::TempDir {
+    let tmp = support::repo_with_initial_commit().await;
+    std::fs::create_dir_all(tmp.path().join(".assembly")).unwrap();
+    std::fs::write(
+        tmp.path().join(assembly_line::config::REPO_CONFIG_PATH),
+        format!(
+            "verify = \"{verify}\"\nbase = \"{base}\"\n{}",
+            support::config_running(script)
+        ),
+    )
+    .unwrap();
+    commit_all(tmp.path(), "opt in").await.unwrap().unwrap();
+    tmp
+}
+
 /// A bare sibling repository added as `origin`, so a real delivery would have
 /// somewhere to push to. No network, no credentials.
 async fn add_origin(tmp: &tempfile::TempDir) {
@@ -252,6 +269,30 @@ async fn add_origin(tmp: &tempfile::TempDir) {
     git::push_branch(tmp.path(), "origin", "main")
         .await
         .unwrap();
+}
+
+/// A fake `gh` that records exactly what it was invoked with instead of
+/// touching the network, so a test can assert on `--base` directly rather
+/// than inferring it from which `Delivered` variant came back. Returns the
+/// directory to prepend to `PATH` and the file its invocation is recorded
+/// to.
+fn fake_gh_capturing_args(tmp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+    let bin_dir = tmp.path().join("fake-bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let capture = tmp.path().join("gh-invocation.txt");
+    let script = bin_dir.join("gh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> {}\necho https://example.invalid/pr/1\n",
+            capture.display()
+        ),
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+    (bin_dir, capture)
 }
 
 /// The gate this task implements: a job's branch is real work either way, but
@@ -312,6 +353,49 @@ async fn a_passing_revise_round_is_delivered() {
         on_remote.stdout.trim(),
         local.stdout.trim(),
         "revise's branch never reached the remote — delivery is not wired into revise"
+    );
+
+    discard_worktrees(&tmp);
+}
+
+/// `config.base` is consulted at exactly one place — `deliver_if_verified`
+/// choosing the pull request's base — and until now nothing proved it
+/// actually got there; every existing test on `base` only asserts that it
+/// parses. This drives the real binary with a fake `gh` standing in for the
+/// real one, so the `--base` a pull request would open with is captured
+/// directly instead of inferred from which `Delivered` variant printed.
+///
+/// It also proves the divergence note fires: `base = "release"` here while
+/// the job is cut from the default checked-out branch, `main` — exactly the
+/// silent-scope-creep case the review found.
+#[tokio::test]
+async fn configured_base_reaches_the_pull_request_and_the_divergence_is_reported() {
+    let tmp = repo_running_with_base("fake-agent.sh", "true", "release").await;
+    add_origin(&tmp).await;
+    let (fake_bin, gh_capture) = fake_gh_capturing_args(&tmp);
+    let path_with_fake_gh = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    assembly(&tmp)
+        .env("PATH", path_with_fake_gh)
+        .args(["run", "--prompt", "write a file"])
+        .assert()
+        .success()
+        .stdout(contains("will target 'release'"))
+        .stdout(contains("cut from 'main'"));
+
+    let invocation = std::fs::read_to_string(&gh_capture)
+        .expect("gh was never invoked — the configured base never reached delivery");
+    assert!(
+        invocation.contains("--base release"),
+        "gh was not asked to target the configured base: {invocation}"
+    );
+    assert!(
+        invocation.contains("--head al/job-1"),
+        "gh was not asked to deliver the job's own branch: {invocation}"
     );
 
     discard_worktrees(&tmp);
