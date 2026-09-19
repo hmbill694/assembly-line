@@ -190,10 +190,10 @@ impl Harness {
             round,
         };
 
-        let failed = run_job(&config, &spec, &paths, &mut log, &mut state, &opts).await?;
+        let outcome = run_job(&config, &spec, &paths, &mut log, &mut state, &opts).await?;
 
         Ok(Outcome {
-            succeeded: !failed,
+            succeeded: outcome.passed(),
             job_id: paths.id,
             state,
             events: EventLog::read(paths.events())

@@ -30,6 +30,21 @@ pub struct RunOpts {
     pub remote: String,
 }
 
+/// Whether a job's work was accepted. `verify` decides this when the
+/// repository declares one; otherwise the agent's exit code does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobOutcome {
+    Passed,
+    Failed,
+}
+
+impl JobOutcome {
+    #[must_use]
+    pub fn passed(self) -> bool {
+        matches!(self, Self::Passed)
+    }
+}
+
 /// One job: which prompt, run by which provider, against which ref.
 #[derive(Debug, Clone, Copy)]
 pub struct JobSpec<'a> {
@@ -221,14 +236,12 @@ async fn start_commit_for_round(
 
 /// Run one job end to end: scratch checkout, agent, commit, publish, discard.
 ///
-/// Returns whether the job failed.
-///
 /// # Errors
 ///
 /// Returns an error only if the job cannot be *administered* — the event log
 /// cannot be appended to, `max_duration` is unparseable, the repository does
 /// not declare the provider, or git refused to make a checkout. An agent that
-/// runs and fails is not an error: that is the returned flag.
+/// runs and fails is not an error: that is [`JobOutcome::Failed`].
 pub async fn run_job(
     config: &RepoConfig,
     spec: &JobSpec<'_>,
@@ -236,7 +249,7 @@ pub async fn run_job(
     log: &mut EventLog,
     state: &mut JobState,
     opts: &RunOpts,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<JobOutcome> {
     let timeout = wall_clock_limit(config)?;
     let branch = job_branch_name(paths.id);
     let start_sha = start_commit_for_round(&opts.repo, &branch, spec).await?;
@@ -283,7 +296,7 @@ pub async fn revise_job(
     log: &mut EventLog,
     state: &mut JobState,
     opts: &RunOpts,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<JobOutcome> {
     let prompt = revised_prompt(&meta.prompt, revision.feedback);
     let spec = JobSpec {
         prompt: &prompt,
@@ -461,14 +474,12 @@ async fn remote_the_branch_reached(plan: &JobPlan, ws: &JobWorkspace) -> Option<
     }
 }
 
-/// Write every event a completion implies, in order, and report whether the
-/// job ended up failed.
 fn record_completion(
     log: &mut EventLog,
     state: &mut JobState,
     result: JobResult,
-) -> anyhow::Result<bool> {
-    let (events, job_failed) = events_for_completion(result);
+) -> anyhow::Result<JobOutcome> {
+    let (events, outcome) = events_for_completion(result);
 
     events.into_iter().try_for_each(|kind| {
         let ev = log.append(kind)?;
@@ -476,7 +487,7 @@ fn record_completion(
         anyhow::Ok(())
     })?;
 
-    Ok(job_failed)
+    Ok(outcome)
 }
 
 /// Recording what an agent left: the commit, then where its branch went.
@@ -501,22 +512,21 @@ fn work_recorded(work: Option<&AgentWork>) -> Vec<EventKind> {
 }
 
 /// The events a completion implies, in the order things settled, paired with
-/// whether the job ended up failed.
+/// the outcome they add up to.
 ///
 /// Pure, so the ordering that makes replay correct can be asserted without
-/// running anything. Work is always recorded first: a failure that produced a
-/// diff still produced a diff.
-fn events_for_completion(result: JobResult) -> (Vec<EventKind>, bool) {
+/// running anything. Work is recorded before the verdict that judges it.
+fn events_for_completion(result: JobResult) -> (Vec<EventKind>, JobOutcome) {
     let finished = EventKind::JobFinished { exit_code: 0 };
 
     match result {
-        JobResult::Succeeded => (vec![finished], false),
+        JobResult::Succeeded => (vec![finished], JobOutcome::Passed),
         JobResult::Failed { reason, work } => (
             work_recorded(work.as_ref())
                 .into_iter()
                 .chain([EventKind::JobFailed { reason }])
                 .collect(),
-            true,
+            JobOutcome::Failed,
         ),
         JobResult::VerifyRejected { reason, work } => (
             work_recorded(work.as_ref())
@@ -530,14 +540,14 @@ fn events_for_completion(result: JobResult) -> (Vec<EventKind>, bool) {
                     },
                 ])
                 .collect(),
-            true,
+            JobOutcome::Failed,
         ),
         JobResult::Committed { work } => (
             work_recorded(Some(&work))
                 .into_iter()
                 .chain([finished])
                 .collect(),
-            false,
+            JobOutcome::Passed,
         ),
     }
 }

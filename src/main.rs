@@ -3,7 +3,7 @@ use assembly_line::config::RepoConfig;
 use assembly_line::event::{Event, EventKind, EventLog};
 use assembly_line::paths::{JobMeta, JobPaths};
 use assembly_line::report::JobReport;
-use assembly_line::scheduler::{JobSpec, Revision, RunOpts, revise_job, run_job};
+use assembly_line::scheduler::{JobOutcome, JobSpec, Revision, RunOpts, revise_job, run_job};
 use assembly_line::state::JobState;
 use assembly_line::{config, delivery, gc, paths};
 use clap::Parser;
@@ -219,11 +219,11 @@ async fn start_new_job(
 
     match outcome {
         Err(e) => fail_with_usage_error(e),
-        Ok(job_failed) => {
+        Ok(outcome) => {
             let meta = report_and_record_branch(&paths, meta);
-            deliver_if_verified(&repo, &config, &meta, job_failed).await;
+            deliver_if_verified(&repo, &config, &meta, outcome).await;
             println!("state: {}", paths.dir.display());
-            exit_code_for(job_failed)
+            exit_code_for(outcome)
         }
     }
 }
@@ -270,10 +270,10 @@ async fn prepare_job(
     })
 }
 
-fn exit_code_for(job_failed: bool) -> ExitCode {
-    match job_failed {
-        true => ExitCode::from(EXIT_JOB_FAILED),
-        false => ExitCode::SUCCESS,
+fn exit_code_for(outcome: JobOutcome) -> ExitCode {
+    match outcome {
+        JobOutcome::Failed => ExitCode::from(EXIT_JOB_FAILED),
+        JobOutcome::Passed => ExitCode::SUCCESS,
     }
 }
 
@@ -311,12 +311,17 @@ fn report_and_record_branch(paths: &JobPaths, meta: JobMeta) -> JobMeta {
 /// A failed job still leaves a real branch, but opening a pull request for
 /// work that did not pass is noise — the branch name is printed instead, so
 /// acting on it stays a decision rather than a default.
-async fn deliver_if_verified(repo: &Path, config: &RepoConfig, meta: &JobMeta, failed: bool) {
+async fn deliver_if_verified(
+    repo: &Path,
+    config: &RepoConfig,
+    meta: &JobMeta,
+    outcome: JobOutcome,
+) {
     let Some(branch) = &meta.branch else {
         return; // The agent changed nothing, so there is nothing to deliver.
     };
 
-    if failed {
+    if outcome == JobOutcome::Failed {
         println!("branch: {branch} (not delivered — the job did not pass)");
         return;
     }
@@ -435,10 +440,10 @@ async fn revise_existing_job(job_id: u64, feedback: String, repo: Option<PathBuf
     .await
     {
         Err(e) => fail_with_usage_error(e),
-        Ok(job_failed) => {
+        Ok(outcome) => {
             let meta = report_and_record_branch(&paths, meta);
-            deliver_if_verified(&meta.repo, &config, &meta, job_failed).await;
-            exit_code_for(job_failed)
+            deliver_if_verified(&meta.repo, &config, &meta, outcome).await;
+            exit_code_for(outcome)
         }
     }
 }
