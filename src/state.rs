@@ -23,8 +23,10 @@ impl JobState {
         }
     }
 
-    pub fn apply(&mut self, kind: &EventKind) {
-        *self = match kind {
+    /// This state after `event`. Written to be passed directly to
+    /// `Iterator::fold`.
+    fn after_event(self, event: &Event) -> Self {
+        match &event.kind {
             EventKind::JobStarted { .. } => JobState::Running,
             EventKind::JobFinished { .. } => JobState::Succeeded,
             EventKind::JobFailed { .. } => JobState::Failed,
@@ -35,15 +37,14 @@ impl JobState {
             // actually drives the transition to `Failed`.
             EventKind::JobCommitted { .. }
             | EventKind::JobBranchPublished { .. }
-            | EventKind::JobVerifyFailed { .. } => *self,
-        };
+            | EventKind::JobVerifyFailed { .. } => self,
+        }
     }
 
     #[must_use]
     pub fn replay<'a>(events: impl IntoIterator<Item = &'a Event>) -> Self {
-        events.into_iter().fold(JobState::default(), |mut st, e| {
-            st.apply(&e.kind);
-            st
-        })
+        events
+            .into_iter()
+            .fold(JobState::default(), JobState::after_event)
     }
 }

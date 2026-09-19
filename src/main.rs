@@ -4,7 +4,6 @@ use assembly_line::event::{Event, EventKind, EventLog};
 use assembly_line::paths::{JobMeta, JobPaths};
 use assembly_line::report::JobReport;
 use assembly_line::scheduler::{JobOutcome, JobSpec, Revision, RunOpts, revise_job, run_job};
-use assembly_line::state::JobState;
 use assembly_line::{config, delivery, gc, paths};
 use clap::Parser;
 use std::path::{Path, PathBuf};
@@ -199,7 +198,6 @@ async fn start_new_job(
         Ok(log) => log,
         Err(e) => return fail_with_usage_error(format!("opening the event log: {e}")),
     };
-    let mut state = JobState::default();
     let spec = JobSpec {
         prompt: &prompt,
         provider: &provider,
@@ -207,15 +205,7 @@ async fn start_new_job(
         round: 1,
     };
 
-    let outcome = run_job(
-        &config,
-        &spec,
-        &paths,
-        &mut log,
-        &mut state,
-        &machine_opts(&repo),
-    )
-    .await;
+    let outcome = run_job(&config, &spec, &paths, &mut log, &machine_opts(&repo)).await;
 
     match outcome {
         Err(e) => fail_with_usage_error(e),
@@ -424,8 +414,6 @@ async fn revise_existing_job(job_id: u64, feedback: String, repo: Option<PathBuf
         Ok(log) => log,
         Err(e) => return fail_with_usage_error(format!("opening the event log: {e}")),
     };
-    let mut state = JobState::replay(&events);
-
     let round = rounds_so_far(&events) + 1;
     println!("revising job {job_id} (round {round})");
 
@@ -434,11 +422,7 @@ async fn revise_existing_job(job_id: u64, feedback: String, repo: Option<PathBuf
         feedback: &feedback,
         round,
     };
-    match revise_job(
-        &config, &meta, &revision, &paths, &mut log, &mut state, &opts,
-    )
-    .await
-    {
+    match revise_job(&config, &meta, &revision, &paths, &mut log, &opts).await {
         Err(e) => fail_with_usage_error(e),
         Ok(outcome) => {
             let meta = report_and_record_branch(&paths, meta);

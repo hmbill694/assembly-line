@@ -10,7 +10,6 @@ use crate::exec::{ShellOutcome, run_command, run_shell};
 use crate::git;
 use crate::paths::{self, JobMeta, JobPaths};
 use crate::provider::{CommandSpec, render_command};
-use crate::state::JobState;
 use crate::workspace::{self, JobWorkspace, job_branch_name};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -247,7 +246,6 @@ pub async fn run_job(
     spec: &JobSpec<'_>,
     paths: &JobPaths,
     log: &mut EventLog,
-    state: &mut JobState,
     opts: &RunOpts,
 ) -> anyhow::Result<JobOutcome> {
     let timeout = wall_clock_limit(config)?;
@@ -255,8 +253,7 @@ pub async fn run_job(
     let start_sha = start_commit_for_round(&opts.repo, &branch, spec).await?;
     let plan = job_plan(config, spec, paths, opts, &start_sha)?;
 
-    let ev = log.append(EventKind::JobStarted { round: spec.round })?;
-    state.apply(&ev.kind);
+    log.append(EventKind::JobStarted { round: spec.round })?;
 
     let result = round_result(&plan, &paths.log(), timeout, opts.cancel.clone())
         .await
@@ -268,7 +265,7 @@ pub async fn run_job(
             work: None,
         });
 
-    record_completion(log, state, result)
+    record_completion(log, result)
 }
 
 /// One revise round: what to change about the last one, and which round this
@@ -294,7 +291,6 @@ pub async fn revise_job(
     revision: &Revision<'_>,
     paths: &JobPaths,
     log: &mut EventLog,
-    state: &mut JobState,
     opts: &RunOpts,
 ) -> anyhow::Result<JobOutcome> {
     let prompt = revised_prompt(&meta.prompt, revision.feedback);
@@ -304,7 +300,7 @@ pub async fn revise_job(
         base_ref: &meta.base_ref,
         round: revision.round,
     };
-    run_job(config, &spec, paths, log, state, opts).await
+    run_job(config, &spec, paths, log, opts).await
 }
 
 /// One round, from empty checkout to discarded checkout.
@@ -474,18 +470,12 @@ async fn remote_the_branch_reached(plan: &JobPlan, ws: &JobWorkspace) -> Option<
     }
 }
 
-fn record_completion(
-    log: &mut EventLog,
-    state: &mut JobState,
-    result: JobResult,
-) -> anyhow::Result<JobOutcome> {
+fn record_completion(log: &mut EventLog, result: JobResult) -> anyhow::Result<JobOutcome> {
     let (events, outcome) = events_for_completion(result);
 
-    events.into_iter().try_for_each(|kind| {
-        let ev = log.append(kind)?;
-        state.apply(&ev.kind);
-        anyhow::Ok(())
-    })?;
+    events
+        .into_iter()
+        .try_for_each(|kind| log.append(kind).map(|_| ()))?;
 
     Ok(outcome)
 }

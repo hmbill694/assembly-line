@@ -17,39 +17,48 @@ fn a_job_starts_pending() {
 
 #[test]
 fn starting_and_finishing_moves_a_job_through_running_to_succeeded() {
-    let mut st = JobState::default();
+    let started = vec![EventKind::JobStarted { round: 1 }];
+    assert_eq!(
+        JobState::replay(&stream(started.clone())),
+        JobState::Running
+    );
 
-    st.apply(&EventKind::JobStarted { round: 1 });
-    assert_eq!(st, JobState::Running);
-
-    st.apply(&EventKind::JobFinished { exit_code: 0 });
-    assert_eq!(st, JobState::Succeeded);
+    let finished = [started, vec![EventKind::JobFinished { exit_code: 0 }]].concat();
+    assert_eq!(JobState::replay(&stream(finished)), JobState::Succeeded);
 }
 
 #[test]
 fn a_failed_job_is_recorded_as_failed() {
-    let mut st = JobState::default();
-    st.apply(&EventKind::JobFailed {
+    let events = stream(vec![EventKind::JobFailed {
         reason: "exit 1".into(),
-    });
-    assert_eq!(st, JobState::Failed);
+    }]);
+
+    assert_eq!(JobState::replay(&events), JobState::Failed);
 }
 
 #[test]
 fn a_commit_is_progress_not_completion() {
-    let mut st = JobState::default();
+    let through_commit = vec![
+        EventKind::JobStarted { round: 1 },
+        EventKind::JobCommitted {
+            sha: "abc".into(),
+            files: 2,
+            insertions: 10,
+            deletions: 1,
+        },
+    ];
+    assert_eq!(
+        JobState::replay(&stream(through_commit.clone())),
+        JobState::Running,
+        "a commit is not completion"
+    );
 
-    st.apply(&EventKind::JobStarted { round: 1 });
-    st.apply(&EventKind::JobCommitted {
-        sha: "abc".into(),
-        files: 2,
-        insertions: 10,
-        deletions: 1,
-    });
-    assert_eq!(st, JobState::Running, "a commit is not completion");
-
-    st.apply(&EventKind::JobFinished { exit_code: 0 });
-    assert_eq!(st, JobState::Succeeded);
+    let finished = [
+        through_commit,
+        vec![EventKind::JobFinished { exit_code: 0 }],
+    ]
+    .concat();
+    assert_eq!(JobState::replay(&stream(finished)), JobState::Succeeded);
 }
 
 /// A job's branch is published before its success is judged, so publishing

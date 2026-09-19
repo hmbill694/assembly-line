@@ -175,7 +175,6 @@ impl Harness {
             .unwrap_or_default();
         let paths = self.job_paths();
         let mut log = EventLog::open_append(paths.events()).unwrap();
-        let mut state = JobState::default();
 
         let opts = RunOpts {
             cancel: CancellationToken::new(),
@@ -190,17 +189,14 @@ impl Harness {
             round,
         };
 
-        let outcome = run_job(&config, &spec, &paths, &mut log, &mut state, &opts).await?;
+        let outcome = run_job(&config, &spec, &paths, &mut log, &opts).await?;
+        let events = EventLog::read(paths.events()).unwrap();
 
         Ok(Outcome {
             succeeded: outcome.passed(),
             job_id: paths.id,
-            state,
-            events: EventLog::read(paths.events())
-                .unwrap()
-                .into_iter()
-                .map(|e| e.kind)
-                .collect(),
+            state: JobState::replay(&events),
+            events: events.into_iter().map(|e| e.kind).collect(),
             log: paths.log(),
         })
     }
