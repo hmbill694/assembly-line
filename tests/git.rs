@@ -242,12 +242,6 @@ async fn a_secret_committed_by_the_agent_fails_the_job() {
         .to_string();
 
     assert!(err.contains(".env"), "{err}");
-    assert_eq!(
-        git::tracked_among(&node, &[".env".to_string()])
-            .await
-            .unwrap(),
-        vec![".env".to_string()]
-    );
 }
 
 #[tokio::test]

@@ -254,9 +254,6 @@ pub struct JobMeta {
     pub base_ref: String,
     pub prompt: String,
     pub provider: String,
-    /// Set once the job publishes its branch.
-    #[serde(default)]
-    pub branch: Option<String>,
 }
 
 /// # Errors

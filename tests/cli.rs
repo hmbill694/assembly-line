@@ -45,7 +45,6 @@ async fn repo_running(script: &str) -> tempfile::TempDir {
     std::fs::create_dir_all(tmp.path().join(".assembly")).unwrap();
     std::fs::write(
         tmp.path().join(REPO_CONFIG_PATH),
-        // `verify` only silences the warning; Task 6 gives it teeth.
         format!("verify = \"true\"\n{}", support::config_running(script)),
     )
     .unwrap();

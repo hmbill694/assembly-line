@@ -97,7 +97,6 @@ fn meta_round_trips() {
             base_ref: "main".into(),
             prompt: "add authentication".into(),
             provider: "claude".into(),
-            branch: Some("al/job-1".into()),
         },
     )
     .unwrap();
@@ -107,24 +106,23 @@ fn meta_round_trips() {
     assert_eq!(back.base_ref, "main");
     assert_eq!(back.prompt, "add authentication");
     assert_eq!(back.provider, "claude");
-    assert_eq!(back.branch.as_deref(), Some("al/job-1"));
 }
 
 /// `revise` needs the prompt and the ref by id alone, which is exactly why
 /// they live here rather than only in the event log.
 #[test]
-fn meta_deserializes_before_the_branch_exists() {
+fn meta_written_by_an_older_version_still_loads() {
     let tmp = tempfile::tempdir().unwrap();
     let job = create_job(&jobs_root(tmp.path()), 1).unwrap();
     fs::write(
         job.meta(),
-        r#"{"repo":"/work/acme","base_ref":"main","prompt":"go","provider":"claude"}"#,
+        r#"{"repo":"/work/acme","base_ref":"main","prompt":"go","provider":"claude","branch":"al/job-1"}"#,
     )
     .unwrap();
 
     let meta = read_meta(&job).unwrap();
     assert_eq!(meta.prompt, "go");
-    assert!(meta.branch.is_none(), "a job that has not published yet");
+    assert_eq!(meta.base_ref, "main");
 }
 
 #[test]

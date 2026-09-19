@@ -402,28 +402,3 @@ pub async fn diff_stat_against(worktree: impl AsRef<Path>, base: &str) -> anyhow
         },
     ))
 }
-
-/// Paths tracked on the current branch that match `candidates`.
-///
-/// Used to assert that seeded files never entered history.
-pub async fn tracked_among(
-    worktree: impl AsRef<Path>,
-    candidates: &[String],
-) -> anyhow::Result<Vec<String>> {
-    if candidates.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let args: Vec<&str> = ["ls-files", "--"]
-        .into_iter()
-        .chain(candidates.iter().map(String::as_str))
-        .collect();
-
-    let listed = run_expecting_success(worktree, &args, "ls-files").await?;
-    Ok(listed
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(String::from)
-        .collect())
-}
