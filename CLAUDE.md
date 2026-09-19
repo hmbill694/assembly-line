@@ -246,9 +246,9 @@ Where a type owns a sink or source, make it generic with a sensible default
 ## Invariants
 
 - The event log is **append-only**. Never rewrite or truncate it.
-- `JobState::apply` must stay a pure function of the event stream. Anything
-  that cannot be reconstructed from `events.jsonl` does not belong in
-  `JobState` or `JobReport`.
+- `JobState::replay` must stay a pure fold over the event stream — as must
+  `JobReport::from_events`. Anything that cannot be reconstructed from
+  `events.jsonl` does not belong in `JobState` or `JobReport`.
 - Job ids are never user input, so there is nothing to validate. A job's id is
   a `u64` that `paths::next_job_id` allocates by scanning the existing job
   directories and taking one past the max, and its branch name is derived

@@ -30,11 +30,9 @@ impl JobState {
             EventKind::JobStarted { .. } => JobState::Running,
             EventKind::JobFinished { .. } => JobState::Succeeded,
             EventKind::JobFailed { .. } => JobState::Failed,
-            // Progress markers, not transitions. Listed one by one rather than
-            // behind a catch-all, so a new event is a compile error here
-            // instead of a silent omission. `JobVerifyFailed` is one of
-            // these too: it is always followed by the `JobFailed` that
-            // actually drives the transition to `Failed`.
+            // Progress markers, not transitions. Listed one by one rather
+            // than behind a catch-all, so a new event kind is a compile error
+            // here instead of a silent omission.
             EventKind::JobCommitted { .. }
             | EventKind::JobBranchPublished { .. }
             | EventKind::JobVerifyFailed { .. } => self,

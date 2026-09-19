@@ -95,7 +95,6 @@ fn cancel_on_ctrl_c(cancel: CancellationToken) {
     });
 }
 
-/// The prompt the user supplied, inline or by file.
 fn prompt_text(prompt: Option<String>, prompt_file: Option<PathBuf>) -> Result<String, String> {
     match (prompt, prompt_file) {
         (Some(text), _) => Ok(text),
@@ -116,8 +115,7 @@ async fn default_base_ref(repo: &Path) -> Result<String, String> {
         .map(|branch| branch.unwrap_or_else(|| "HEAD".to_string()))
 }
 
-/// Everything the repository declares plus the provider the job will use,
-/// with every problem reported at once.
+/// Everything the repository declares plus the provider the job will use.
 fn config_and_provider(
     config: RepoConfig,
     chosen: Option<String>,
@@ -283,8 +281,7 @@ fn report_and_branch(paths: &JobPaths) -> Option<String> {
 /// Hand a finished job's branch on, once `verify` accepted it.
 ///
 /// A failed job still leaves a real branch, but opening a pull request for
-/// work that did not pass is noise — the branch name is printed instead, so
-/// acting on it stays a decision rather than a default.
+/// work that did not pass is noise — the branch name is printed instead.
 async fn deliver_if_verified(
     repo: &Path,
     config: &RepoConfig,
@@ -382,9 +379,8 @@ async fn revise_existing_job(job_id: u64, feedback: String, repo: Option<PathBuf
         Err(e) => return fail_with_usage_error(e),
     };
 
-    // The ref the job was cut from, not the job's own branch: the settings
-    // that govern a revise are the ones the repository declared, which the
-    // previous round's branch is not allowed to have changed.
+    // `base_ref`, not the job's own branch: the previous round is not allowed
+    // to have changed the settings that govern this one.
     let declared = match RepoConfig::from_ref(&meta.repo, &meta.base_ref).await {
         Ok(config) => config,
         Err(e) => return fail_with_usage_error(e),
@@ -477,7 +473,8 @@ fn print_job_log(job_id: u64, follow: bool, repo: Option<PathBuf>) -> ExitCode {
     }
 
     match follow {
-        // `tail -f` is the right tool and is present everywhere this runs.
+        // Delegated to `tail` rather than reimplemented; a machine without it
+        // gets the spawn error.
         true => match std::process::Command::new("tail")
             .arg("-f")
             .arg(&path)

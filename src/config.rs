@@ -1,8 +1,8 @@
 //! What a repository declares about how the factory builds it.
 //!
-//! There is no user-authored graph file any more. A job's prompt arrives on
-//! the command line; everything else comes from [`REPO_CONFIG_PATH`], read
-//! from the ref the job is cut from.
+//! A job's prompt arrives on the command line; everything else comes from
+//! [`REPO_CONFIG_PATH`], read from the ref the job is cut from — see
+//! [`crate::git::file_at_ref`] for why from a ref and never a checkout.
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -42,8 +42,8 @@ impl std::fmt::Display for ConfigError {
     }
 }
 
-// So a `ConfigError` can travel as an `anyhow::Error` from the one place a
-// job's plan cannot be built — without flattening it to a bare string first.
+// So a `ConfigError` can travel as an `anyhow::Error` without being flattened
+// to a bare string first.
 impl std::error::Error for ConfigError {}
 
 /// A setting worth flagging but not worth refusing to run over.
@@ -64,8 +64,6 @@ impl std::fmt::Display for Warning {
 }
 
 /// One repository's factory settings, as the repository itself declares them.
-///
-/// Read from a ref, never from a checkout — see [`RepoConfig::from_ref`].
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepoConfig {
@@ -112,13 +110,12 @@ impl RepoConfig {
         Self::parse(&src)
     }
 
-    /// Parse configuration from TOML text, without touching git.
-    ///
     /// # Errors
     ///
-    /// Returns an error for malformed syntax or an unknown key — the latter
-    /// because every config struct denies unknown fields, so a typo is
-    /// reported rather than silently defaulted.
+    /// Returns an error for malformed syntax or an unknown key — every config
+    /// struct denies unknown fields, so a misspelled *key* is reported rather
+    /// than silently defaulted. A misspelled provider *name* is not: those are
+    /// map keys, and surface later as [`ConfigError::UnknownProvider`].
     pub fn parse(src: &str) -> anyhow::Result<RepoConfig> {
         toml::from_str(src).map_err(|e| anyhow::anyhow!("parsing {REPO_CONFIG_PATH}: {e}"))
     }

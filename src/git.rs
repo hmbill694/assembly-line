@@ -12,8 +12,6 @@
 //! the functions whose failure means something *beyond* that document it
 //! individually.
 
-// The uniform contract above is stated once rather than repeated on thirty
-// functions, where it would train readers to skip `# Errors` sections.
 #![allow(clippy::missing_errors_doc)]
 
 use std::path::Path;
@@ -33,15 +31,13 @@ impl GitOutput {
         self.exit_code == 0
     }
 
-    /// Trimmed stdout, or an error carrying git's own message.
     fn stdout_or_error(self, operation: &str) -> anyhow::Result<String> {
         self.stdout_verbatim_or_error(operation)
             .map(|out| out.trim().to_string())
     }
 
-    /// Stdout exactly as git produced it, or an error carrying git's own
-    /// message. For file contents, where a trailing newline is part of the
-    /// file rather than noise.
+    /// For file contents, where a trailing newline is part of the file rather
+    /// than noise.
     fn stdout_verbatim_or_error(self, operation: &str) -> anyhow::Result<String> {
         match self.succeeded() {
             true => Ok(self.stdout),
@@ -97,8 +93,7 @@ pub async fn head_sha(repo: impl AsRef<Path>) -> anyhow::Result<String> {
 /// job atomic with respect to the ref: [`RepoConfig::from_ref`] resolves the
 /// same ref name earlier, to read config, and this resolves it again when the
 /// checkout starts. A branch that moves in between gives config from one
-/// commit and a tree from another — a narrow window (milliseconds, in
-/// practice) that this function does not close.
+/// commit and a tree from another — a window this function does not close.
 ///
 /// [`RepoConfig::from_ref`]: crate::config::RepoConfig::from_ref
 pub async fn sha_at_ref(repo: impl AsRef<Path>, git_ref: &str) -> anyhow::Result<String> {
@@ -156,7 +151,7 @@ pub async fn current_branch(repo: impl AsRef<Path>) -> anyhow::Result<Option<Str
 }
 
 /// Whether the repository has any commits yet. A freshly initialised repo has
-/// none, and nearly every other operation needs one to start from.
+/// none, and a job needs one to branch from.
 pub async fn has_commits(repo: impl AsRef<Path>) -> anyhow::Result<bool> {
     Ok(
         run_allowing_failure(repo, &["rev-parse", "--verify", "HEAD"])
@@ -229,11 +224,8 @@ pub async fn add_worktree_for_existing_branch(
     .map(|_| ())
 }
 
-/// Delete a branch whether or not it was merged.
-///
-/// Only ever called on a branch assembly-line created for a job attempt that
-/// a later attempt supersedes; the force is what makes an unmerged failed
-/// attempt collectable.
+/// Delete a branch whether or not it was merged — a superseded attempt is
+/// unmerged by definition, and a safe delete would refuse it.
 pub async fn delete_branch(repo: impl AsRef<Path>, branch: &str) -> anyhow::Result<()> {
     run_expecting_success(
         repo,
@@ -245,19 +237,14 @@ pub async fn delete_branch(repo: impl AsRef<Path>, branch: &str) -> anyhow::Resu
 }
 
 /// Whether `remote` is configured.
-///
-/// A repository with no remote is an ordinary local run, not a fault: the
-/// caller keeps the job's branch as a local ref instead of publishing it.
 pub async fn remote_exists(repo: impl AsRef<Path>, remote: &str) -> anyhow::Result<bool> {
     let configured = run_expecting_success(repo, &["remote"], "remote").await?;
     Ok(configured.lines().map(str::trim).any(|name| name == remote))
 }
 
-/// Push `branch` to `remote`.
-///
-/// Deliberately without `--set-upstream`: that writes `branch.*.remote` into
-/// the repository's config, and the target repository is never modified. A
-/// later round pushes the same branch name again and fast-forwards without it.
+/// Deliberately without `--set-upstream`: that would write `branch.*.remote`
+/// into the repository's config. A later round pushes the same branch name
+/// again and fast-forwards without it.
 pub async fn push_branch(repo: impl AsRef<Path>, remote: &str, branch: &str) -> anyhow::Result<()> {
     run_expecting_success(
         repo,
@@ -268,9 +255,8 @@ pub async fn push_branch(repo: impl AsRef<Path>, remote: &str, branch: &str) -> 
     .map(|_| ())
 }
 
-/// Remove a worktree and its administrative entry. Forcing is deliberate: the
-/// worktree is assembly-line's to discard, and it routinely holds untracked
-/// build output.
+/// Forcing is deliberate: the worktree is assembly-line's to discard, and it
+/// routinely holds untracked build output.
 pub async fn remove_worktree(repo: impl AsRef<Path>, path: impl AsRef<Path>) -> anyhow::Result<()> {
     let path_arg = path.as_ref().to_string_lossy().into_owned();
     run_expecting_success(
@@ -282,6 +268,11 @@ pub async fn remove_worktree(repo: impl AsRef<Path>, path: impl AsRef<Path>) -> 
     .map(|_| ())
 }
 
+/// Drop administrative entries for worktrees whose directories are gone.
+///
+/// Not optional: git still lists such a worktree and refuses to reuse its
+/// path until told otherwise, so deleting the directory alone leaves the name
+/// unusable.
 pub async fn prune_worktrees(repo: impl AsRef<Path>) -> anyhow::Result<()> {
     run_expecting_success(repo, &["worktree", "prune"], "worktree prune")
         .await
@@ -306,10 +297,8 @@ pub async fn commit_all(
 ///
 /// # Errors
 ///
-/// Beyond the usual git failures, this returns an error if a `never_commit`
-/// path is tracked after the commit — meaning the agent committed it itself.
-/// That is treated as fatal because the alternative is leaking a seeded
-/// credential onto a branch bound for a remote.
+/// Beyond the usual git failures, an error if a `never_commit` path is
+/// tracked once the commit is made — meaning the agent committed it itself.
 pub async fn commit_all_except(
     worktree: impl AsRef<Path>,
     message: &str,
@@ -318,7 +307,8 @@ pub async fn commit_all_except(
     let worktree = worktree.as_ref();
     run_expecting_success(worktree, &["add", "-A"], "add -A").await?;
 
-    // Unstaging a path that was never staged is a harmless no-op.
+    // `run_allowing_failure`: unstaging a path that was never staged is a
+    // no-op worth ignoring, not an error.
     for path in never_commit {
         run_allowing_failure(worktree, &["reset", "--quiet", "--", path]).await?;
     }
@@ -340,11 +330,9 @@ pub async fn commit_all_except(
     head_sha(worktree).await.map(Some)
 }
 
-/// Fail loudly if a path that must never be committed ended up tracked.
-///
-/// Unstaging covers commits assembly-line makes; this catches the case where
-/// the agent committed the file itself. For a seeded credential, a failed job
-/// is far better than a silent leak onto a branch bound for a remote.
+/// Unstaging covers the commits assembly-line makes; this catches the agent
+/// committing a seeded file itself. Fatal, because a failed job is far better
+/// than a leaked credential on a branch bound for a remote.
 async fn ensure_untracked(worktree: &Path, never_commit: &[String]) -> anyhow::Result<()> {
     if never_commit.is_empty() {
         return Ok(());
@@ -378,7 +366,6 @@ pub struct DiffStat {
     pub deletions: usize,
 }
 
-/// Numeric diff of a worktree's HEAD against `base`, for reporting at a gate.
 pub async fn diff_stat_against(worktree: impl AsRef<Path>, base: &str) -> anyhow::Result<DiffStat> {
     let numstat = run_expecting_success(
         worktree,

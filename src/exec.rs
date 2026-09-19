@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
-/// Why a command stopped. Every variant except `Exited(0)` fails its job.
+/// Why a command stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellOutcome {
     Exited(i32),
@@ -19,7 +19,6 @@ impl ShellOutcome {
         matches!(self, Self::Exited(0))
     }
 
-    /// A human-readable reason, or `None` when the command succeeded.
     #[must_use]
     pub fn failure_reason(&self) -> Option<String> {
         match self {
@@ -43,9 +42,8 @@ fn open_log_for_append(path: &Path) -> std::io::Result<std::fs::File> {
         })
 }
 
-/// Run `cmd` under `sh -c`, appending both stdout and stderr to `log_path`.
-/// Used for `verify`, where the user wrote a shell line and expects pipes and
-/// redirection to work.
+/// Under `sh -c`, for `verify`: the user wrote a shell line and expects pipes
+/// and redirection to work.
 ///
 /// # Errors
 ///
@@ -64,10 +62,7 @@ pub async fn run_shell(
     supervise(command, cmd, cwd, log_path, timeout, cancel).await
 }
 
-/// Run a program with an explicit argument vector, bypassing the shell.
-///
-/// Agent commands take this path: a prompt contains quotes, newlines and `$`,
-/// and must reach the program as one argument rather than being re-parsed.
+/// Bypassing the shell — see [`CommandSpec`] for why agent commands must.
 ///
 /// # Errors
 ///
@@ -86,13 +81,12 @@ pub async fn run_command(
     supervise(command, &spec.program, cwd, log_path, timeout, cancel).await
 }
 
-/// Spawn `command`, then wait for whichever comes first: exit, deadline, or
-/// cancellation. Shared so the timeout and kill semantics cannot drift between
-/// the two entry points.
+/// Wait for whichever comes first: exit, deadline, or cancellation. Shared so
+/// the timeout and kill semantics cannot drift between the two entry points.
 ///
-/// The child gets two independent append-mode descriptors on the same file, so
-/// output goes straight through the kernel and survives a kill — nothing is
-/// buffered in this process and there are no reader tasks to drain.
+/// The child gets two independent append-mode descriptors on the same file:
+/// nothing is buffered in *this* process and there are no reader tasks to
+/// drain, so a kill loses only whatever the child had buffered itself.
 async fn supervise(
     mut command: Command,
     described_as: &str,

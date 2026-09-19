@@ -3,15 +3,18 @@
 //! # Errors
 //!
 //! Functions here fail only for the usual filesystem reasons — a directory
-//! that cannot be created or read, a file that cannot be written. Anything
-//! beyond that is documented on the function.
+//! that cannot be created or read, a file that cannot be written. Only the
+//! functions whose failure means something *beyond* that document it
+//! individually.
+
+#![allow(clippy::missing_errors_doc)]
 
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Walk up from `from` looking for a `.git` entry — a directory in a normal
-/// repo, a file in a worktree checkout.
+/// `.git` is a directory in a normal repo and a file in a worktree checkout,
+/// so this tests for either.
 #[must_use]
 pub fn git_root(from: &Path) -> Option<PathBuf> {
     from.ancestors()
@@ -67,18 +70,18 @@ pub fn repo_slug(repo: &Path) -> String {
 
 /// Environment variable that moves every worktree somewhere other than
 /// `$HOME` — a faster disk, or a directory a test owns outright.
+///
+/// Worktrees live under `$HOME` by default, never inside the repository: the
+/// target repo must stay untouched, and a worktree inside it would need a
+/// `.gitignore` entry assembly-line is not entitled to add.
 pub const WORKTREE_ROOT_VAR: &str = "ASSEMBLY_WORKTREE_ROOT";
 
-/// Where worktrees go, given what the environment says.
-///
-/// The override wins outright and is used verbatim; otherwise they live under
-/// `$HOME`, never inside the repository — the target repo must stay untouched,
-/// and a worktree inside it would need a `.gitignore` entry we are not
-/// entitled to add.
+/// Where worktrees go, given what the environment says. The override wins
+/// outright and is used verbatim.
 ///
 /// Split from the lookup below because reading the environment is not
 /// something a test can do twice: `set_var` is process-global and unsafe under
-/// edition 2024, so the rule is testable only while it stays a function of its
+/// edition 2024, so the rule stays testable only while it is a function of its
 /// arguments.
 #[must_use]
 pub fn worktrees_root_given(
@@ -111,10 +114,6 @@ pub fn repo_worktrees_root(repo: &Path) -> Option<PathBuf> {
 }
 
 /// One job's worktrees.
-///
-/// Worktrees live under `$HOME`, never inside the repository — the target repo
-/// must stay untouched, and a worktree inside it would need a `.gitignore`
-/// entry we are not entitled to add.
 #[must_use]
 pub fn worktree_root(repo: &Path, job_id: u64) -> Option<PathBuf> {
     repo_worktrees_root(repo).map(|root| root.join(job_id.to_string()))
@@ -129,8 +128,7 @@ pub fn worktree_root(repo: &Path, job_id: u64) -> Option<PathBuf> {
 ///
 /// # Errors
 ///
-/// Returns an error if `$HOME` is unset, or if the directory or marker cannot
-/// be written.
+/// Beyond the usual, an error when `$HOME` is unset.
 pub fn record_repository_for_worktrees(repo: &Path) -> io::Result<PathBuf> {
     let dir = repo_worktrees_root(repo)
         .ok_or_else(|| io::Error::other("HOME is unset, so worktrees have nowhere to live"))?;
@@ -151,7 +149,6 @@ pub fn repository_owning_worktrees(repo_worktrees_root: &Path) -> Option<PathBuf
         .map(|path| PathBuf::from(path.trim_end_matches('\n')))
 }
 
-/// Job directories are named by integer. Anything else in there is ignored.
 fn existing_job_ids(jobs_root: &Path) -> io::Result<Vec<u64>> {
     match std::fs::read_dir(jobs_root) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -163,21 +160,13 @@ fn existing_job_ids(jobs_root: &Path) -> io::Result<Vec<u64>> {
     }
 }
 
-/// The id a new job should claim.
-///
-/// # Errors
-///
-/// Returns an error if the jobs directory exists but cannot be read. A
-/// missing directory is not an error — it means this is the first job.
+/// The id a new job should claim. A missing jobs directory is not an error —
+/// it means this is the first job.
 pub fn next_job_id(jobs_root: &Path) -> io::Result<u64> {
     existing_job_ids(jobs_root).map(|ids| ids.into_iter().max().unwrap_or(0) + 1)
 }
 
 /// The most recent job, or `None` when there have been none.
-///
-/// # Errors
-///
-/// Returns an error if the jobs directory exists but cannot be read.
 pub fn latest_job_id(jobs_root: &Path) -> io::Result<Option<u64>> {
     existing_job_ids(jobs_root).map(|ids| ids.into_iter().max())
 }
@@ -205,13 +194,9 @@ impl JobPaths {
         self.dir.join("job.log")
     }
 
-    /// Where the job's scratch checkout lives. `repo` is the repository the
-    /// job belongs to; it keys the path so concurrent jobs in two
-    /// repositories cannot claim the same directory.
-    ///
-    /// The checkout is one level below [`worktree_root`] rather than being it,
-    /// so removing the checkout leaves the job's own directory for `gc` to
-    /// find and report.
+    /// Where the job's scratch checkout lives, one level below
+    /// [`worktree_root`] rather than being it — so removing the checkout
+    /// leaves the job's own directory for `gc` to find and report.
     #[must_use]
     pub fn worktree(&self, repo: &Path) -> Option<PathBuf> {
         worktree_root(repo, self.id).map(|root| root.join("checkout"))
@@ -219,22 +204,14 @@ impl JobPaths {
 }
 
 /// Create the directory layout for a new job.
-///
-/// # Errors
-///
-/// Returns an error if the job directory cannot be created.
 pub fn create_job(jobs_root: &Path, id: u64) -> io::Result<JobPaths> {
     let dir = jobs_root.join(id.to_string());
     std::fs::create_dir_all(&dir)?;
     Ok(JobPaths { id, dir })
 }
 
-/// Locate an existing job.
-///
-/// # Errors
-///
-/// Returns `NotFound` if no directory exists for `id`, so `revise` and
-/// `status` can report a wrong job id rather than an empty result.
+/// Locate an existing job. `NotFound` rather than an empty result, so
+/// `revise` and `status` can report a wrong job id.
 pub fn open_job(jobs_root: &Path, id: u64) -> io::Result<JobPaths> {
     let dir = jobs_root.join(id.to_string());
     match dir.is_dir() {
@@ -256,20 +233,14 @@ pub struct JobMeta {
     pub provider: String,
 }
 
-/// # Errors
-///
-/// Returns an error if `meta.json` cannot be serialised or written.
 pub fn write_meta(paths: &JobPaths, meta: &JobMeta) -> io::Result<()> {
     serde_json::to_string_pretty(meta)
         .map_err(io::Error::other)
         .and_then(|body| std::fs::write(paths.meta(), body))
 }
 
-/// # Errors
-///
-/// Returns an error if `meta.json` is missing or is not valid JSON — which
-/// means the job directory was created by an incompatible version, or hand-
-/// edited.
+/// Invalid JSON here means the job directory was written by an incompatible
+/// version, or hand-edited.
 pub fn read_meta(paths: &JobPaths) -> io::Result<JobMeta> {
     std::fs::read_to_string(paths.meta())
         .and_then(|body| serde_json::from_str(&body).map_err(io::Error::other))

@@ -1,10 +1,9 @@
 //! Collecting what jobs leave behind.
 //!
 //! A job discards its own checkout as it finishes, so what is found here is
-//! narrow: whatever a job that died mid-round orphaned. That makes the policy
-//! small — **a job's worktrees are wanted exactly as long as the job is** —
-//! and `--older-than` exists only for the leftovers of jobs whose state was
-//! never cleaned up.
+//! whatever a job that died mid-round orphaned. The policy: a job's worktrees
+//! are wanted exactly as long as the job is, and `--older-than` exists only
+//! for the leftovers of jobs whose state was never cleaned up.
 //!
 //! Deciding and doing are separate: [`collectable`] reports what could go and
 //! why, which is what `--dry-run` prints, and [`remove`] is the only part that
@@ -33,7 +32,6 @@ pub struct RepositoryLeftovers {
     pub stale: Vec<StaleWorktree>,
 }
 
-/// Directories directly under `dir` whose names are job ids.
 fn job_directories(dir: &Path) -> Vec<(u64, PathBuf)> {
     std::fs::read_dir(dir)
         .into_iter()
@@ -56,7 +54,6 @@ fn subdirectories(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// How long ago `path` was last written, or `None` if that cannot be read.
 fn idle_time(path: &Path) -> Option<Duration> {
     std::fs::metadata(path)
         .and_then(|meta| meta.modified())
@@ -136,11 +133,8 @@ pub struct Removed {
     pub warnings: Vec<String>,
 }
 
-/// Delete the directories in `found`, then prune each repository's worktree
-/// list.
-///
-/// Git still lists a worktree whose directory is gone and will refuse to reuse
-/// the path until told otherwise, so the prune is not optional.
+/// Delete the directories in `found`, then [`git::prune_worktrees`] each
+/// repository.
 pub async fn remove(found: &[RepositoryLeftovers]) -> Removed {
     let mut removed = Removed::default();
 

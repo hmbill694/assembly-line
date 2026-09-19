@@ -24,8 +24,7 @@ pub struct RunOpts {
     pub repo: PathBuf,
     /// Where `copy` paths resolve from.
     pub seed_from: PathBuf,
-    /// The remote the job's branch is published to. A repository that has no
-    /// remote by this name keeps its branch locally instead.
+    /// The remote the job's branch is published to.
     pub remote: String,
 }
 
@@ -50,41 +49,34 @@ pub struct JobSpec<'a> {
     pub prompt: &'a str,
     pub provider: &'a str,
     pub base_ref: &'a str,
-    /// 1 for a first attempt; higher for a revise round, which continues the
-    /// job's own branch.
+    /// 1 for a first attempt; higher for a revise round.
     pub round: u32,
 }
 
 /// What an agent left behind, recorded on the job's branch.
-///
-/// This is the whole durable output of a job. The checkout it was produced in
-/// is gone by the time this exists.
 #[derive(Debug)]
 struct AgentWork {
     branch: String,
     sha: String,
     stat: git::DiffStat,
-    /// The remote the branch reached, or `None` for a repository with no such
-    /// remote — or one that refused the push.
+    /// As recorded in [`EventKind::JobBranchPublished`].
     pushed_to: Option<String>,
 }
 
-/// How a round ended.
+/// How a round ended. Every variant that can carry work does carry it: a
+/// round is judged after its work is preserved, never instead of.
 #[derive(Debug)]
 enum RoundResult {
     /// An agent that correctly decided nothing needed doing.
     Succeeded,
-    /// An agent left work, which was committed and published.
-    Committed { work: AgentWork },
-    /// `verify` rejected an otherwise-successful round. The work — if there
-    /// was any — is preserved regardless: a rejection is exactly the case
-    /// where the diff is worth reading.
+    Committed {
+        work: AgentWork,
+    },
+    /// `verify` rejected an otherwise-successful round.
     VerifyRejected {
         reason: String,
         work: Option<AgentWork>,
     },
-    /// `work` carries whatever the agent had produced before it failed. That
-    /// work is preserved on the job's branch.
     Failed {
         reason: String,
         work: Option<AgentWork>,
@@ -122,8 +114,7 @@ impl RoundResult {
 #[derive(Debug)]
 struct JobPlan {
     repo: PathBuf,
-    /// The commit the checkout starts at — the base ref for a first attempt,
-    /// the job's own branch tip for a revise round.
+    /// The commit the checkout starts at — see [`start_commit_for_round`].
     start_sha: String,
     workspace_path: PathBuf,
     branch: String,
@@ -132,9 +123,6 @@ struct JobPlan {
     command: CommandSpec,
     commit_message: String,
     remote: String,
-    /// A first attempt cuts a fresh branch off the base; a revise round
-    /// continues the job's own branch, so the agent starts from its prior
-    /// work.
     continues_branch: bool,
     /// The command that decides whether the round's work is accepted, or
     /// `None` for a repository with no `verify` — which accepts on the
@@ -162,12 +150,7 @@ fn commit_message(job_id: u64, prompt: &str) -> String {
 }
 
 /// The prompt a revise round carries: what was originally asked, then what to
-/// change about the answer.
-///
-/// The agent's prior work is already committed in the tree it is about to be
-/// dropped into, so the feedback is the only new context it needs. That is
-/// what makes revising behave identically across every provider — no session
-/// replay, no conversation history.
+/// change about the answer. See [`revise_job`] for why that is enough.
 fn revised_prompt(original: &str, feedback: &str) -> String {
     format!(
         "{original}\n\n---\n\nYour previous attempt is already committed in this \
@@ -214,7 +197,8 @@ fn job_plan(
 }
 
 /// Where this round's checkout starts: the ref the job was cut from for a
-/// first attempt, the job's own branch tip for a revise round.
+/// first attempt, the job's own branch tip for a revise round — which is how
+/// the agent arrives at its prior work.
 ///
 /// Also records which repository these worktrees belong to, so `gc` can
 /// collect them without being run from the repository itself.
@@ -281,8 +265,10 @@ pub struct Revision<'a> {
 /// Another round on this job's branch, with feedback folded into the prompt.
 ///
 /// A revise is a *new job*, not a resumption. Nothing is kept from the last
-/// round except the branch — which is exactly what the agent needs, because
-/// its prior work arrives as files on disk.
+/// round except the branch, and that is enough: the agent's prior work
+/// arrives as files on disk, already committed in the tree it is dropped
+/// into. No session replay, no conversation history — which is what makes
+/// revising behave identically across every provider.
 ///
 /// # Errors
 ///
@@ -377,11 +363,8 @@ async fn round_result(
     let (work, verdict) = settled.work_and_verdict()?;
 
     Ok(match (agent_failure, verdict) {
-        // The two failures that are not judgements about the work: an agent
-        // failure, which is the earlier and more fundamental one and is why
-        // `verify` was never asked; and a `verify` killed before it could
-        // judge anything, which fails the round as itself rather than as a
-        // rejection.
+        // Neither of these is a judgement about the work, so neither becomes
+        // a `VerifyRejected`.
         (Some(reason), _) | (None, VerifyVerdict::Interrupted { reason }) => {
             RoundResult::Failed { reason, work }
         }
@@ -410,16 +393,11 @@ enum VerifyVerdict {
     Interrupted { reason: String },
 }
 
-/// What `verify` made of what the agent left. A repository with no `verify`
-/// raises no objection, so the round succeeds on the agent's exit code alone.
-///
-/// Runs in the job's own checkout, after the commit, so it judges exactly the
-/// tree the branch carries.
+/// What `verify` made of what the agent left, run in the job's own checkout
+/// after the commit, so it judges exactly the tree the branch carries.
 ///
 /// The outcome is matched here rather than flattened through
-/// `ShellOutcome::failure_reason`, which cannot tell `exit 1` from a kill: a
-/// rejection is a verdict about the work, and an interruption is the absence
-/// of one.
+/// `ShellOutcome::failure_reason`, which cannot tell `exit 1` from a kill.
 async fn verify_verdict(
     verify: Option<&str>,
     workspace: &Path,
@@ -447,7 +425,6 @@ async fn verify_verdict(
     )
 }
 
-/// What the agent left on the job's branch, or `None` when it changed nothing.
 async fn agent_work_on_branch(
     plan: &JobPlan,
     ws: &JobWorkspace,
@@ -464,13 +441,9 @@ async fn agent_work_on_branch(
     }))
 }
 
-/// The remote the branch reached, or `None` for a repository that has no such
-/// remote *and* for a push the remote refused.
-///
-/// Neither is worth losing the record over. The branch is a local ref holding
-/// the agent's work either way, and the branch is the job's whole durable
-/// output — dropping `JobBranchPublished` because a remote was unreachable
-/// would erase the only trace of the one thing a job is for.
+/// A refused push is swallowed rather than failing the round: dropping
+/// [`EventKind::JobBranchPublished`] would erase the record of the branch,
+/// which holds the work either way.
 async fn remote_the_branch_reached(plan: &JobPlan, ws: &JobWorkspace) -> Option<String> {
     match workspace::publish(&plan.repo, ws, &plan.remote).await {
         Ok(reached) => reached,
@@ -495,8 +468,6 @@ fn record_completion(log: &mut EventLog, result: RoundResult) -> anyhow::Result<
     Ok(outcome)
 }
 
-/// Recording what an agent left: the commit, then where its branch went.
-///
 /// Empty for an agent that correctly changed nothing.
 fn work_recorded(work: Option<&AgentWork>) -> Vec<EventKind> {
     work.map(|w| {

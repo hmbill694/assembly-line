@@ -40,9 +40,8 @@ pub struct JobReport {
     pub diff: Option<DiffSummary>,
     /// Failure reason, when there is one.
     pub detail: Option<String>,
-    /// The branch the job's work is on, once it has been published. This is
-    /// the job's whole durable output, so a report without it is a job that
-    /// has not produced anything yet.
+    /// The branch the job's work is on, once it has been published. `None` is
+    /// a job that has not produced anything yet.
     pub branch: Option<String>,
 }
 
@@ -59,7 +58,6 @@ struct JobProgress {
 }
 
 impl JobProgress {
-    /// Fold one event in. Written to be passed directly to `Iterator::fold`.
     fn after_event(self, event: &Event) -> Self {
         match &event.kind {
             // A new round restarts the clock and clears the previous round's
@@ -85,16 +83,13 @@ impl JobProgress {
                 }),
                 ..self
             },
-            // Publishing moves a ref, not the job's own progress — but it is
-            // where the branch's name enters the record.
+            // Where the branch's name enters the record.
             EventKind::JobBranchPublished { branch, .. } => JobProgress {
                 branch: Some(branch.clone()),
                 ..self
             },
-            // A progress marker, like `JobCommitted` — the transition to
-            // `Failed` comes from the `JobFailed` that always follows it.
-            // Setting `detail` here only matters if that invariant is ever
-            // broken; when it holds, `JobFailed`'s reason overwrites it.
+            // `detail` here only matters if the `JobFailed` that always
+            // follows is ever missing; when it is not, its reason overwrites.
             EventKind::JobVerifyFailed { reason } => JobProgress {
                 detail: Some(format!("verify rejected the work: {reason}")),
                 ..self

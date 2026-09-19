@@ -27,20 +27,15 @@ pub fn job_branch_name(job_id: u64) -> String {
 pub enum StartPoint<'a> {
     /// Cut a fresh branch at this commit, superseding any earlier attempt's.
     FreshBranch(&'a str),
-    /// Continue the job's existing branch. A revise round is a new job, but
-    /// it appends to the branch rather than replacing the record of what came
-    /// before — which is also how the agent sees its own prior work, as files
-    /// on disk, with no session replay.
+    /// Append to the job's existing branch rather than replacing the record
+    /// of what came before.
     ContinueBranch,
 }
 
-/// Create a worktree for `branch` and seed it.
-///
 /// # Errors
 ///
-/// Returns an error if a declared seed path does not exist under `seed_from`,
-/// if the worktree cannot be created, or if a copy fails. Seed paths are
-/// checked before the worktree is made, so a typo leaves nothing behind.
+/// Seed paths are checked *before* the worktree is made, so a typo leaves
+/// nothing behind.
 pub async fn create(
     repo: impl AsRef<Path>,
     path: impl AsRef<Path>,
@@ -88,12 +83,8 @@ pub async fn create(
     })
 }
 
-/// Free the checkout path, whatever is holding it.
-///
-/// Jobs discard their own scratch, so anything found here is the residue of a
-/// job that died mid-round. Git will not reuse the path while it is claimed —
-/// and a worktree whose directory is already gone still holds its
-/// administrative entry, which alone is enough to make the name unusable.
+/// Free the checkout path, whatever is holding it. Anything found here is the
+/// residue of a job that died mid-round, since jobs discard their own scratch.
 async fn clear_previous_checkout(repo: &Path, path: &Path) -> anyhow::Result<()> {
     git::prune_worktrees(repo).await?;
 
@@ -114,27 +105,25 @@ async fn clear_previous_attempt(repo: &Path, path: &Path, branch: &str) -> anyho
     }
 }
 
-/// Commit whatever the agent left, excluding seeded files. `None` means the
-/// agent changed nothing.
+/// `None` means the agent changed nothing.
 ///
 /// # Errors
 ///
-/// See [`git::commit_all_except`] — notably, an error if the agent committed a
-/// seeded file itself.
+/// See [`git::commit_all_except`].
 pub async fn commit(ws: &JobWorkspace, message: &str) -> anyhow::Result<Option<String>> {
     git::commit_all_except(&ws.path, message, &ws.seeded).await
 }
 
-/// Make the job's branch durable, returning the remote it reached.
-///
-/// A job is stateless: its checkout is scratch and the branch is the only
-/// thing that outlives it. `None` means the repository has no such remote, so
-/// the branch stays a local ref — an ordinary local run, not a failure.
+/// Make the job's branch durable, returning the remote it reached, or `None`
+/// when the repository has no such remote — see
+/// [`EventKind::JobBranchPublished`](crate::event::EventKind::JobBranchPublished).
 ///
 /// # Errors
 ///
 /// Returns an error if the remote cannot be listed, or if the push is
-/// rejected.
+/// rejected. Note the asymmetry: a *missing* remote is `Ok(None)`, a
+/// *refused* push is `Err` — callers that treat the two alike flatten it
+/// themselves.
 pub async fn publish(
     repo: impl AsRef<Path>,
     ws: &JobWorkspace,
@@ -149,12 +138,11 @@ pub async fn publish(
     }
 }
 
-/// Remove the checkout. The branch survives, because it is the record of what
-/// the job did.
+/// Remove the checkout. The branch survives.
 ///
 /// # Errors
 ///
-/// Returns an error if git cannot remove the worktree.
+/// See [`git::remove_worktree`].
 pub async fn discard(repo: impl AsRef<Path>, ws: &JobWorkspace) -> anyhow::Result<()> {
     git::remove_worktree(repo, &ws.path).await
 }

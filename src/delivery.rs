@@ -1,7 +1,4 @@
-//! Getting a finished job's work off the machine, as a pull request.
-//!
-//! Delivery is the last step of the job contract: a job's output is a branch,
-//! and this is what makes that branch someone else's to look at.
+//! Getting a finished job's branch off the machine, as a pull request.
 
 use crate::config::{Delivery, DeliveryMode};
 use crate::git;
@@ -37,8 +34,6 @@ impl std::fmt::Display for Delivered {
     }
 }
 
-/// Publish a finished job's branch according to `delivery`.
-///
 /// # Errors
 ///
 /// Returns an error only if git itself fails — a push rejected because the
@@ -66,8 +61,7 @@ pub async fn deliver(
     }
 }
 
-/// Ask `gh` for a pull request. Never fatal — the branch is already pushed, so
-/// the worst case is that a human opens the PR themselves.
+/// Ask `gh` for a pull request. Never fatal — the branch is already pushed.
 async fn open_pull_request(repo: &Path, job_branch: &str, base: &str) -> Delivered {
     let attempt = Command::new("gh")
         .args([

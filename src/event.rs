@@ -28,9 +28,9 @@ pub enum EventKind {
     /// Both are complete outcomes, not degraded ones: the branch exists and
     /// holds the work.
     ///
-    /// Emitted for failed jobs too, and whatever became of the push: a job
-    /// leaves nothing but its branch, so this is what makes the work
-    /// findable at all.
+    /// Emitted for failed jobs too, and whatever became of the push. A job
+    /// leaves nothing but its branch, so this is what makes the work findable
+    /// at all.
     JobBranchPublished {
         branch: String,
         pushed_to: Option<String>,
@@ -64,14 +64,12 @@ pub struct Event {
 
 /// Parse a newline-delimited event stream from any reader.
 ///
-/// A line that does not parse is skipped, not fatal: the common cause is a
-/// torn final line from a crash mid-write, and the events before it are still
-/// the truth about what happened.
+/// A line that does not parse is skipped, not fatal: a torn final line from a
+/// crash mid-write must not cost us the events before it.
 ///
 /// # Errors
 ///
-/// Returns an error only if the underlying reader fails. Unparseable lines
-/// are logged and skipped rather than failing the read.
+/// Returns an error only if the underlying reader fails.
 pub fn read_events(src: impl BufRead) -> io::Result<Vec<Event>> {
     src.lines()
         .collect::<io::Result<Vec<String>>>()
@@ -92,9 +90,6 @@ pub fn read_events(src: impl BufRead) -> io::Result<Vec<Event>> {
 
 /// Append-only event sink. The log is the source of truth for a job; it is
 /// never rewritten or truncated.
-///
-/// Generic over its sink so tests can write into a buffer, defaulting to the
-/// on-disk file that real runs use.
 #[derive(Debug)]
 pub struct EventLog<W: Write = File> {
     sink: W,
@@ -105,7 +100,8 @@ impl<W: Write> EventLog<W> {
         EventLog { sink }
     }
 
-    /// Append one event and flush, so a crash cannot lose it.
+    /// Append one event and flush, so a crashing *process* cannot lose it.
+    /// There is no `fsync`, so a machine that loses power still can.
     ///
     /// # Errors
     ///
@@ -130,8 +126,6 @@ impl<W: Write> EventLog<W> {
 }
 
 impl EventLog<File> {
-    /// Open a log for appending, creating it and its parent if needed.
-    ///
     /// # Errors
     ///
     /// Returns an error if the parent directory cannot be created or the file
