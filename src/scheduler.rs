@@ -71,7 +71,7 @@ struct AgentWork {
 
 /// How a round ended.
 #[derive(Debug)]
-enum JobResult {
+enum RoundResult {
     /// An agent that correctly decided nothing needed doing.
     Succeeded,
     /// An agent left work, which was committed and published.
@@ -91,27 +91,27 @@ enum JobResult {
     },
 }
 
-impl JobResult {
+impl RoundResult {
     /// A command's outcome, where an unspawnable program and a non-zero exit
     /// both mean the job failed — but with different reasons.
     fn from_command(outcome: anyhow::Result<ShellOutcome>) -> Self {
         match outcome.map(|o| o.failure_reason()) {
-            Err(unspawnable) => JobResult::Failed {
+            Err(unspawnable) => RoundResult::Failed {
                 reason: unspawnable.to_string(),
                 work: None,
             },
-            Ok(Some(reason)) => JobResult::Failed { reason, work: None },
-            Ok(None) => JobResult::Succeeded,
+            Ok(Some(reason)) => RoundResult::Failed { reason, work: None },
+            Ok(None) => RoundResult::Succeeded,
         }
     }
 
     /// The reason this round failed, if the agent itself is what failed it.
     fn failure_reason(self) -> Option<String> {
         match self {
-            JobResult::Failed { reason, .. } => Some(reason),
-            JobResult::Succeeded
-            | JobResult::Committed { .. }
-            | JobResult::VerifyRejected { .. } => None,
+            RoundResult::Failed { reason, .. } => Some(reason),
+            RoundResult::Succeeded
+            | RoundResult::Committed { .. }
+            | RoundResult::VerifyRejected { .. } => None,
         }
     }
 }
@@ -142,6 +142,8 @@ struct JobPlan {
     verify: Option<String>,
 }
 
+/// The cap on one command. Both the agent and `verify` get it in full — see
+/// [`RepoConfig::max_duration`].
 fn wall_clock_limit(config: &RepoConfig) -> anyhow::Result<Option<Duration>> {
     config
         .max_duration
@@ -260,7 +262,7 @@ pub async fn run_job(
         // The round could not be administered at all — no sandbox, or git
         // refused. Any partial work is described by the error, not by a branch
         // we can name.
-        .unwrap_or_else(|e| JobResult::Failed {
+        .unwrap_or_else(|e| RoundResult::Failed {
             reason: e.to_string(),
             work: None,
         });
@@ -303,6 +305,32 @@ pub async fn revise_job(
     run_job(config, &spec, paths, log, opts).await
 }
 
+/// What a round settled to, in the order it settled: the agent's work
+/// preserved on the branch, the verdict on it, then the scratch checkout's
+/// removal.
+///
+/// Three held `Result`s rather than three `?`s. The checkout is scratch
+/// holding whatever was seeded into it, so leaving it behind for `gc` because
+/// an earlier git call failed is not an option — and building this as one
+/// value leaves nowhere to put a `?` that would skip the discard.
+#[derive(Debug)]
+struct RoundSettlement {
+    preserved: anyhow::Result<Option<AgentWork>>,
+    verdict: anyhow::Result<VerifyVerdict>,
+    discarded: anyhow::Result<()>,
+}
+
+impl RoundSettlement {
+    /// What the round produced and what was made of it — answered only once
+    /// the checkout is gone.
+    fn work_and_verdict(self) -> anyhow::Result<(Option<AgentWork>, VerifyVerdict)> {
+        let work = self.preserved?;
+        let verdict = self.verdict?;
+        self.discarded?;
+        Ok((work, verdict))
+    }
+}
+
 /// One round, from empty checkout to discarded checkout.
 ///
 /// The agent's work is committed and published *before* success is decided:
@@ -313,7 +341,7 @@ async fn round_result(
     log_path: &Path,
     timeout: Option<Duration>,
     cancel: CancellationToken,
-) -> anyhow::Result<JobResult> {
+) -> anyhow::Result<RoundResult> {
     let start = match plan.continues_branch {
         true => workspace::StartPoint::ContinueBranch,
         false => workspace::StartPoint::FreshBranch(&plan.start_sha),
@@ -329,37 +357,24 @@ async fn round_result(
     )
     .await?;
 
-    let ran = JobResult::from_command(
+    let ran = RoundResult::from_command(
         run_command(&plan.command, &ws.path, log_path, timeout, cancel.clone()).await,
     );
     // Taken once, up front: it decides both whether `verify` is worth running
     // and how the round ends, and an agent failure wins over either answer.
     let agent_failure = ran.failure_reason();
 
-    // Preserve first, judge after — and discard the checkout whichever way
-    // preserving went. The checkout is scratch holding whatever was seeded
-    // into it, so leaving it for `gc` because a git call failed is not an
-    // option; both outcomes are held and reported after it is gone.
-    //
-    // `verify` runs here too, in this same checkout, after the commit: it
-    // judges exactly the tree the branch now carries, and what it gates is
-    // delivery, never the branch's survival. A round whose agent already
-    // failed skips it: there is nothing to judge but an abandoned tree, and
-    // the answer could not change the outcome — so at least the failure path
-    // does not also pay for a `verify` run. It is not a general budget,
-    // though: `verify` is a user-authored shell line that gets its own full
-    // `max_duration`, same as the agent, so a round that succeeds can still
-    // take up to 2x `max_duration` end to end. A shared remaining-budget is a
-    // later milestone's problem.
-    let preserved = agent_work_on_branch(plan, &ws).await;
-    let verdict = match agent_failure {
-        Some(_) => Ok(VerifyVerdict::NoObjection),
-        None => verify_verdict(plan.verify.as_deref(), &ws.path, log_path, timeout, cancel).await,
+    let settled = RoundSettlement {
+        preserved: agent_work_on_branch(plan, &ws).await,
+        verdict: match agent_failure {
+            Some(_) => Ok(VerifyVerdict::NoObjection),
+            None => {
+                verify_verdict(plan.verify.as_deref(), &ws.path, log_path, timeout, cancel).await
+            }
+        },
+        discarded: workspace::discard(&plan.repo, &ws).await,
     };
-    let discarded = workspace::discard(&plan.repo, &ws).await;
-    let work = preserved?;
-    let verdict = verdict?;
-    discarded?;
+    let (work, verdict) = settled.work_and_verdict()?;
 
     Ok(match (agent_failure, verdict) {
         // The two failures that are not judgements about the work: an agent
@@ -368,12 +383,12 @@ async fn round_result(
         // judge anything, which fails the round as itself rather than as a
         // rejection.
         (Some(reason), _) | (None, VerifyVerdict::Interrupted { reason }) => {
-            JobResult::Failed { reason, work }
+            RoundResult::Failed { reason, work }
         }
-        (None, VerifyVerdict::Rejected { reason }) => JobResult::VerifyRejected { reason, work },
+        (None, VerifyVerdict::Rejected { reason }) => RoundResult::VerifyRejected { reason, work },
         (None, VerifyVerdict::NoObjection) => match work {
-            None => JobResult::Succeeded,
-            Some(work) => JobResult::Committed { work },
+            None => RoundResult::Succeeded,
+            Some(work) => RoundResult::Committed { work },
         },
     })
 }
@@ -470,7 +485,7 @@ async fn remote_the_branch_reached(plan: &JobPlan, ws: &JobWorkspace) -> Option<
     }
 }
 
-fn record_completion(log: &mut EventLog, result: JobResult) -> anyhow::Result<JobOutcome> {
+fn record_completion(log: &mut EventLog, result: RoundResult) -> anyhow::Result<JobOutcome> {
     let (events, outcome) = events_for_completion(result);
 
     events
@@ -506,19 +521,19 @@ fn work_recorded(work: Option<&AgentWork>) -> Vec<EventKind> {
 ///
 /// Pure, so the ordering that makes replay correct can be asserted without
 /// running anything. Work is recorded before the verdict that judges it.
-fn events_for_completion(result: JobResult) -> (Vec<EventKind>, JobOutcome) {
+fn events_for_completion(result: RoundResult) -> (Vec<EventKind>, JobOutcome) {
     let finished = EventKind::JobFinished { exit_code: 0 };
 
     match result {
-        JobResult::Succeeded => (vec![finished], JobOutcome::Passed),
-        JobResult::Failed { reason, work } => (
+        RoundResult::Succeeded => (vec![finished], JobOutcome::Passed),
+        RoundResult::Failed { reason, work } => (
             work_recorded(work.as_ref())
                 .into_iter()
                 .chain([EventKind::JobFailed { reason }])
                 .collect(),
             JobOutcome::Failed,
         ),
-        JobResult::VerifyRejected { reason, work } => (
+        RoundResult::VerifyRejected { reason, work } => (
             work_recorded(work.as_ref())
                 .into_iter()
                 .chain([
@@ -532,7 +547,7 @@ fn events_for_completion(result: JobResult) -> (Vec<EventKind>, JobOutcome) {
                 .collect(),
             JobOutcome::Failed,
         ),
-        JobResult::Committed { work } => (
+        RoundResult::Committed { work } => (
             work_recorded(Some(&work))
                 .into_iter()
                 .chain([finished])
