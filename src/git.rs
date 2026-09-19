@@ -179,8 +179,17 @@ pub async fn branch_exists(repo: impl AsRef<Path>, branch: &str) -> anyhow::Resu
     .succeeded())
 }
 
+/// `git worktree add` creates the worktree directory itself, but not the path
+/// leading to it.
+fn make_room_for_worktree(path: &Path) -> std::io::Result<()> {
+    match path.parent() {
+        Some(parent) => std::fs::create_dir_all(parent),
+        None => Ok(()),
+    }
+}
+
 /// Create `branch` at `start_point` and check it out into a new worktree at
-/// `path`. The repository's own working tree is left alone.
+/// `path`.
 pub async fn add_worktree(
     repo: impl AsRef<Path>,
     path: impl AsRef<Path>,
@@ -188,9 +197,7 @@ pub async fn add_worktree(
     start_point: &str,
 ) -> anyhow::Result<()> {
     let path = path.as_ref();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    make_room_for_worktree(path)?;
     let path_arg = path.to_string_lossy().into_owned();
 
     run_expecting_success(
@@ -203,17 +210,14 @@ pub async fn add_worktree(
 }
 
 /// Check an existing branch out into a new worktree, rather than creating the
-/// branch. Used when a run's branch outlived its checkout — `gc` removed it,
-/// or a crash did.
+/// branch — how a revise round picks its own branch back up.
 pub async fn add_worktree_for_existing_branch(
     repo: impl AsRef<Path>,
     path: impl AsRef<Path>,
     branch: &str,
 ) -> anyhow::Result<()> {
     let path = path.as_ref();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    make_room_for_worktree(path)?;
     let path_arg = path.to_string_lossy().into_owned();
 
     run_expecting_success(
