@@ -1,5 +1,4 @@
 /target
-.assembly/
 
 # macOS writes these into any directory Finder has looked at.
 .DS_Store
