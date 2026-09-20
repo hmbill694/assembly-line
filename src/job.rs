@@ -171,23 +171,27 @@ fn job_plan(
     })
 }
 
-/// Where this round's checkout starts: the ref the job was cut from for a
-/// first attempt, the job's own branch tip for a revise round — which is how
-/// the agent arrives at its prior work.
-///
-/// Also records which repository these worktrees belong to, so `gc` can
-/// collect them without being run from the repository itself.
-async fn start_commit_for_round(
-    repo: &Path,
-    branch: &str,
-    spec: &JobSpec<'_>,
-) -> anyhow::Result<String> {
+/// What must be true, and true on disk, before a round can start: the
+/// repository has something to branch from, and its worktree directory
+/// records which repository it belongs to — which is what lets `gc` collect
+/// those worktrees without being run from the repository itself.
+async fn ready_repository_for_worktrees(repo: &Path) -> anyhow::Result<()> {
     anyhow::ensure!(
         git::has_commits(repo).await?,
         "the repository has no commits, so a job has nothing to branch from"
     );
     paths::record_repository_for_worktrees(repo)?;
+    Ok(())
+}
 
+/// Where this round's checkout starts: the ref the job was cut from for a
+/// first attempt, the job's own branch tip for a revise round — which is how
+/// the agent arrives at its prior work.
+async fn start_commit_for_round(
+    repo: &Path,
+    branch: &str,
+    spec: &JobSpec<'_>,
+) -> anyhow::Result<String> {
     match spec.round > 1 {
         true => git::branch_tip(repo, branch).await,
         false => git::sha_at_ref(repo, spec.base_ref).await,
@@ -210,6 +214,8 @@ pub async fn run_job(
     opts: &RunOpts,
 ) -> anyhow::Result<JobOutcome> {
     let timeout = wall_clock_limit(config)?;
+    ready_repository_for_worktrees(&opts.repo).await?;
+
     let branch = job_branch_name(paths.id);
     let start_sha = start_commit_for_round(&opts.repo, &branch, spec).await?;
     let plan = job_plan(config, spec, paths, opts, &start_sha)?;
