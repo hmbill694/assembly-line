@@ -54,9 +54,14 @@ fn install_tracing() {
         .init();
 }
 
-fn in_async_runtime(work: impl Future<Output = ExitCode>) -> ExitCode {
+/// Where every async command's usage error is reported, so none of them has to
+/// unwind one by hand.
+fn in_async_runtime(work: impl Future<Output = Result<ExitCode, String>>) -> ExitCode {
     match tokio::runtime::Runtime::new() {
-        Ok(runtime) => runtime.block_on(work),
+        Ok(runtime) => match runtime.block_on(work) {
+            Ok(code) => code,
+            Err(e) => fail_with_usage_error(e),
+        },
         Err(e) => fail_with_usage_error(format!("starting the async runtime: {e}")),
     }
 }
@@ -159,27 +164,14 @@ async fn start_new_job(
     repo: Option<PathBuf>,
     base_ref: Option<String>,
     provider: Option<String>,
-) -> ExitCode {
-    let ready = match prepare_job(prompt, prompt_file, repo, base_ref, provider).await {
-        Ok(ready) => ready,
-        Err(e) => return fail_with_usage_error(e),
-    };
+) -> Result<ExitCode, String> {
     let PreparedJob {
         repo,
         base_ref,
         prompt,
         provider,
         config,
-    } = ready;
-
-    // Allocated only once the config is known good, so a repository that has
-    // not opted in leaves no litter.
-    let jobs_root = paths::jobs_root(&repo);
-    let paths =
-        match paths::next_job_id(&jobs_root).and_then(|id| paths::create_job(&jobs_root, id)) {
-            Ok(p) => p,
-            Err(e) => return fail_with_usage_error(format!("preparing the job directory: {e}")),
-        };
+    } = prepare_job(prompt, prompt_file, repo, base_ref, provider).await?;
 
     let meta = JobMeta {
         repo: repo.clone(),
@@ -187,32 +179,53 @@ async fn start_new_job(
         prompt: prompt.clone(),
         provider: provider.clone(),
     };
-    if let Err(e) = paths::write_meta(&paths, &meta) {
-        return fail_with_usage_error(format!("writing meta.json: {e}"));
-    }
+    let (paths, mut log) = allocate_job(&meta)?;
 
-    let mut log = match EventLog::open_append(paths.events()) {
-        Ok(log) => log,
-        Err(e) => return fail_with_usage_error(format!("opening the event log: {e}")),
-    };
     let spec = JobSpec {
         prompt: &prompt,
         provider: &provider,
         base_ref: &base_ref,
         round: 1,
     };
+    let outcome = run_job(&config, &spec, &paths, &mut log, &machine_opts(&repo))
+        .await
+        .map_err(|e| e.to_string())?;
 
-    let outcome = run_job(&config, &spec, &paths, &mut log, &machine_opts(&repo)).await;
+    let code = finish_job(&repo, &config, &base_ref, &paths, outcome).await;
+    println!("state: {}", paths.dir.display());
+    Ok(code)
+}
 
-    match outcome {
-        Err(e) => fail_with_usage_error(e),
-        Ok(outcome) => {
-            let branch = report_and_branch(&paths);
-            deliver_if_verified(&repo, &config, &base_ref, branch.as_deref(), outcome).await;
-            println!("state: {}", paths.dir.display());
-            exit_code_for(outcome)
-        }
-    }
+/// A new job's directory, its `meta.json` and its open event log.
+///
+/// Allocated only once the config is known good, so a repository that has not
+/// opted in leaves no litter.
+fn allocate_job(meta: &JobMeta) -> Result<(JobPaths, EventLog), String> {
+    let jobs_root = paths::jobs_root(&meta.repo);
+
+    let paths = paths::next_job_id(&jobs_root)
+        .and_then(|id| paths::create_job(&jobs_root, id))
+        .map_err(|e| format!("preparing the job directory: {e}"))?;
+
+    paths::write_meta(&paths, meta).map_err(|e| format!("writing meta.json: {e}"))?;
+
+    EventLog::open_append(paths.events())
+        .map(|log| (paths, log))
+        .map_err(|e| format!("opening the event log: {e}"))
+}
+
+/// What both `run` and `revise` do once the round is over: say what it left,
+/// hand its branch on, and settle the exit code.
+async fn finish_job(
+    repo: &Path,
+    config: &RepoConfig,
+    base_ref: &str,
+    paths: &JobPaths,
+    outcome: JobOutcome,
+) -> ExitCode {
+    let branch = report_and_branch(paths);
+    deliver_if_verified(repo, config, base_ref, branch.as_deref(), outcome).await;
+    exit_code_for(outcome)
 }
 
 /// Everything a job needs before a directory is allocated for it, so a
@@ -369,68 +382,57 @@ fn rounds_so_far(events: &[Event]) -> u32 {
 }
 
 /// Run a job again with feedback. The round appends to the job's branch.
-async fn revise_existing_job(job_id: u64, feedback: String, repo: Option<PathBuf>) -> ExitCode {
-    let (paths, meta) = match locate_job(Some(job_id), repo) {
-        Ok(found) => found,
-        Err(e) => return fail_with_usage_error(e),
-    };
-    let events = match events_of(&paths) {
-        Ok(events) => events,
-        Err(e) => return fail_with_usage_error(e),
-    };
+async fn revise_existing_job(
+    job_id: u64,
+    feedback: String,
+    repo: Option<PathBuf>,
+) -> Result<ExitCode, String> {
+    let (paths, meta) = locate_job(Some(job_id), repo)?;
+    let events = events_of(&paths)?;
 
     // `base_ref`, not the job's own branch: the previous round is not allowed
     // to have changed the settings that govern this one.
-    let declared = match RepoConfig::from_ref(&meta.repo, &meta.base_ref).await {
-        Ok(config) => config,
-        Err(e) => return fail_with_usage_error(e),
-    };
-    let (config, _) = match config_and_provider(declared, Some(meta.provider.clone())) {
-        Ok(ready) => ready,
-        Err(e) => return fail_with_usage_error(e),
-    };
+    let declared = RepoConfig::from_ref(&meta.repo, &meta.base_ref)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (config, _) = config_and_provider(declared, Some(meta.provider.clone()))?;
 
-    let mut log = match EventLog::open_append(paths.events()) {
-        Ok(log) => log,
-        Err(e) => return fail_with_usage_error(format!("opening the event log: {e}")),
-    };
+    let mut log =
+        EventLog::open_append(paths.events()).map_err(|e| format!("opening the event log: {e}"))?;
+
     let round = rounds_so_far(&events) + 1;
     println!("revising job {job_id} (round {round})");
 
-    let opts = machine_opts(&meta.repo);
     let revision = Revision {
         feedback: &feedback,
         round,
     };
-    match revise_job(&config, &meta, &revision, &paths, &mut log, &opts).await {
-        Err(e) => fail_with_usage_error(e),
-        Ok(outcome) => {
-            let branch = report_and_branch(&paths);
-            deliver_if_verified(
-                &meta.repo,
-                &config,
-                &meta.base_ref,
-                branch.as_deref(),
-                outcome,
-            )
-            .await;
-            exit_code_for(outcome)
-        }
-    }
+    let outcome = revise_job(
+        &config,
+        &meta,
+        &revision,
+        &paths,
+        &mut log,
+        &machine_opts(&meta.repo),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(finish_job(&meta.repo, &config, &meta.base_ref, &paths, outcome).await)
 }
 
 /// Report what `gc` would collect, or collect it.
 ///
 /// Policy lives in [`assembly_line::gc`]; this is the printing half.
-async fn remove_stale_worktrees(older_than: Option<String>, dry_run: bool) -> ExitCode {
-    let keep_for = match older_than
+async fn remove_stale_worktrees(
+    older_than: Option<String>,
+    dry_run: bool,
+) -> Result<ExitCode, String> {
+    let keep_for = older_than
         .as_deref()
         .map(config::parse_duration)
         .transpose()
-    {
-        Ok(d) => d,
-        Err(e) => return fail_with_usage_error(e),
-    };
+        .map_err(|e| e.to_string())?;
 
     let found = gc::collectable(keep_for);
     found
@@ -458,7 +460,7 @@ async fn remove_stale_worktrees(older_than: Option<String>, dry_run: bool) -> Ex
             println!("removed {} worktree(s)", removed.directories);
         }
     }
-    ExitCode::SUCCESS
+    Ok(ExitCode::SUCCESS)
 }
 
 fn print_job_log(job_id: u64, follow: bool, repo: Option<PathBuf>) -> ExitCode {
