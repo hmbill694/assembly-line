@@ -1,9 +1,9 @@
 use assembly_line::cli::{Cli, Command};
 use assembly_line::config::RepoConfig;
 use assembly_line::event::{Event, EventKind, EventLog};
+use assembly_line::job::{JobOutcome, JobSpec, Revision, RunOpts, revise_job, run_job};
 use assembly_line::paths::{JobMeta, JobPaths};
 use assembly_line::report::JobReport;
-use assembly_line::scheduler::{JobOutcome, JobSpec, Revision, RunOpts, revise_job, run_job};
 use assembly_line::{config, delivery, gc, paths};
 use clap::Parser;
 use std::path::{Path, PathBuf};
