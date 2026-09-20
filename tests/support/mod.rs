@@ -40,9 +40,9 @@ pub fn config_running(script: &str) -> String {
     format!("provider = \"fake\"\n{}", provider_block(script, "a"))
 }
 
-/// Turn `at` into a git repository with one commit, so a job has somewhere to
-/// branch from. The one definition of "a git repo with a commit in it".
-pub async fn init_git_repo(at: &Path) {
+/// Turn `at` into a git repository with no commits at all — nothing for a job
+/// to branch from. The one definition of "a git repo with nothing in it".
+pub async fn init_git_repo_with_no_commits(at: &Path) {
     std::fs::create_dir_all(at).unwrap();
     for args in [
         vec!["init", "--initial-branch=main"],
@@ -53,6 +53,12 @@ pub async fn init_git_repo(at: &Path) {
         let out = git::run_allowing_failure(at, &args).await.unwrap();
         assert!(out.succeeded(), "git {args:?} failed: {}", out.stderr);
     }
+}
+
+/// Turn `at` into a git repository with one commit, so a job has somewhere to
+/// branch from. The one definition of "a git repo with a commit in it".
+pub async fn init_git_repo(at: &Path) {
+    init_git_repo_with_no_commits(at).await;
     std::fs::write(at.join("README.md"), "base\n").unwrap();
     commit_all(at, "initial").await.unwrap().unwrap();
 }
@@ -159,9 +165,8 @@ impl Harness {
     }
 
     /// Run a job that may not be administrable at all — an undeclared
-    /// provider, an unparseable `max_duration`, a repository with no commits.
-    /// Those are errors rather than failed jobs, and this is how a test sees
-    /// the difference.
+    /// provider, or an unparseable `max_duration`. Those are errors rather
+    /// than failed jobs, and this is how a test sees the difference.
     ///
     /// `provider` and `base_ref` default to what the repository declares and
     /// to `HEAD`; the wrappers above cover the ordinary cases.
