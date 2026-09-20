@@ -87,7 +87,7 @@ What each file is responsible for once F1 is done.
 | `src/git.rs` | Git subprocess operations |
 | `src/exec.rs` | Running a command with a timeout, into a log file |
 | `src/provider.rs` | Provider config → `CommandSpec` |
-| `src/scheduler.rs` | `run_job` — one job end to end |
+| `src/job.rs` | `run_job` — one job end to end |
 | `src/delivery.rs` | Opening a pull request for a finished branch |
 | `src/gc.rs` | Collecting orphaned worktrees |
 | `src/main.rs` | CLI wiring and printing |

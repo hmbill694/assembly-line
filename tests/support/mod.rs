@@ -8,8 +8,8 @@
 use assembly_line::config::RepoConfig;
 use assembly_line::event::{EventKind, EventLog};
 use assembly_line::git::{self, commit_all};
+use assembly_line::job::{JobSpec, RunOpts, run_job};
 use assembly_line::paths::{self, JobPaths};
-use assembly_line::scheduler::{JobSpec, RunOpts, run_job};
 use assembly_line::state::JobState;
 use assembly_line::workspace;
 use std::path::{Path, PathBuf};
