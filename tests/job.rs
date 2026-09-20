@@ -1,9 +1,12 @@
-use assembly_line::config::REPO_CONFIG_PATH;
-use assembly_line::event::EventKind;
+use assembly_line::config::{REPO_CONFIG_PATH, RepoConfig};
+use assembly_line::event::{EventKind, EventLog};
 use assembly_line::git::{self, commit_all, head_sha};
+use assembly_line::job::{JobSpec, RunOpts, run_job};
+use assembly_line::paths;
 use assembly_line::state::JobState;
-use assembly_line::workspace::job_branch_name;
-use support::{Harness, config_running, provider_block};
+use assembly_line::workspace::{DEFAULT_REMOTE, job_branch_name};
+use support::{Harness, config_running, init_git_repo_with_no_commits, provider_block};
+use tokio_util::sync::CancellationToken;
 
 mod support;
 
@@ -415,6 +418,42 @@ async fn an_unparseable_max_duration_stops_the_job_before_it_starts() {
         .to_string();
 
     assert!(err.contains("soon"), "{err}");
+}
+
+/// Reachable only from a library caller. Through the CLI, `RepoConfig::from_ref`
+/// fails first — a commitless repository carries no ref to read a config from —
+/// so this guard is what protects `run_job`'s own contract.
+#[tokio::test]
+async fn a_repository_with_no_commits_has_nothing_to_branch_from() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_git_repo_with_no_commits(&repo).await;
+
+    // Built by hand rather than read from a ref, for the reason above.
+    let config =
+        RepoConfig::parse("provider = \"fake\"\n[providers.fake]\ncmd = \"true\"\n").unwrap();
+    let paths = paths::create_job(&paths::jobs_root(tmp.path()), 1).unwrap();
+    let mut log = EventLog::open_append(paths.events()).unwrap();
+
+    let opts = RunOpts {
+        cancel: CancellationToken::new(),
+        repo: repo.clone(),
+        seed_from: repo,
+        remote: DEFAULT_REMOTE.to_string(),
+    };
+    let spec = JobSpec {
+        prompt: "x",
+        provider: "fake",
+        base_ref: "HEAD",
+        round: 1,
+    };
+
+    let err = run_job(&config, &spec, &paths, &mut log, &opts)
+        .await
+        .expect_err("a repository with no commits is not a job that failed")
+        .to_string();
+
+    assert!(err.contains("no commits"), "{err}");
 }
 
 /// The heart of the stateless design: a revise round is a new job that sees
