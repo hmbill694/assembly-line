@@ -83,31 +83,6 @@ enum RoundResult {
     },
 }
 
-impl RoundResult {
-    /// A command's outcome, where an unspawnable program and a non-zero exit
-    /// both mean the job failed — but with different reasons.
-    fn from_command(outcome: anyhow::Result<ShellOutcome>) -> Self {
-        match outcome.map(|o| o.failure_reason()) {
-            Err(unspawnable) => RoundResult::Failed {
-                reason: unspawnable.to_string(),
-                work: None,
-            },
-            Ok(Some(reason)) => RoundResult::Failed { reason, work: None },
-            Ok(None) => RoundResult::Succeeded,
-        }
-    }
-
-    /// The reason this round failed, if the agent itself is what failed it.
-    fn failure_reason(self) -> Option<String> {
-        match self {
-            RoundResult::Failed { reason, .. } => Some(reason),
-            RoundResult::Succeeded
-            | RoundResult::Committed { .. }
-            | RoundResult::VerifyRejected { .. } => None,
-        }
-    }
-}
-
 /// Everything a round needs, resolved before the agent is spawned so a config
 /// mistake is reported against the command line rather than surfacing as a
 /// mysteriously failed job.
@@ -343,12 +318,11 @@ async fn round_result(
     )
     .await?;
 
-    let ran = RoundResult::from_command(
-        run_command(&plan.command, &ws.path, log_path, timeout, cancel.clone()).await,
-    );
     // Taken once, up front: it decides both whether `verify` is worth running
     // and how the round ends, and an agent failure wins over either answer.
-    let agent_failure = ran.failure_reason();
+    let agent_failure = agent_failure_reason(
+        run_command(&plan.command, &ws.path, log_path, timeout, cancel.clone()).await,
+    );
 
     let settled = RoundSettlement {
         preserved: agent_work_on_branch(plan, &ws).await,
@@ -423,6 +397,16 @@ async fn verify_verdict(
             },
         },
     )
+}
+
+/// Why the agent failed, or `None` when it ran to a clean exit. A program that
+/// could not be spawned and one that exited non-zero both fail the round, with
+/// different reasons.
+fn agent_failure_reason(outcome: anyhow::Result<ShellOutcome>) -> Option<String> {
+    match outcome {
+        Err(unspawnable) => Some(unspawnable.to_string()),
+        Ok(ran) => ran.failure_reason(),
+    }
 }
 
 async fn agent_work_on_branch(
