@@ -138,27 +138,48 @@ pub struct Removed {
 pub async fn remove(found: &[RepositoryLeftovers]) -> Removed {
     let mut removed = Removed::default();
 
+    // A loop, not an iterator chain: each repository's prune is awaited, and
+    // std has no async fold to thread the accumulator through.
     for leftovers in found {
-        for entry in &leftovers.stale {
-            match std::fs::remove_dir_all(&entry.path) {
-                Ok(()) => removed.directories += 1,
-                Err(e) => removed
-                    .warnings
-                    .push(format!("could not remove {}: {e}", entry.path.display())),
-            }
-        }
-
-        if let Some(repo) = &leftovers.repo
-            && !leftovers.stale.is_empty()
-            && repo.exists()
-            && let Err(e) = git::prune_worktrees(repo).await
-        {
-            removed.warnings.push(format!(
-                "could not prune worktrees in {}: {e}",
-                repo.display()
-            ));
-        }
+        let deleted = delete_directories(&leftovers.stale);
+        removed.directories += deleted.directories;
+        removed.warnings.extend(deleted.warnings);
+        removed.warnings.extend(prune_warning(leftovers).await);
     }
 
     removed
+}
+
+/// Delete one repository's stale directories, keeping the reason for each one
+/// that would not go.
+fn delete_directories(stale: &[StaleWorktree]) -> Removed {
+    let warnings: Vec<String> = stale
+        .iter()
+        .filter_map(|entry| {
+            std::fs::remove_dir_all(&entry.path)
+                .err()
+                .map(|e| format!("could not remove {}: {e}", entry.path.display()))
+        })
+        .collect();
+
+    Removed {
+        // Every entry either went or left a warning, so this cannot underflow.
+        directories: stale.len() - warnings.len(),
+        warnings,
+    }
+}
+
+/// Why pruning a repository's worktree list failed, or `None` when it worked,
+/// when nothing was removed to make it worth doing, or when the repository is
+/// unknown or gone.
+async fn prune_warning(leftovers: &RepositoryLeftovers) -> Option<String> {
+    let repo = leftovers
+        .repo
+        .as_deref()
+        .filter(|repo| !leftovers.stale.is_empty() && repo.exists())?;
+
+    git::prune_worktrees(repo)
+        .await
+        .err()
+        .map(|e| format!("could not prune worktrees in {}: {e}", repo.display()))
 }
