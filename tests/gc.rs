@@ -1,6 +1,9 @@
-use assembly_line::gc::reason_to_collect;
+use assembly_line::gc::{RepositoryLeftovers, StaleWorktree, reason_to_collect, remove};
+use assembly_line::git;
 use assembly_line::paths::{create_job, jobs_root};
 use std::time::Duration;
+
+mod support;
 
 /// A repository whose job 1 has a state directory, plus a worktree directory
 /// standing in for that job's checkout.
@@ -88,5 +91,73 @@ fn a_worktree_younger_than_the_threshold_is_kept() {
             Some(Duration::from_hours(1))
         ),
         None
+    );
+}
+
+#[tokio::test]
+async fn removing_leftovers_deletes_them_and_counts_only_what_went() {
+    let fx = Fixture::new();
+    let never_existed = fx.worktree.parent().unwrap().join("2");
+
+    let leftovers = RepositoryLeftovers {
+        repo: None,
+        stale: vec![
+            StaleWorktree {
+                path: never_existed.clone(),
+                because: "its repository is unknown".to_string(),
+            },
+            StaleWorktree {
+                path: fx.worktree.clone(),
+                because: "its repository is unknown".to_string(),
+            },
+        ],
+    };
+
+    let removed = remove(&[leftovers]).await;
+
+    assert!(
+        !fx.worktree.exists(),
+        "the directory that existed should be gone"
+    );
+    assert_eq!(removed.directories, 1, "only what actually went is counted");
+    assert_eq!(removed.warnings.len(), 1, "{:?}", removed.warnings);
+    assert!(
+        removed.warnings[0].contains(&never_existed.display().to_string()),
+        "the warning should name the directory: {}",
+        removed.warnings[0]
+    );
+}
+
+#[tokio::test]
+async fn removing_a_worktree_also_drops_gits_record_of_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    support::init_git_repo(&repo).await;
+
+    let worktree = tmp.path().join("wt/1/checkout");
+    git::add_worktree(&repo, &worktree, "al/job-1", "HEAD")
+        .await
+        .unwrap();
+
+    let leftovers = RepositoryLeftovers {
+        repo: Some(repo.clone()),
+        stale: vec![StaleWorktree {
+            path: worktree.parent().unwrap().to_path_buf(),
+            because: "job 1 has no state directory".to_string(),
+        }],
+    };
+
+    let removed = remove(&[leftovers]).await;
+
+    assert_eq!(removed.directories, 1);
+    assert!(removed.warnings.is_empty(), "{:?}", removed.warnings);
+
+    let listed = git::run_allowing_failure(&repo, &["worktree", "list"])
+        .await
+        .unwrap()
+        .stdout;
+    assert!(
+        !listed.contains("al/job-1"),
+        "git still lists the removed worktree: {listed}"
     );
 }
