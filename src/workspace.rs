@@ -46,40 +46,59 @@ pub async fn create(
 ) -> anyhow::Result<JobWorkspace> {
     let (repo, path, seed_from) = (repo.as_ref(), path.as_ref(), seed_from.as_ref());
 
-    if let Some(missing) = copy_paths.iter().find(|rel| !seed_from.join(rel).exists()) {
+    if let Some(missing) = missing_seed_path(seed_from, copy_paths) {
         anyhow::bail!(
             "copy path '{missing}' does not exist under {}",
             seed_from.display()
         );
     }
 
-    match start {
-        StartPoint::FreshBranch(base_sha) => {
-            clear_previous_attempt(repo, path, branch).await?;
-            git::add_worktree(repo, path, branch, base_sha).await?;
-        }
-        StartPoint::ContinueBranch => {
-            clear_previous_checkout(repo, path).await?;
-            git::add_worktree_for_existing_branch(repo, path, branch).await?;
-        }
-    }
-
-    copy_paths
-        .iter()
-        .try_for_each(|rel| -> anyhow::Result<()> {
-            let destination = path.join(rel);
-            if let Some(parent) = destination.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::copy(seed_from.join(rel), destination)
-                .map(|_| ())
-                .map_err(|e| anyhow::anyhow!("copying '{rel}' into the workspace: {e}"))
-        })?;
+    check_out_branch(repo, path, branch, start).await?;
+    seed_files(path, seed_from, copy_paths)?;
 
     Ok(JobWorkspace {
         path: path.to_path_buf(),
         branch: branch.to_string(),
         seeded: copy_paths.to_vec(),
+    })
+}
+
+/// The first `copy` path the repository declares that is not actually there.
+fn missing_seed_path<'a>(seed_from: &Path, copy_paths: &'a [String]) -> Option<&'a String> {
+    copy_paths.iter().find(|rel| !seed_from.join(rel).exists())
+}
+
+/// Put a worktree at `path` holding `branch`, freeing whatever held the path —
+/// and, for a fresh branch, the branch name — first.
+async fn check_out_branch(
+    repo: &Path,
+    path: &Path,
+    branch: &str,
+    start: StartPoint<'_>,
+) -> anyhow::Result<()> {
+    match start {
+        StartPoint::FreshBranch(base_sha) => {
+            clear_previous_attempt(repo, path, branch).await?;
+            git::add_worktree(repo, path, branch, base_sha).await
+        }
+        StartPoint::ContinueBranch => {
+            clear_previous_checkout(repo, path).await?;
+            git::add_worktree_for_existing_branch(repo, path, branch).await
+        }
+    }
+}
+
+/// Copy the repository's `copy` paths into the checkout, creating whatever
+/// directories they nest in.
+fn seed_files(into: &Path, seed_from: &Path, copy_paths: &[String]) -> anyhow::Result<()> {
+    copy_paths.iter().try_for_each(|rel| -> anyhow::Result<()> {
+        let destination = into.join(rel);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(seed_from.join(rel), destination)
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("copying '{rel}' into the workspace: {e}"))
     })
 }
 
