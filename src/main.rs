@@ -313,9 +313,11 @@ async fn deliver_if_verified(
 
     let base = config.base.as_deref().unwrap_or(base_ref);
 
-    if let Some(configured) = config.base.as_deref().filter(|&b| b != base_ref) {
+    if base != base_ref {
         println!(
-            "note: this pull request will target '{configured}', but the job was cut from '{base_ref}' — review the diff before merging, since it carries everything separating the two, not just this job's work"
+            "note: this pull request will target '{base}', but the job was cut from \
+             '{base_ref}' — review the diff before merging, since it carries everything \
+             separating the two, not just this job's work"
         );
     }
 
