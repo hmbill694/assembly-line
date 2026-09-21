@@ -22,16 +22,6 @@ pub fn job_branch_name(job_id: u64) -> String {
     format!("al/job-{job_id}")
 }
 
-/// Where a job's checkout begins.
-#[derive(Debug, Clone, Copy)]
-pub enum StartPoint<'a> {
-    /// Cut a fresh branch at this commit, superseding any earlier attempt's.
-    FreshBranch(&'a str),
-    /// Append to the job's existing branch rather than replacing the record
-    /// of what came before.
-    ContinueBranch,
-}
-
 /// # Errors
 ///
 /// Seed paths are checked *before* the worktree is made, so a typo leaves
@@ -40,7 +30,7 @@ pub async fn create(
     repo: impl AsRef<Path>,
     path: impl AsRef<Path>,
     branch: &str,
-    start: StartPoint<'_>,
+    start: &git::WorktreeStart,
     seed_from: impl AsRef<Path>,
     copy_paths: &[String],
 ) -> anyhow::Result<JobWorkspace> {
@@ -74,18 +64,18 @@ async fn check_out_branch(
     repo: &Path,
     path: &Path,
     branch: &str,
-    start: StartPoint<'_>,
+    start: &git::WorktreeStart,
 ) -> anyhow::Result<()> {
     match start {
-        StartPoint::FreshBranch(base_sha) => {
+        git::WorktreeStart::CreatingBranch { .. } => {
             clear_previous_attempt(repo, path, branch).await?;
-            git::add_worktree(repo, path, branch, base_sha).await
         }
-        StartPoint::ContinueBranch => {
+        git::WorktreeStart::OnExistingBranch { .. } => {
             clear_previous_checkout(repo, path).await?;
-            git::add_worktree_for_existing_branch(repo, path, branch).await
         }
     }
+
+    git::add_worktree(repo, path, branch, start).await
 }
 
 /// Copy the repository's `copy` paths into the checkout, creating whatever

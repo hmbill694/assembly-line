@@ -1,6 +1,6 @@
 use assembly_line::git::{
-    self, DiffStat, add_worktree, commit_all, commit_all_except, diff_stat_against, head_sha,
-    is_dirty, remove_worktree,
+    self, DiffStat, WorktreeStart, add_worktree, commit_all, commit_all_except, diff_stat_against,
+    head_sha, is_dirty, remove_worktree,
 };
 use std::path::{Path, PathBuf};
 
@@ -45,9 +45,14 @@ impl Fixture {
     async fn worktree(&self, name: &str, branch: &str) -> PathBuf {
         let path = self.worktrees.join(name);
         let base = self.base().await;
-        add_worktree(&self.repo, &path, branch, &base)
-            .await
-            .unwrap();
+        add_worktree(
+            &self.repo,
+            &path,
+            branch,
+            &WorktreeStart::CreatingBranch { at: base },
+        )
+        .await
+        .unwrap();
         path
     }
 }
@@ -248,9 +253,14 @@ async fn an_existing_branch_can_be_checked_out_into_a_fresh_worktree() {
     remove_worktree(&fx.repo, &node).await.unwrap();
 
     let again = fx.worktrees.join("again");
-    git::add_worktree_for_existing_branch(&fx.repo, &again, "al/job-1")
-        .await
-        .unwrap();
+    git::add_worktree(
+        &fx.repo,
+        &again,
+        "al/job-1",
+        &WorktreeStart::OnExistingBranch { tip: sha.clone() },
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         head_sha(&again).await.unwrap(),
@@ -269,10 +279,16 @@ async fn checking_out_a_branch_that_is_already_in_a_worktree_is_refused() {
     let fx = Fixture::new().await;
     fx.worktree("held", "al/job-1").await;
 
+    let tip = fx.base().await;
     assert!(
-        git::add_worktree_for_existing_branch(&fx.repo, fx.worktrees.join("second"), "al/job-1")
-            .await
-            .is_err()
+        git::add_worktree(
+            &fx.repo,
+            fx.worktrees.join("second"),
+            "al/job-1",
+            &WorktreeStart::OnExistingBranch { tip }
+        )
+        .await
+        .is_err()
     );
 }
 

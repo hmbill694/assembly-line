@@ -89,8 +89,9 @@ enum RoundResult {
 #[derive(Debug)]
 struct JobPlan {
     repo: PathBuf,
-    /// The commit the checkout starts at — see [`start_commit_for_round`].
-    start_sha: String,
+    /// Where the checkout begins, and whether that cuts the branch or
+    /// continues it — see [`round_start`].
+    start: git::WorktreeStart,
     workspace_path: PathBuf,
     branch: String,
     seed_from: PathBuf,
@@ -98,7 +99,6 @@ struct JobPlan {
     command: CommandSpec,
     commit_message: String,
     remote: String,
-    continues_branch: bool,
     /// The command that decides whether the round's work is accepted, or
     /// `None` for a repository with no `verify` — which accepts on the
     /// agent's exit code alone.
@@ -145,7 +145,7 @@ fn job_plan(
     spec: &JobSpec<'_>,
     paths: &JobPaths,
     opts: &RunOpts,
-    start_sha: &str,
+    start: git::WorktreeStart,
 ) -> anyhow::Result<JobPlan> {
     let provider = config
         .providers
@@ -158,7 +158,7 @@ fn job_plan(
 
     Ok(JobPlan {
         repo: opts.repo.clone(),
-        start_sha: start_sha.to_string(),
+        start,
         workspace_path,
         branch: job_branch_name(paths.id),
         seed_from: opts.seed_from.clone(),
@@ -166,7 +166,6 @@ fn job_plan(
         command: render_command(provider, spec.prompt),
         commit_message: commit_message(paths.id, spec.prompt),
         remote: opts.remote.clone(),
-        continues_branch: spec.round > 1,
         verify: config.verify.clone(),
     })
 }
@@ -184,17 +183,23 @@ async fn ready_repository_for_worktrees(repo: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Where this round's checkout starts: the ref the job was cut from for a
-/// first attempt, the job's own branch tip for a revise round — which is how
-/// the agent arrives at its prior work.
-async fn start_commit_for_round(
+/// Where this round's checkout begins: a fresh branch at the ref the job was
+/// cut from, or the job's own branch continued from its tip — which is how the
+/// agent arrives at its prior work.
+///
+/// The one place a round number decides anything.
+async fn round_start(
     repo: &Path,
     branch: &str,
     spec: &JobSpec<'_>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<git::WorktreeStart> {
     match spec.round > 1 {
-        true => git::branch_tip(repo, branch).await,
-        false => git::sha_at_ref(repo, spec.base_ref).await,
+        true => git::branch_tip(repo, branch)
+            .await
+            .map(|tip| git::WorktreeStart::OnExistingBranch { tip }),
+        false => git::sha_at_ref(repo, spec.base_ref)
+            .await
+            .map(|at| git::WorktreeStart::CreatingBranch { at }),
     }
 }
 
@@ -217,8 +222,8 @@ pub async fn run_job(
     ready_repository_for_worktrees(&opts.repo).await?;
 
     let branch = job_branch_name(paths.id);
-    let start_sha = start_commit_for_round(&opts.repo, &branch, spec).await?;
-    let plan = job_plan(config, spec, paths, opts, &start_sha)?;
+    let start = round_start(&opts.repo, &branch, spec).await?;
+    let plan = job_plan(config, spec, paths, opts, start)?;
 
     log.append(EventKind::JobStarted { round: spec.round })?;
 
@@ -309,16 +314,11 @@ async fn round_result(
     timeout: Option<Duration>,
     cancel: CancellationToken,
 ) -> anyhow::Result<RoundResult> {
-    let start = match plan.continues_branch {
-        true => workspace::StartPoint::ContinueBranch,
-        false => workspace::StartPoint::FreshBranch(&plan.start_sha),
-    };
-
     let ws = workspace::create(
         &plan.repo,
         &plan.workspace_path,
         &plan.branch,
-        start,
+        &plan.start,
         &plan.seed_from,
         &plan.copy_paths,
     )
@@ -426,7 +426,7 @@ async fn agent_work_on_branch(
     Ok(Some(AgentWork {
         branch: ws.branch.clone(),
         sha,
-        stat: git::diff_stat_against(&ws.path, &plan.start_sha).await?,
+        stat: git::diff_stat_against(&ws.path, plan.start.start_commit()).await?,
         pushed_to: remote_the_branch_reached(plan, ws).await,
     }))
 }
