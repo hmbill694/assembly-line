@@ -1,5 +1,5 @@
-use assembly_line::git::{self, head_sha};
-use assembly_line::workspace::{self, StartPoint, job_branch_name};
+use assembly_line::git::{self, WorktreeStart, head_sha};
+use assembly_line::workspace::{self, job_branch_name};
 use std::path::PathBuf;
 
 mod support;
@@ -30,6 +30,12 @@ impl Fixture {
     }
 }
 
+fn fresh_branch_at(commit: &str) -> WorktreeStart {
+    WorktreeStart::CreatingBranch {
+        at: commit.to_string(),
+    }
+}
+
 #[test]
 fn a_branch_name_identifies_the_job_that_produced_it() {
     assert_eq!(job_branch_name(42), "al/job-42");
@@ -49,7 +55,7 @@ async fn creating_a_workspace_checks_out_the_base_commit() {
         &fx.repo,
         fx.wt_root.join("impl-auth"),
         "al/job-1",
-        StartPoint::FreshBranch(&base),
+        &fresh_branch_at(&base),
         &fx.seed,
         &[],
     )
@@ -76,7 +82,7 @@ async fn seeded_files_are_copied_in_and_kept_out_of_the_commit() {
         &fx.repo,
         fx.wt_root.join("n"),
         "al/job-1",
-        StartPoint::FreshBranch(&base),
+        &fresh_branch_at(&base),
         &fx.seed,
         &[".env".to_string()],
     )
@@ -114,7 +120,7 @@ async fn seeding_preserves_nested_paths() {
         &fx.repo,
         fx.wt_root.join("n"),
         "al/job-1",
-        StartPoint::FreshBranch(&base),
+        &fresh_branch_at(&base),
         &fx.seed,
         &[".claude/settings.local.json".to_string()],
     )
@@ -134,7 +140,7 @@ async fn a_missing_seed_path_names_the_file_and_leaves_no_worktree() {
         &fx.repo,
         &path,
         "al/job-1",
-        StartPoint::FreshBranch(&base),
+        &fresh_branch_at(&base),
         &fx.seed,
         &["nope.env".to_string()],
     )
@@ -155,7 +161,7 @@ async fn committing_an_untouched_workspace_produces_nothing() {
         &fx.repo,
         fx.wt_root.join("n"),
         "al/job-1",
-        StartPoint::FreshBranch(&base),
+        &fresh_branch_at(&base),
         &fx.seed,
         &[],
     )
@@ -179,7 +185,7 @@ async fn discarding_a_workspace_removes_it_but_keeps_the_branch() {
         &fx.repo,
         fx.wt_root.join("n"),
         "al/job-1",
-        StartPoint::FreshBranch(&base),
+        &fresh_branch_at(&base),
         &fx.seed,
         &[],
     )
@@ -209,7 +215,7 @@ async fn continuing_a_branch_restores_the_previous_rounds_work() {
         &fx.repo,
         &path,
         "al/job-1",
-        StartPoint::FreshBranch(&base),
+        &fresh_branch_at(&base),
         &fx.seed,
         &[],
     )
@@ -227,7 +233,9 @@ async fn continuing_a_branch_restores_the_previous_rounds_work() {
         &fx.repo,
         &path,
         "al/job-1",
-        StartPoint::ContinueBranch,
+        &WorktreeStart::OnExistingBranch {
+            tip: first_sha.clone(),
+        },
         &fx.seed,
         &[],
     )
@@ -255,7 +263,7 @@ async fn a_second_attempt_supersedes_the_worktree_and_branch_of_the_first() {
         &fx.repo,
         &path,
         "al/job-1",
-        StartPoint::FreshBranch(&base),
+        &fresh_branch_at(&base),
         &fx.seed,
         &[],
     )
@@ -268,7 +276,7 @@ async fn a_second_attempt_supersedes_the_worktree_and_branch_of_the_first() {
         &fx.repo,
         &path,
         "al/job-1",
-        StartPoint::FreshBranch(&base),
+        &fresh_branch_at(&base),
         &fx.seed,
         &[],
     )
@@ -294,7 +302,7 @@ async fn a_branch_left_without_its_worktree_does_not_block_the_next_attempt() {
         &fx.repo,
         &path,
         "al/job-1",
-        StartPoint::FreshBranch(&base),
+        &fresh_branch_at(&base),
         &fx.seed,
         &[],
     )
@@ -307,7 +315,7 @@ async fn a_branch_left_without_its_worktree_does_not_block_the_next_attempt() {
         &fx.repo,
         &path,
         "al/job-1",
-        StartPoint::FreshBranch(&base),
+        &fresh_branch_at(&base),
         &fx.seed,
         &[],
     )

@@ -135,9 +135,16 @@ async fn removing_a_worktree_also_drops_gits_record_of_it() {
     support::init_git_repo(&repo).await;
 
     let worktree = tmp.path().join("wt/1/checkout");
-    git::add_worktree(&repo, &worktree, "al/job-1", "HEAD")
-        .await
-        .unwrap();
+    git::add_worktree(
+        &repo,
+        &worktree,
+        "al/job-1",
+        &git::WorktreeStart::CreatingBranch {
+            at: "HEAD".to_string(),
+        },
+    )
+    .await
+    .unwrap();
 
     let leftovers = RepositoryLeftovers {
         repo: Some(repo.clone()),

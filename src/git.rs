@@ -183,45 +183,55 @@ fn make_room_for_worktree(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Create `branch` at `start_point` and check it out into a new worktree at
-/// `path`.
+/// Where a new worktree's content begins, and what that makes of its branch.
+///
+/// Both variants name the commit the worktree starts at. `git worktree add`
+/// needs it only when creating the branch — checking out a branch that already
+/// exists lands at its tip by definition — but callers diff against it either
+/// way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeStart {
+    /// Create `branch` at this commit, superseding any earlier attempt's.
+    CreatingBranch { at: String },
+    /// Check out a branch that is already there, whose tip is this commit —
+    /// how a revise round picks its own branch back up.
+    OnExistingBranch { tip: String },
+}
+
+impl WorktreeStart {
+    /// The commit the worktree starts from, however its branch came to be —
+    /// which is what a round's diff is measured against.
+    #[must_use]
+    pub fn start_commit(&self) -> &str {
+        match self {
+            Self::CreatingBranch { at } => at,
+            Self::OnExistingBranch { tip } => tip,
+        }
+    }
+}
+
+/// Check `branch` out into a new worktree at `path`, creating the branch first
+/// when `start` says to.
 pub async fn add_worktree(
     repo: impl AsRef<Path>,
     path: impl AsRef<Path>,
     branch: &str,
-    start_point: &str,
+    start: &WorktreeStart,
 ) -> anyhow::Result<()> {
     let path = path.as_ref();
     make_room_for_worktree(path)?;
     let path_arg = path.to_string_lossy().into_owned();
 
-    run_expecting_success(
-        repo,
-        &["worktree", "add", "-b", branch, &path_arg, start_point],
-        &format!("worktree add {branch}"),
-    )
-    .await
-    .map(|_| ())
-}
+    let args: Vec<&str> = match start {
+        WorktreeStart::CreatingBranch { at } => {
+            vec!["worktree", "add", "-b", branch, &path_arg, at]
+        }
+        WorktreeStart::OnExistingBranch { .. } => vec!["worktree", "add", &path_arg, branch],
+    };
 
-/// Check an existing branch out into a new worktree, rather than creating the
-/// branch — how a revise round picks its own branch back up.
-pub async fn add_worktree_for_existing_branch(
-    repo: impl AsRef<Path>,
-    path: impl AsRef<Path>,
-    branch: &str,
-) -> anyhow::Result<()> {
-    let path = path.as_ref();
-    make_room_for_worktree(path)?;
-    let path_arg = path.to_string_lossy().into_owned();
-
-    run_expecting_success(
-        repo,
-        &["worktree", "add", &path_arg, branch],
-        &format!("worktree add {branch}"),
-    )
-    .await
-    .map(|_| ())
+    run_expecting_success(repo, &args, &format!("worktree add {branch}"))
+        .await
+        .map(|_| ())
 }
 
 /// Delete a branch whether or not it was merged — a superseded attempt is

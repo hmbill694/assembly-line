@@ -42,9 +42,14 @@ impl Fixture {
     async fn job_branch(&self, name: &str) -> String {
         let base = head_sha(&self.repo).await.unwrap();
         let wt = self.repo.parent().unwrap().join(format!("wt-{name}"));
-        git::add_worktree(&self.repo, &wt, name, &base)
-            .await
-            .unwrap();
+        git::add_worktree(
+            &self.repo,
+            &wt,
+            name,
+            &git::WorktreeStart::CreatingBranch { at: base },
+        )
+        .await
+        .unwrap();
         std::fs::write(wt.join("work.txt"), "the job's work\n").unwrap();
         let sha = commit_all(&wt, "job work").await.unwrap().unwrap();
         git::remove_worktree(&self.repo, &wt).await.unwrap();
