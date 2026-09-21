@@ -120,8 +120,12 @@ async fn default_base_ref(repo: &Path) -> Result<String, String> {
         .map(|branch| branch.unwrap_or_else(|| "HEAD".to_string()))
 }
 
-/// Everything the repository declares plus the provider the job will use.
-fn config_and_provider(
+/// The repository's settings and the provider the job will use, once the two
+/// are known to work together.
+///
+/// Warnings and every reason it cannot run are printed from here: deciding is
+/// [`RepoConfig`]'s job, and saying so is this layer's.
+fn runnable_config_and_provider(
     config: RepoConfig,
     chosen: Option<String>,
 ) -> Result<(RepoConfig, String), String> {
@@ -259,7 +263,7 @@ async fn prepare_job(
     let declared = RepoConfig::from_ref(&repo, &base_ref)
         .await
         .map_err(|e| e.to_string())?;
-    let (config, provider) = config_and_provider(declared, provider)?;
+    let (config, provider) = runnable_config_and_provider(declared, provider)?;
 
     Ok(PreparedJob {
         repo,
@@ -397,7 +401,7 @@ async fn revise_existing_job(
     let declared = RepoConfig::from_ref(&meta.repo, &meta.base_ref)
         .await
         .map_err(|e| e.to_string())?;
-    let (config, _) = config_and_provider(declared, Some(meta.provider.clone()))?;
+    let (config, _) = runnable_config_and_provider(declared, Some(meta.provider.clone()))?;
 
     let mut log =
         EventLog::open_append(paths.events()).map_err(|e| format!("opening the event log: {e}"))?;
