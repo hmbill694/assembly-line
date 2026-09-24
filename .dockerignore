@@ -1,0 +1,8 @@
+target/
+.git/
+.jj/
+.devenv/
+.direnv/
+.assembly/
+.superpowers/
+docs/
