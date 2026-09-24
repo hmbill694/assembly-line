@@ -5,7 +5,7 @@ branch, decides whether it succeeded with `verify`, and opens a pull request
 when it did.
 
 - Design decisions: `docs/superpowers/specs/2026-09-11-software-factory-v2.md`
-- Current milestone: `docs/superpowers/plans/2026-09-11-software-factory-f1.md`
+- Current milestone: `docs/superpowers/plans/2026-09-21-software-factory-f2.md`
 
 ## Toolchain
 
