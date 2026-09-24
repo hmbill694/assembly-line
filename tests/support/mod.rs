@@ -94,16 +94,6 @@ pub struct Harness {
     pub origin: PathBuf,
 }
 
-/// Worktrees live under `$HOME`. A job discards its own, but a job that dies
-/// mid-round can still orphan one, and tests must not leave that behind.
-impl Drop for Harness {
-    fn drop(&mut self) {
-        if let Some(root) = paths::repo_worktrees_root(&self.repo) {
-            let _ = std::fs::remove_dir_all(root);
-        }
-    }
-}
-
 impl Harness {
     /// A repository whose committed config runs the passing fake agent.
     pub async fn new() -> Self {
@@ -158,11 +148,6 @@ impl Harness {
     /// the working tree it is asserting about.
     pub fn job_paths(&self) -> JobPaths {
         paths::create_job(&paths::jobs_root(self.tmp.path()), THE_JOB).unwrap()
-    }
-
-    /// Where the job's scratch checkout lives, which must never survive it.
-    pub fn worktree_root(&self) -> PathBuf {
-        paths::worktree_root(&self.repo, THE_JOB).expect("HOME is set in the test environment")
     }
 
     /// Run one job against this repository, with `prompt`, from `main`.

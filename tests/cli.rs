@@ -6,23 +6,9 @@ use predicates::str::contains;
 
 mod support;
 
-/// Where this test's worktrees go: outside the repository, and outside the
-/// shared `$HOME` default. `gc` walks every repository it can see, so tests
-/// sharing one root would collect each other's work mid-job.
-fn worktree_root_for(tmp: &tempfile::TempDir) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "assembly-test-wt-{}",
-        tmp.path().file_name().unwrap().to_string_lossy()
-    ))
-}
-
 fn assembly(tmp: &tempfile::TempDir) -> Command {
     let mut cmd = Command::cargo_bin("assembly").unwrap();
     cmd.current_dir(tmp.path());
-    cmd.env(
-        assembly_line::paths::WORKTREE_ROOT_VAR,
-        worktree_root_for(tmp),
-    );
     cmd
 }
 
@@ -79,10 +65,9 @@ async fn repo_running(script: &str) -> tempfile::TempDir {
     tmp
 }
 
-/// Worktrees and the bare remote outlive the tempdir, so a test that makes
-/// them has to take them with it.
-fn discard_worktrees(tmp: &tempfile::TempDir) {
-    let _ = std::fs::remove_dir_all(worktree_root_for(tmp));
+/// The bare remote outlives the tempdir, so a test that makes one has to take
+/// it with it.
+fn discard_origin(tmp: &tempfile::TempDir) {
     let _ = std::fs::remove_dir_all(origin_for(tmp));
 }
 
@@ -99,7 +84,7 @@ async fn run_exits_zero_and_records_the_job() {
     assert!(tmp.path().join(".assembly/jobs/1/events.jsonl").is_file());
     assert!(tmp.path().join(".assembly/jobs/1/meta.json").is_file());
 
-    discard_worktrees(&tmp);
+    discard_origin(&tmp);
 }
 
 #[tokio::test]
@@ -118,7 +103,7 @@ async fn run_exits_one_when_the_agent_fails_but_still_leaves_the_branch() {
         40
     );
 
-    discard_worktrees(&tmp);
+    discard_origin(&tmp);
 }
 
 #[tokio::test]
@@ -137,7 +122,7 @@ async fn a_repository_that_has_not_opted_in_is_told_which_file_to_write() {
         "a repository that cannot run should not allocate a job directory"
     );
 
-    discard_worktrees(&tmp);
+    discard_origin(&tmp);
 }
 
 /// A job clones from the remote and pushes back to it, so a repository
@@ -170,7 +155,7 @@ async fn revising_a_job_that_left_no_branch_says_there_is_nothing_to_revise() {
         .code(2)
         .stderr(contains("job 1 has no branch on 'origin'").and(contains("nothing to revise")));
 
-    discard_worktrees(&tmp);
+    discard_origin(&tmp);
 }
 
 #[tokio::test]
@@ -185,7 +170,7 @@ async fn an_undeclared_provider_is_rejected_before_a_job_directory_is_allocated(
 
     assert!(!tmp.path().join(".assembly/jobs/1").exists());
 
-    discard_worktrees(&tmp);
+    discard_origin(&tmp);
 }
 
 #[tokio::test]
@@ -207,7 +192,7 @@ async fn a_run_with_no_prompt_at_all_is_a_usage_error() {
 
     assembly(&tmp).arg("run").assert().code(2);
 
-    discard_worktrees(&tmp);
+    discard_origin(&tmp);
 }
 
 #[tokio::test]
@@ -223,7 +208,7 @@ async fn a_prompt_can_come_from_a_file_instead() {
     let on_branch = git_on_origin(&tmp, &["show", "al/job-1:agent-output.txt"]);
     assert!(on_branch.contains("Implement auth"), "{on_branch}");
 
-    discard_worktrees(&tmp);
+    discard_origin(&tmp);
 }
 
 #[tokio::test]
@@ -238,7 +223,7 @@ async fn a_missing_prompt_file_is_reported_before_the_job_starts() {
 
     assert!(!tmp.path().join(".assembly/jobs/1").exists());
 
-    discard_worktrees(&tmp);
+    discard_origin(&tmp);
 }
 
 #[tokio::test]
@@ -266,7 +251,7 @@ async fn status_and_logs_report_a_finished_job() {
         .success()
         .stdout(contains("giving up"));
 
-    discard_worktrees(&tmp);
+    discard_origin(&tmp);
 }
 
 /// Every command resolves the repository the same way, so a job started with
@@ -318,8 +303,7 @@ async fn a_job_started_elsewhere_is_found_by_pointing_the_read_commands_at_it() 
         .success()
         .stdout(contains("round 2"));
 
-    discard_worktrees(&standing_in);
-    discard_worktrees(&target);
+    discard_origin(&target);
 }
 
 /// A global `pushInsteadOf` — fetch over one transport, push over another —
@@ -356,7 +340,7 @@ async fn a_global_push_rewrite_is_followed_rather_than_refused() {
         "the job's push did not follow the rewrite"
     );
 
-    discard_worktrees(&tmp);
+    discard_origin(&tmp);
 }
 
 /// `--ref` decides what the job is cut from; with none, the checked-out
@@ -394,7 +378,7 @@ async fn a_job_branches_from_the_ref_it_is_given() {
         "the default base ref is not the checked-out branch"
     );
 
-    discard_worktrees(&tmp);
+    discard_origin(&tmp);
 }
 
 #[tokio::test]
@@ -408,7 +392,7 @@ async fn a_detached_head_is_asked_to_name_its_ref() {
         .code(2)
         .stderr(contains("--ref"));
 
-    discard_worktrees(&tmp);
+    discard_origin(&tmp);
 }
 
 #[tokio::test]
@@ -423,7 +407,7 @@ async fn unpushed_local_work_is_pointed_out_and_the_remotes_ref_is_used() {
         .success()
         .stdout(contains("push first"));
 
-    discard_worktrees(&tmp);
+    discard_origin(&tmp);
 }
 
 #[tokio::test]
@@ -482,7 +466,7 @@ async fn a_revise_round_continues_the_branch_instead_of_starting_over() {
         "round 2 never saw the feedback: {body}"
     );
 
-    discard_worktrees(&tmp);
+    discard_origin(&tmp);
 }
 
 /// Feedback is a required argument — clap refuses the invocation before
@@ -493,7 +477,7 @@ async fn revise_without_feedback_is_a_usage_error() {
 
     assembly(&tmp).args(["revise", "1"]).assert().code(2);
 
-    discard_worktrees(&tmp);
+    discard_origin(&tmp);
 }
 
 #[tokio::test]
@@ -522,32 +506,5 @@ async fn a_job_writes_nothing_outside_dot_assembly_in_the_target_repository() {
 
     assert!(!tmp.path().join("agent-output.txt").exists());
 
-    discard_worktrees(&tmp);
-}
-
-#[tokio::test]
-async fn gc_with_nothing_to_collect_says_so() {
-    let tmp = repo_running("fake-agent.sh").await;
-    assembly(&tmp)
-        .args(["run", "--prompt", "x"])
-        .assert()
-        .success();
-
-    assembly(&tmp)
-        .args(["gc", "--dry-run"])
-        .assert()
-        .success()
-        .stdout(contains("nothing to collect"));
-
-    discard_worktrees(&tmp);
-}
-
-#[tokio::test]
-async fn gc_rejects_an_unreadable_duration() {
-    let tmp = support::repo_with_initial_commit().await;
-    assembly(&tmp)
-        .args(["gc", "--older-than", "soon"])
-        .assert()
-        .code(2)
-        .stderr(contains("soon"));
+    discard_origin(&tmp);
 }

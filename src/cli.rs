@@ -69,14 +69,4 @@ pub enum Command {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
-
-    /// Remove worktrees left behind by jobs that died mid-run
-    Gc {
-        /// Also remove worktrees untouched for this long, e.g. "7d"
-        #[arg(long)]
-        older_than: Option<String>,
-        /// Report what would be removed, and remove nothing
-        #[arg(long)]
-        dry_run: bool,
-    },
 }

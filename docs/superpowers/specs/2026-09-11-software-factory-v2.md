@@ -429,7 +429,7 @@ is closed by enforcing `verify`.
 | `src/event.rs`, `src/state.rs` | The NDJSON wire format *and* the daemon's state model — the fold widens from one run to all jobs |
 | `revise_node` (`scheduler.rs:320`) | The tester loop's remediation primitive, unchanged |
 | `src/git.rs` | Clone, branches, publish — the job's whole mechanism |
-| `src/paths.rs` | Already keyed by repo slug, so already multi-repo shaped |
+| `src/paths.rs` | Job ids, and where a job's state lives until F3 moves it out of the repository |
 | `src/workspace.rs` | `copy` seeding into a scratch clone |
 | `src/provider.rs`, `src/exec.rs` | Vendor-neutral agent invocation, unchanged |
 | `src/delivery.rs` | Folds into the forge trait's `open_change` |
@@ -525,8 +525,8 @@ with a deletion.
 - Where refinement happens for Slack-sourced work — the thread is the obvious
   home, and it overlaps the web UI's chat. Decided when F7 is reached.
 - Web UI authentication.
-- Branch pruning across many repositories. `gc` lost its worktree policy in M3
-  and has not yet gained the branch job that replaces it.
+- Branch pruning. `gc` was deleted in F2 along with worktrees, and nothing
+  yet prunes the job branches left on a remote.
 - A cache for `mise` provisioning — a docker volume, a PVC, node-local
   storage. Whatever it is, the jobs that read it must not be able to write
   it: a cache the agent can write runs its code in every later job, that

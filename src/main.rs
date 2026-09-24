@@ -7,7 +7,7 @@ use assembly_line::job::{
 use assembly_line::paths::{JobMeta, JobPaths};
 use assembly_line::report::JobReport;
 use assembly_line::workspace::{DEFAULT_REMOTE, job_branch_name};
-use assembly_line::{config, delivery, gc, git, paths};
+use assembly_line::{config, delivery, git, paths};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -40,10 +40,6 @@ fn main() -> ExitCode {
             follow,
             repo,
         } => print_job_log(job_id, follow, repo),
-        Command::Gc {
-            older_than,
-            dry_run,
-        } => in_async_runtime(remove_stale_worktrees(older_than, dry_run)),
     }
 }
 
@@ -477,48 +473,6 @@ async fn revise_existing_job(
     .map_err(|e| e.to_string())?;
 
     Ok(finish_job(&meta.repo, &config, &meta.base_ref, &paths, outcome).await)
-}
-
-/// Report what `gc` would collect, or collect it.
-///
-/// Policy lives in [`assembly_line::gc`]; this is the printing half.
-async fn remove_stale_worktrees(
-    older_than: Option<String>,
-    dry_run: bool,
-) -> Result<ExitCode, String> {
-    let keep_for = older_than
-        .as_deref()
-        .map(config::parse_duration)
-        .transpose()
-        .map_err(|e| e.to_string())?;
-
-    let found = gc::collectable(keep_for);
-    found
-        .iter()
-        .flat_map(|leftovers| &leftovers.stale)
-        .for_each(|entry| {
-            println!(
-                "{} {} \u{2014} {}",
-                match dry_run {
-                    true => "would remove",
-                    false => "removing",
-                },
-                entry.path.display(),
-                entry.because
-            );
-        });
-
-    let total = gc::total(&found);
-    match (dry_run, total) {
-        (_, 0) => println!("nothing to collect"),
-        (true, total) => println!("{total} worktree(s) would be removed"),
-        (false, _) => {
-            let removed = gc::remove(&found).await;
-            removed.warnings.iter().for_each(|w| eprintln!("warn: {w}"));
-            println!("removed {} worktree(s)", removed.directories);
-        }
-    }
-    Ok(ExitCode::SUCCESS)
 }
 
 fn print_job_log(job_id: u64, follow: bool, repo: Option<PathBuf>) -> ExitCode {

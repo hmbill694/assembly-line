@@ -150,7 +150,7 @@ async fn the_prompt_reaches_the_agent_intact() {
 /// A half-finished failure is exactly the case where the diff is worth
 /// reading, so the work is committed before the failure is judged.
 #[tokio::test]
-async fn a_failing_agent_preserves_its_work_on_a_branch_and_leaves_no_worktree() {
+async fn a_failing_agent_preserves_its_work_on_a_branch_and_leaves_no_checkout() {
     let h = Harness::with_config(&config_running("failing-agent.sh")).await;
 
     let outcome = h.run_job("x").await;
@@ -165,7 +165,7 @@ async fn a_failing_agent_preserves_its_work_on_a_branch_and_leaves_no_worktree()
     let branch = job_branch_name(outcome.job_id);
     assert!(
         outcome
-            .has(|k| matches!(k, EventKind::JobBranchPublished { branch: b, .. } if *b == branch))
+            .has(|k| matches!(k, EventKind::JobBranchPublished { branch: b, pushed_to } if *b == branch && pushed_to.as_deref() == Some("origin")))
     );
     assert!(
         h.scratch_is_empty(),
@@ -178,37 +178,6 @@ async fn a_failing_agent_preserves_its_work_on_a_branch_and_leaves_no_worktree()
     assert!(
         on_branch.contains("partial.txt"),
         "the agent's partial work is not on the branch: {on_branch}"
-    );
-}
-
-/// The point of publishing: a failed job's work leaves the machine that ran it.
-#[tokio::test]
-async fn a_failed_jobs_branch_reaches_the_remote() {
-    let h = Harness::with_config(&config_running("failing-agent.sh")).await;
-
-    let outcome = h.run_job("x").await;
-
-    assert!(!outcome.succeeded);
-    assert!(outcome.has(
-        |k| matches!(k, EventKind::JobBranchPublished { pushed_to, .. } if pushed_to.as_deref() == Some("origin"))
-    ));
-
-    let on_remote = git::run_allowing_failure(
-        &h.origin,
-        &[
-            "show",
-            "--name-only",
-            "--format=",
-            &job_branch_name(outcome.job_id),
-        ],
-    )
-    .await
-    .unwrap();
-    assert!(on_remote.succeeded(), "{}", on_remote.stderr);
-    assert!(
-        on_remote.stdout.contains("partial.txt"),
-        "the failed job's work never reached the remote: {}",
-        on_remote.stdout
     );
 }
 

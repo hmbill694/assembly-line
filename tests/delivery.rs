@@ -57,22 +57,9 @@ fn delivery_is_configurable_from_the_repositorys_own_config() {
 // known — the library's `Harness` has no stdout to assert on — so this one
 // test drives the real binary, the way `tests/cli.rs` does.
 
-/// Where this test's worktrees go, kept out of the shared `$HOME` default so
-/// a leftover cannot confuse another test's `gc`.
-fn worktree_root_for(tmp: &tempfile::TempDir) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "assembly-test-wt-{}",
-        tmp.path().file_name().unwrap().to_string_lossy()
-    ))
-}
-
 fn assembly(tmp: &tempfile::TempDir) -> Command {
     let mut cmd = Command::cargo_bin("assembly").unwrap();
     cmd.current_dir(tmp.path());
-    cmd.env(
-        assembly_line::paths::WORKTREE_ROOT_VAR,
-        worktree_root_for(tmp),
-    );
     cmd
 }
 
@@ -85,10 +72,9 @@ fn origin_for(tmp: &tempfile::TempDir) -> PathBuf {
     ))
 }
 
-/// The worktree root and the bare remote both live outside the tempdir, so a
-/// test that makes them has to take them with it.
-fn discard_worktrees(tmp: &tempfile::TempDir) {
-    let _ = std::fs::remove_dir_all(worktree_root_for(tmp));
+/// The bare remote lives outside the tempdir, so a test that makes one has to
+/// take it with it.
+fn discard_origin(tmp: &tempfile::TempDir) {
     let _ = std::fs::remove_dir_all(origin_for(tmp));
 }
 
@@ -167,7 +153,7 @@ async fn a_failed_job_is_not_delivered() {
         .code(1)
         .stdout(contains("not delivered"));
 
-    discard_worktrees(&tmp);
+    discard_origin(&tmp);
 }
 
 /// The gate above is wired into `run`, but `revise` has its own call site
@@ -208,7 +194,7 @@ async fn a_passing_revise_round_is_delivered() {
         "the remote's branch does not carry both rounds: {rounds}"
     );
 
-    discard_worktrees(&tmp);
+    discard_origin(&tmp);
 }
 
 /// `config.base` is consulted at exactly one place — `deliver_if_verified`
@@ -250,5 +236,5 @@ async fn configured_base_reaches_the_pull_request_and_the_divergence_is_reported
         "gh was not asked to deliver the job's own branch: {invocation}"
     );
 
-    discard_worktrees(&tmp);
+    discard_origin(&tmp);
 }

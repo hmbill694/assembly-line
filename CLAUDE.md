@@ -103,7 +103,8 @@ std::fs::read_dir(dir)
     .collect()
 ```
 
-(`src/gc.rs`'s `job_directories`.)
+(`src/paths.rs`'s `existing_job_ids` is the same idea, collecting into an
+`io::Result` so that an unreadable entry is an error rather than skipped.)
 
 ### Prefer pattern matching to if-else chains
 
@@ -162,12 +163,10 @@ later milestone's daemon brings one back, it belongs here.
 ### Cost
 
 The unit of work is one job, and the collections around it — a repository's
-declared providers, its `copy` list, the remotes `git remote` prints, a `gc`
-run's stale worktrees — are a handful of items, not millions. Favor clarity:
-`git::remote_exists` checks membership by scanning `git remote`'s output line
-by line rather than collecting it into a `HashSet` first (`src/git.rs`); with
-a handful of remotes the scan is clearer and the difference in cost does not
-exist. There is no graph left to traverse — no DFS, no Kahn's-style peeling;
+declared providers, its `copy` list, the frames one job prints — are a
+handful of items, not millions. Favor clarity: with a handful of items a scan
+is clearer than an index, and the difference in cost does not exist. There
+is no graph left to traverse — no DFS, no Kahn's-style peeling;
 a job either runs or it doesn't. If a later milestone's daemon runs many jobs
 at once, the cost question becomes scheduling contention, not walking a data
 structure — revisit this section when that lands.
@@ -178,10 +177,9 @@ A name should tell the reader what the thing *is* or *decides*, without them
 opening it. Bare verbs (`check`, `handle`, `process`, `absorb`, `skip`) and
 bare nouns (`data`, `info`, `result`, `entry`) fail that test.
 
-- **Predicates read as claims:** `git::branch_exists`, not `exists`.
-- **Filters name what they select:** `gc::collectable`, not `filtered` — it
-  names the `RepositoryLeftovers` a `gc` run would actually remove
-  (`src/gc.rs`).
+- **Predicates read as claims:** `git::remote_lacks_ref`, not `check_ref`.
+- **Filters name what they select:** `RepoConfig::settings_worth_flagging`,
+  not `warnings` — it names which settings it picks out (`src/config.rs`).
 - **Error producers name the fault:** `RepoConfig::reasons_it_cannot_run`,
   `unparseable_max_duration` — not `problems`, `duration_error`
   (`src/config.rs`).
@@ -260,7 +258,6 @@ Where a type owns a sink or source, make it generic with a sensible default
   milestone moves that state out of the repository entirely
   (`src/paths.rs`). Its `.git` gains only what a fetch writes — objects,
   `FETCH_HEAD`, remote-tracking refs — when a job pins its start to the
-  remote (`git::pinned`). Worktrees live under
-  `$HOME` (or `$ASSEMBLY_WORKTREE_ROOT`, which tests set), never inside the
-  repo: the target repo must stay untouched, and a worktree inside it would
-  need a `.gitignore` entry assembly-line is not entitled to add.
+  remote (`git::pinned`). Checkouts are scratch
+  clones under the system temp directory, never inside the repository, and
+  are deleted with the round that made them.

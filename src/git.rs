@@ -2,8 +2,8 @@
 //!
 //! Two rules shape this module. The user's working tree is never touched — all
 //! writes happen in scratch clones assembly-line creates elsewhere. And every
-//! operation names the repository or worktree it acts on, so nothing depends
-//! on the process's current directory.
+//! operation names the repository or clone it acts on, so nothing depends on
+//! the process's current directory.
 //!
 //! # Errors
 //!
@@ -319,124 +319,11 @@ pub async fn commit_as_assembly_line(clone: impl AsRef<Path>) -> anyhow::Result<
     .map(|_| ())
 }
 
-/// The commit `branch` points at. A revise round starts here, so the agent
-/// sees its own prior work rather than starting over.
-pub async fn branch_tip(repo: impl AsRef<Path>, branch: &str) -> anyhow::Result<String> {
-    run_expecting_success(
-        repo,
-        &["rev-parse", &format!("refs/heads/{branch}")],
-        &format!("rev-parse {branch}"),
-    )
-    .await
-}
-
 /// The checked-out branch, or `None` when HEAD is detached.
 pub async fn current_branch(repo: impl AsRef<Path>) -> anyhow::Result<Option<String>> {
     let name =
         run_expecting_success(repo, &["branch", "--show-current"], "branch --show-current").await?;
     Ok((!name.is_empty()).then_some(name))
-}
-
-/// Whether the repository has any commits yet. A freshly initialised repo has
-/// none, and a job needs one to branch from.
-pub async fn has_commits(repo: impl AsRef<Path>) -> anyhow::Result<bool> {
-    Ok(
-        run_allowing_failure(repo, &["rev-parse", "--verify", "HEAD"])
-            .await?
-            .succeeded(),
-    )
-}
-
-pub async fn branch_exists(repo: impl AsRef<Path>, branch: &str) -> anyhow::Result<bool> {
-    Ok(run_allowing_failure(
-        repo,
-        &[
-            "show-ref",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{branch}"),
-        ],
-    )
-    .await?
-    .succeeded())
-}
-
-/// `git worktree add` creates the worktree directory itself, but not the path
-/// leading to it.
-fn make_room_for_worktree(path: &Path) -> std::io::Result<()> {
-    match path.parent() {
-        Some(parent) => std::fs::create_dir_all(parent),
-        None => Ok(()),
-    }
-}
-
-/// Where a new worktree's content begins, and what that makes of its branch.
-///
-/// Both variants name the commit the worktree starts at. `git worktree add`
-/// needs it only when creating the branch — checking out a branch that already
-/// exists lands at its tip by definition — but callers diff against it either
-/// way.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorktreeStart {
-    /// Create `branch` at this commit, superseding any earlier attempt's.
-    CreatingBranch { at: String },
-    /// Check out a branch that is already there, whose tip is this commit —
-    /// how a revise round picks its own branch back up.
-    OnExistingBranch { tip: String },
-}
-
-impl WorktreeStart {
-    /// The commit the worktree starts from, however its branch came to be —
-    /// which is what a round's diff is measured against.
-    #[must_use]
-    pub fn start_commit(&self) -> &str {
-        match self {
-            Self::CreatingBranch { at } => at,
-            Self::OnExistingBranch { tip } => tip,
-        }
-    }
-}
-
-/// Check `branch` out into a new worktree at `path`, creating the branch first
-/// when `start` says to.
-pub async fn add_worktree(
-    repo: impl AsRef<Path>,
-    path: impl AsRef<Path>,
-    branch: &str,
-    start: &WorktreeStart,
-) -> anyhow::Result<()> {
-    let path = path.as_ref();
-    make_room_for_worktree(path)?;
-    let path_arg = path.to_string_lossy().into_owned();
-
-    let args: Vec<&str> = match start {
-        WorktreeStart::CreatingBranch { at } => {
-            vec!["worktree", "add", "-b", branch, &path_arg, at]
-        }
-        WorktreeStart::OnExistingBranch { .. } => vec!["worktree", "add", &path_arg, branch],
-    };
-
-    run_expecting_success(repo, &args, &format!("worktree add {branch}"))
-        .await
-        .map(|_| ())
-}
-
-/// Delete a branch whether or not it was merged — a superseded attempt is
-/// unmerged by definition, and a safe delete would refuse it.
-pub async fn delete_branch(repo: impl AsRef<Path>, branch: &str) -> anyhow::Result<()> {
-    run_expecting_success(
-        repo,
-        &["branch", "-D", branch],
-        &format!("branch -D {branch}"),
-    )
-    .await
-    .map(|_| ())
-}
-
-/// Whether `remote` is configured.
-pub async fn remote_exists(repo: impl AsRef<Path>, remote: &str) -> anyhow::Result<bool> {
-    let configured = run_expecting_success(repo, &["remote"], "remote").await?;
-    Ok(configured.lines().map(str::trim).any(|name| name == remote))
 }
 
 /// Deliberately without `--set-upstream`: that would write `branch.*.remote`
@@ -452,85 +339,55 @@ pub async fn push_branch(repo: impl AsRef<Path>, remote: &str, branch: &str) -> 
     .map(|_| ())
 }
 
-/// Forcing is deliberate: the worktree is assembly-line's to discard, and it
-/// routinely holds untracked build output.
-pub async fn remove_worktree(repo: impl AsRef<Path>, path: impl AsRef<Path>) -> anyhow::Result<()> {
-    let path_arg = path.as_ref().to_string_lossy().into_owned();
-    run_expecting_success(
-        repo,
-        &["worktree", "remove", "--force", &path_arg],
-        "worktree remove",
-    )
-    .await
-    .map(|_| ())
-}
-
-/// Drop administrative entries for worktrees whose directories are gone.
-///
-/// Not optional: git still lists such a worktree and refuses to reuse its
-/// path until told otherwise, so deleting the directory alone leaves the name
-/// unusable.
-pub async fn prune_worktrees(repo: impl AsRef<Path>) -> anyhow::Result<()> {
-    run_expecting_success(repo, &["worktree", "prune"], "worktree prune")
-        .await
-        .map(|_| ())
-}
-
 /// Stage everything and commit. `None` means the tree was clean — a normal
 /// outcome, since an agent may correctly conclude no change is needed.
-pub async fn commit_all(
-    worktree: impl AsRef<Path>,
-    message: &str,
-) -> anyhow::Result<Option<String>> {
-    commit_all_except(worktree, message, &[]).await
+pub async fn commit_all(clone: impl AsRef<Path>, message: &str) -> anyhow::Result<Option<String>> {
+    commit_all_except(clone, message, &[]).await
 }
 
 /// Commit everything except `never_commit`, which stay on disk for the agent
 /// to read but are kept out of history.
 ///
-/// Staging is controlled directly rather than through `info/exclude`, because
-/// git resolves that file from the repository's *common* directory — writing
-/// it would modify the user's repository, and a per-worktree copy is ignored.
+/// Staging is controlled directly rather than through `info/exclude` or a
+/// `.gitignore`: both are files in the scratch clone, which the agent is free
+/// to rewrite, so an ignore rule there is only as good as the agent's
+/// restraint. Unstaging each path — and checking afterwards that none was
+/// committed — depends on nothing the agent can edit.
 ///
 /// # Errors
 ///
 /// Beyond the usual git failures, an error if a `never_commit` path is
 /// tracked once the commit is made — meaning the agent committed it itself.
 pub async fn commit_all_except(
-    worktree: impl AsRef<Path>,
+    clone: impl AsRef<Path>,
     message: &str,
     never_commit: &[String],
 ) -> anyhow::Result<Option<String>> {
-    let worktree = worktree.as_ref();
-    run_expecting_success(worktree, &["add", "-A"], "add -A").await?;
+    let clone = clone.as_ref();
+    run_expecting_success(clone, &["add", "-A"], "add -A").await?;
 
     // `run_allowing_failure`: unstaging a path that was never staged is a
     // no-op worth ignoring, not an error.
     for path in never_commit {
-        run_allowing_failure(worktree, &["reset", "--quiet", "--", path]).await?;
+        run_allowing_failure(clone, &["reset", "--quiet", "--", path]).await?;
     }
 
-    let nothing_staged = run_allowing_failure(worktree, &["diff", "--cached", "--quiet"])
+    let nothing_staged = run_allowing_failure(clone, &["diff", "--cached", "--quiet"])
         .await?
         .succeeded();
     if nothing_staged {
         return Ok(None);
     }
 
-    run_expecting_success(
-        worktree,
-        &["commit", "--no-verify", "-m", message],
-        "commit",
-    )
-    .await?;
-    ensure_untracked(worktree, never_commit).await?;
-    head_sha(worktree).await.map(Some)
+    run_expecting_success(clone, &["commit", "--no-verify", "-m", message], "commit").await?;
+    ensure_untracked(clone, never_commit).await?;
+    head_sha(clone).await.map(Some)
 }
 
 /// Unstaging covers the commits assembly-line makes; this catches the agent
 /// committing a seeded file itself. Fatal, because a failed job is far better
 /// than a leaked credential on a branch bound for a remote.
-async fn ensure_untracked(worktree: &Path, never_commit: &[String]) -> anyhow::Result<()> {
+async fn ensure_untracked(clone: &Path, never_commit: &[String]) -> anyhow::Result<()> {
     if never_commit.is_empty() {
         return Ok(());
     }
@@ -539,7 +396,7 @@ async fn ensure_untracked(worktree: &Path, never_commit: &[String]) -> anyhow::R
         .into_iter()
         .chain(never_commit.iter().map(String::as_str))
         .collect();
-    let tracked = run_expecting_success(worktree, &args, "ls-files").await?;
+    let tracked = run_expecting_success(clone, &args, "ls-files").await?;
 
     match tracked.is_empty() {
         true => Ok(()),
@@ -550,9 +407,9 @@ async fn ensure_untracked(worktree: &Path, never_commit: &[String]) -> anyhow::R
     }
 }
 
-/// Whether a worktree has uncommitted changes, tracked or otherwise.
-pub async fn is_dirty(worktree: impl AsRef<Path>) -> anyhow::Result<bool> {
-    let status = run_expecting_success(worktree, &["status", "--porcelain"], "status").await?;
+/// Whether a clone has uncommitted changes, tracked or otherwise.
+pub async fn is_dirty(clone: impl AsRef<Path>) -> anyhow::Result<bool> {
+    let status = run_expecting_success(clone, &["status", "--porcelain"], "status").await?;
     Ok(!status.is_empty())
 }
 
@@ -563,9 +420,9 @@ pub struct DiffStat {
     pub deletions: usize,
 }
 
-pub async fn diff_stat_against(worktree: impl AsRef<Path>, base: &str) -> anyhow::Result<DiffStat> {
+pub async fn diff_stat_against(clone: impl AsRef<Path>, base: &str) -> anyhow::Result<DiffStat> {
     let numstat = run_expecting_success(
-        worktree,
+        clone,
         &["diff", "--numstat", &format!("{base}..HEAD")],
         "diff --numstat",
     )
