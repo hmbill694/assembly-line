@@ -42,6 +42,7 @@ impl Fixture {
             &self.repo,
             copy,
             self.scratch(),
+            None,
         )
         .await
     }
@@ -190,9 +191,17 @@ async fn continuing_a_branch_restores_the_previous_rounds_work() {
     workspace::discard(first).unwrap();
 
     let tip = git::pinned(&fx.repo, "origin", "al/job-1").await.unwrap();
-    let second = workspace::create(fx.url(), &tip, "al/job-1", &fx.repo, &[], fx.scratch())
-        .await
-        .unwrap();
+    let second = workspace::create(
+        fx.url(),
+        &tip,
+        "al/job-1",
+        &fx.repo,
+        &[],
+        fx.scratch(),
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         std::fs::read_to_string(second.path().join("rounds.txt")).unwrap(),

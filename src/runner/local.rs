@@ -1,8 +1,8 @@
 //! Running a job as a child of this process: no isolation, the host's own
 //! toolchain and credentials.
 
-use super::Termination;
 use super::child::ChildLines;
+use super::{JobSecrets, Runner, RunnerProblem, RunningJob, Termination};
 use crate::payload::{JobPayload, PAYLOAD_VAR};
 use std::path::PathBuf;
 use tokio::process::Command;
@@ -28,16 +28,39 @@ impl LocalRunner {
             program: program.into(),
         }
     }
+}
 
-    /// # Errors
-    ///
-    /// Returns an error if the payload cannot be serialised or the binary
-    /// cannot be spawned.
-    pub fn launch(&self, payload: &JobPayload) -> anyhow::Result<LocalJob> {
+impl Runner for LocalRunner {
+    type Running = LocalJob;
+    const RUNS_IN_A_CONTAINER: bool = false;
+
+    /// The host is already here: nothing to reach, nothing to create.
+    fn reasons_it_cannot_run(&self) -> impl Future<Output = Vec<RunnerProblem>> + Send {
+        std::future::ready(Vec::new())
+    }
+
+    /// `secrets` goes unused: the child inherits the host's environment, git
+    /// credentials included. Spawning does not wait on the child, so the
+    /// launch is ready at once.
+    fn launch(
+        &self,
+        payload: &JobPayload,
+        _secrets: &JobSecrets,
+    ) -> impl Future<Output = anyhow::Result<LocalJob>> + Send {
+        std::future::ready(self.spawn_job_exec(payload))
+    }
+}
+
+impl LocalRunner {
+    fn spawn_job_exec(&self, payload: &JobPayload) -> anyhow::Result<LocalJob> {
         let mut command = Command::new(&self.program);
         command
             .arg("job-exec")
-            .env(PAYLOAD_VAR, serde_json::to_string(payload)?);
+            .env(PAYLOAD_VAR, serde_json::to_string(payload)?)
+            // Exported for a container runner, the token would make
+            // `job-exec` authenticate with it instead of the host's own
+            // credentials.
+            .env_remove(crate::payload::GIT_TOKEN_VAR);
         ChildLines::spawn(command).map(|lines| LocalJob { lines })
     }
 }
@@ -47,19 +70,19 @@ pub struct LocalJob {
     lines: ChildLines,
 }
 
-impl LocalJob {
-    pub async fn next_line(&mut self) -> Option<String> {
+impl RunningJob for LocalJob {
+    async fn next_line(&mut self) -> Option<String> {
         self.lines.next_line().await
     }
 
     /// SIGTERM, which `job-exec` answers by cancelling its agent and
     /// reporting the round. Returns at once; the round's end arrives on the
     /// stream.
-    pub fn cancel(&mut self) {
+    async fn cancel(&mut self) {
         self.lines.terminate();
     }
 
-    pub async fn termination(self) -> Termination {
+    async fn termination(self) -> Termination {
         Termination::Exited(self.lines.exit_code().await)
     }
 }

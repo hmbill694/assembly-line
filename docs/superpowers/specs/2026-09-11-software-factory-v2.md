@@ -234,7 +234,9 @@ is shaped the way it is.
 The daemon is the only credential holder, and the holder decides what
 leaves. A container job always receives `ASSEMBLY_GIT_TOKEN`, which
 `job-exec` wires into a git credential helper for its clone and push, and
-never exposes to the agent; SSH remotes are rewritten to HTTPS for it.
+withholds from the agent's environment — though an agent running as the same
+user can still read it from `job-exec`'s process environment (accepted risk
+11). SSH remotes are rewritten to HTTPS for it.
 Anything else the agent needs — its API key — is named by the host
 (`--pass-env` in F2, daemon config from F3). Docker receives values as
 `-e NAME`, never on a command line; k8s as a per-job Secret owned by the Job
@@ -519,6 +521,10 @@ with a deletion.
    mise-nix backend. A repository that needs one runs on the local runner.
 10. **Container jobs provision their toolchain cold**, costing minutes per
     job, until F3 configures a cache.
+11. **A container job's agent runs as the same user as `job-exec`**, so it
+    can read the git token from `job-exec`'s process environment (`/proc`).
+    Isolating it needs the agent under its own uid — a later milestone's
+    image change.
 
 ## Deferred, knowingly
 

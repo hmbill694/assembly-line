@@ -58,7 +58,9 @@ async fn clone_checked_out(
 ) -> PathBuf {
     let path = into.join(name);
     std::fs::create_dir_all(&path).unwrap();
-    clone_into(source.to_str().unwrap(), &path).await.unwrap();
+    clone_into(source.to_str().unwrap(), &path, None)
+        .await
+        .unwrap();
     check_out_new_branch(&path, branch, at).await.unwrap();
     commit_as_assembly_line(&path).await.unwrap();
     path
@@ -496,7 +498,7 @@ async fn a_clone_checks_out_a_new_branch_at_the_commit_it_is_given() {
 
     let clone = tmp.path().join("clone");
     std::fs::create_dir_all(&clone).unwrap();
-    git::clone_into(origin.to_str().unwrap(), &clone)
+    git::clone_into(origin.to_str().unwrap(), &clone, None)
         .await
         .unwrap();
     git::check_out_new_branch(&clone, "al/job-1", &at)
@@ -509,4 +511,98 @@ async fn a_clone_checks_out_a_new_branch_at_the_commit_it_is_given() {
         Some("al/job-1")
     );
     assert!(clone.join("README.md").is_file());
+}
+
+/// A clone of a fresh remote under `tmp`, made with the token helper.
+async fn clone_with_the_token_helper(tmp: &Path) -> PathBuf {
+    let repo = tmp.join("repo");
+    support::init_git_repo(&repo).await;
+    let origin = tmp.join("origin.git");
+    support::add_origin(&repo, &origin).await;
+    support::publish_main(&repo).await;
+
+    let clone = tmp.join("clone");
+    std::fs::create_dir_all(&clone).unwrap();
+    git::clone_into(
+        origin.to_str().unwrap(),
+        &clone,
+        Some(git::TOKEN_CREDENTIAL_HELPER),
+    )
+    .await
+    .unwrap();
+    clone
+}
+
+/// `git credential <action>` in `clone`, fed `input`, as git would run it
+/// during a push. `global_config` stands in for the machine's own config, so
+/// the real one never takes part.
+fn git_credential(clone: &Path, global_config: &Path, action: &str, input: &str) -> String {
+    let mut git = std::process::Command::new("git")
+        .args(["credential", action])
+        .current_dir(clone)
+        .env("GIT_CONFIG_GLOBAL", global_config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("ASSEMBLY_GIT_TOKEN", "t0ken")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(git.stdin.as_mut().unwrap(), input.as_bytes()).unwrap();
+    String::from_utf8(git.wait_with_output().unwrap().stdout).unwrap()
+}
+
+/// The token helper stays configured in the clone, so the push that ends the
+/// round authenticates the same way the clone did — and it answers with the
+/// token from the environment.
+#[tokio::test]
+async fn a_clone_given_the_token_helper_answers_git_with_the_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let clone = clone_with_the_token_helper(tmp.path()).await;
+
+    let answer = git_credential(
+        &clone,
+        Path::new("/dev/null"),
+        "fill",
+        "protocol=https\nhost=github.com\n\n",
+    );
+
+    assert!(answer.contains("username=x-access-token"), "{answer}");
+    assert!(answer.contains("password=t0ken"), "{answer}");
+}
+
+/// Once a credential works, git offers it to every configured helper to
+/// `store` — a keychain or a plaintext file would then keep the token. The
+/// token helper replaces the machine's helpers instead of joining them.
+#[tokio::test]
+async fn the_token_helper_replaces_every_helper_the_machine_configures() {
+    let tmp = tempfile::tempdir().unwrap();
+    let clone = clone_with_the_token_helper(tmp.path()).await;
+    let consulted = tmp.path().join("consulted");
+    let machine_helper = support::fake_cli(
+        &tmp.path().join("fakes"),
+        "machine-helper",
+        &format!("echo \"$1\" >> {}\n", consulted.display()),
+    );
+    let global_config = tmp.path().join("gitconfig");
+    std::fs::write(
+        &global_config,
+        format!("[credential]\n\thelper = {}\n", machine_helper.display()),
+    )
+    .unwrap();
+
+    let answer = git_credential(
+        &clone,
+        &global_config,
+        "fill",
+        "protocol=https\nhost=github.com\n\n",
+    );
+    git_credential(&clone, &global_config, "approve", &answer);
+
+    assert!(answer.contains("password=t0ken"), "{answer}");
+    assert!(
+        !consulted.exists(),
+        "the machine's helper was asked: {}",
+        std::fs::read_to_string(&consulted).unwrap_or_default()
+    );
 }

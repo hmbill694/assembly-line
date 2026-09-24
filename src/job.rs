@@ -10,7 +10,7 @@ use crate::event::EventKind;
 use crate::exec::{ShellOutcome, run_command, run_shell};
 use crate::frame::FrameWriter;
 use crate::git;
-use crate::payload::JobPayload;
+use crate::payload::{GIT_TOKEN_VAR, JobPayload};
 use crate::workspace::{self, JobWorkspace};
 use std::io::Write;
 use std::path::Path;
@@ -116,6 +116,12 @@ async fn round_result<W: Write + Send + 'static>(
         &payload.seed_from,
         &payload.copy,
         scratch_root,
+        // A container runner always sends the token, having no other
+        // credentials to offer; without one, git uses whatever this
+        // environment already has.
+        std::env::var_os(GIT_TOKEN_VAR)
+            .is_some()
+            .then_some(git::TOKEN_CREDENTIAL_HELPER),
     )
     .await?;
 

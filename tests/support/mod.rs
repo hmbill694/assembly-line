@@ -14,6 +14,7 @@ use assembly_line::paths::{self, JobPaths};
 use assembly_line::payload::{self, JobPayload, RoundRequest};
 use assembly_line::state::JobState;
 use assembly_line::workspace;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
@@ -26,6 +27,20 @@ pub fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(name)
+}
+
+/// Write an executable shell script called `name` into `dir` — a stand-in
+/// for a CLI such as `docker`, so no test ever reaches the real one.
+pub fn fake_cli(dir: &Path, name: &str, body: &str) -> PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(
+        &path,
+        format!("#!/usr/bin/env bash\nset -euo pipefail\n{body}"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
 }
 
 /// A `[providers.fake]` block that runs one of the fixture scripts.

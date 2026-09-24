@@ -4,26 +4,66 @@
 use crate::event::{Event, EventKind, EventLog};
 use crate::frame::{Routed, StreamPosition, verdict_missing_from};
 use crate::job::JobOutcome;
-use crate::runner::local::LocalJob;
+use crate::runner::RunningJob;
 use std::io::Write;
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
 /// Collect one round's stream until it ends, then settle its outcome.
 ///
-/// A loop, not a fold: each line is I/O that must land before the next is
-/// read, and cancellation arrives from outside mid-stream.
-///
 /// # Errors
 ///
 /// Returns an error only if the log or the event log cannot be written. A
 /// job that fails, or dies without saying how, is a [`JobOutcome::Failed`].
-pub async fn collect(
-    mut job: LocalJob,
+/// The job is cancelled, and its end waited for, before the error is
+/// returned: dropping it would kill only the local end — a `docker` client,
+/// or `job-exec` before it has stopped its agent — and leave the work
+/// running with nobody collecting it.
+pub async fn collect<J: RunningJob>(
+    mut job: J,
+    log: &mut EventLog,
+    output_log: &Path,
+    round: u32,
+    cancel: CancellationToken,
+) -> anyhow::Result<JobOutcome> {
+    let collected = match stream_into_logs(&mut job, log, output_log, cancel).await {
+        Ok(collected) => collected,
+        Err(e) => {
+            cancel_and_wait_out(job).await;
+            return Err(e);
+        }
+    };
+
+    let termination = job.termination().await;
+    let settled = start_missing_from(&collected, round)
+        .into_iter()
+        .chain(verdict_missing_from(&collected, &termination.to_string()))
+        .map(|kind| log.append(kind))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(outcome_of(&[collected, settled].concat()))
+}
+
+/// The start of a round whose stream never announced one — a job that died
+/// before its first frame, or never ran. Without it the round's failure would
+/// read as the previous round's, and the next revise would reuse its number.
+fn start_missing_from(round_events: &[Event], round: u32) -> Option<EventKind> {
+    (!round_events
+        .iter()
+        .any(|e| matches!(e.kind, EventKind::JobStarted { .. })))
+    .then_some(EventKind::JobStarted { round })
+}
+
+/// Route every line of the job's stream to the event log or the output log
+/// until the stream ends, returning the events collected.
+///
+/// A loop, not a fold: each line is I/O that must land before the next is
+/// read, and cancellation arrives from outside mid-stream.
+async fn stream_into_logs<J: RunningJob>(
+    job: &mut J,
     log: &mut EventLog,
     output_log: &Path,
     cancel: CancellationToken,
-) -> anyhow::Result<JobOutcome> {
+) -> anyhow::Result<Vec<Event>> {
     let mut output = open_for_append(output_log)?;
     let mut position = StreamPosition::default();
     let mut collected: Vec<Event> = Vec::new();
@@ -33,7 +73,7 @@ pub async fn collect(
         let line = tokio::select! {
             line = job.next_line() => line,
             () = cancel.cancelled(), if !cancelling => {
-                job.cancel();
+                job.cancel().await;
                 cancelling = true;
                 continue;
             }
@@ -51,24 +91,30 @@ pub async fn collect(
             Routed::AlreadyCollected => {}
         }
     }
+    Ok(collected)
+}
 
-    let termination = job.termination().await;
-    if let Some(kind) = verdict_missing_from(&collected, &termination.to_string()) {
-        collected.push(log.append(kind)?);
-    }
-    Ok(outcome_of(&collected))
+/// Cancel `job` and wait for it to end, discarding the rest of its stream so
+/// it never blocks writing to a pipe nobody reads.
+async fn cancel_and_wait_out<J: RunningJob>(mut job: J) {
+    job.cancel().await;
+    // A loop: each line is awaited in turn until the stream ends.
+    while job.next_line().await.is_some() {}
+    let _ = job.termination().await;
 }
 
 /// A runner that could not start the job at all still leaves a record: the
-/// round failed, and this is why.
+/// round began, it failed, and this is why.
 ///
 /// # Errors
 ///
 /// Returns an error if the event log cannot be written.
 pub fn record_launch_failure(
     log: &mut EventLog,
+    round: u32,
     error: &anyhow::Error,
 ) -> anyhow::Result<JobOutcome> {
+    log.append(EventKind::JobStarted { round })?;
     log.append(EventKind::JobFailed {
         reason: format!("the runner could not start the job: {error}"),
     })?;

@@ -1,4 +1,4 @@
-use assembly_line::cli::{Cli, Command};
+use assembly_line::cli::{Cli, Command, RunnerArgs, RunnerKind};
 use assembly_line::collect::{collect, record_launch_failure};
 use assembly_line::config::RepoConfig;
 use assembly_line::event::{Event, EventKind, EventLog};
@@ -7,7 +7,11 @@ use assembly_line::job::{JobOutcome, run_round};
 use assembly_line::paths::{JobMeta, JobPaths};
 use assembly_line::payload::{self, JobPayload, PAYLOAD_VAR, RoundRequest};
 use assembly_line::report::JobReport;
+use assembly_line::runner::docker::DockerRunner;
 use assembly_line::runner::local::LocalRunner;
+use assembly_line::runner::{
+    self, JobSecrets, Runner, RunnerProblem, reasons_a_container_cannot_run,
+};
 use assembly_line::workspace::{DEFAULT_REMOTE, job_branch_name};
 use assembly_line::{config, delivery, git, paths};
 use clap::Parser;
@@ -30,12 +34,30 @@ fn main() -> ExitCode {
             repo,
             base_ref,
             provider,
-        } => in_async_runtime(start_new_job(prompt, prompt_file, repo, base_ref, provider)),
+            runner,
+        } => in_async_runtime(run_work_on_chosen_runner(
+            runner,
+            Work::Start {
+                prompt,
+                prompt_file,
+                repo,
+                base_ref,
+                provider,
+            },
+        )),
         Command::Revise {
             job_id,
             feedback,
             repo,
-        } => in_async_runtime(revise_existing_job(job_id, feedback, repo)),
+            runner,
+        } => in_async_runtime(run_work_on_chosen_runner(
+            runner,
+            Work::Revise {
+                job_id,
+                feedback,
+                repo,
+            },
+        )),
         Command::Status { job_id, repo } => print_job_status(job_id, repo),
         Command::Logs {
             job_id,
@@ -103,21 +125,146 @@ fn cancel_on_termination_signal(cancel: CancellationToken) {
     });
 }
 
+/// What `run` and `revise` do, independent of where the round runs.
+enum Work {
+    Start {
+        prompt: Option<String>,
+        prompt_file: Option<PathBuf>,
+        repo: Option<PathBuf>,
+        base_ref: Option<String>,
+        provider: Option<String>,
+    },
+    Revise {
+        job_id: u64,
+        feedback: String,
+        repo: Option<PathBuf>,
+    },
+}
+
+/// The one place flags become a concrete runner; everything after it is
+/// generic over [`Runner`].
+async fn run_work_on_chosen_runner(args: RunnerArgs, work: Work) -> Result<ExitCode, String> {
+    match args.runner {
+        RunnerKind::Local if args.image.is_some() || !args.pass_env.is_empty() => Err(
+            "--image and --pass-env apply to container runners; the local runner uses your \
+             machine as it is"
+                .into(),
+        ),
+        RunnerKind::Local => {
+            run_work(
+                &LocalRunner::current_binary().map_err(|e| e.to_string())?,
+                &[],
+                work,
+            )
+            .await
+        }
+        RunnerKind::Docker => {
+            let image = args.image.unwrap_or_else(runner::published_image);
+            run_work(&DockerRunner::new(image), &args.pass_env, work).await
+        }
+    }
+}
+
+async fn run_work<R: Runner>(
+    runner: &R,
+    pass_env: &[String],
+    work: Work,
+) -> Result<ExitCode, String> {
+    match work {
+        Work::Start {
+            prompt,
+            prompt_file,
+            repo,
+            base_ref,
+            provider,
+        } => {
+            start_new_job(
+                runner,
+                pass_env,
+                prompt,
+                prompt_file,
+                repo,
+                base_ref,
+                provider,
+            )
+            .await
+        }
+        Work::Revise {
+            job_id,
+            feedback,
+            repo,
+        } => revise_existing_job(runner, pass_env, job_id, feedback, repo).await,
+    }
+}
+
+/// Every reason the chosen runner cannot run this repository's job, printed
+/// together, before anything is allocated.
+async fn runnable_secrets<R: Runner>(
+    runner: &R,
+    config: &RepoConfig,
+    pass_env: &[String],
+) -> Result<JobSecrets, String> {
+    let (secrets, missing) = match R::RUNS_IN_A_CONTAINER {
+        true => JobSecrets::from_host_environment(pass_env),
+        false => (JobSecrets::default(), Vec::new()),
+    };
+    let container = match R::RUNS_IN_A_CONTAINER {
+        true => reasons_a_container_cannot_run(&config.copy),
+        false => Vec::new(),
+    };
+    let problems: Vec<RunnerProblem> = runner
+        .reasons_it_cannot_run()
+        .await
+        .into_iter()
+        .chain(container)
+        .chain(missing)
+        .collect();
+
+    match problems.as_slice() {
+        [] => Ok(secrets),
+        problems => {
+            problems.iter().for_each(|p| eprintln!("error: {p}"));
+            Err("the job cannot run on this runner".into())
+        }
+    }
+}
+
+/// A round's payload, fitted to where it runs. A container has neither the
+/// host's toolchain nor its SSH keys, so it provisions the one and reaches
+/// the remote over HTTPS, with a token, in place of the other.
+fn payload_for_runner<R: Runner>(
+    config: &RepoConfig,
+    request: RoundRequest<'_>,
+) -> Result<JobPayload, String> {
+    let request = RoundRequest {
+        remote_url: match R::RUNS_IN_A_CONTAINER {
+            true => payload::https_equivalent(&request.remote_url),
+            false => request.remote_url,
+        },
+        ..request
+    };
+    JobPayload::for_round(config, request)
+        .map(|payload| JobPayload {
+            provision_toolchain: R::RUNS_IN_A_CONTAINER,
+            ..payload
+        })
+        .map_err(|e| e.to_string())
+}
+
 /// Launch the round and collect it. A launch failure is a failed round, not
 /// a usage error: the job directory already exists and must say what
 /// became of it.
-async fn collect_round(
+async fn collect_round<R: Runner>(
+    runner: &R,
     payload: &JobPayload,
+    secrets: &JobSecrets,
     log: &mut EventLog,
     output_log: &Path,
     cancel: CancellationToken,
 ) -> anyhow::Result<JobOutcome> {
-    match LocalRunner::current_binary()
-        .map_err(anyhow::Error::from)
-        .and_then(|runner| runner.launch(payload))
-    {
-        Ok(job) => collect(job, log, output_log, cancel).await,
-        Err(e) => record_launch_failure(log, &e),
+    match runner.launch(payload, secrets).await {
+        Ok(job) => collect(job, log, output_log, payload.round, cancel).await,
+        Err(e) => record_launch_failure(log, payload.round, &e),
     }
 }
 
@@ -235,7 +382,9 @@ fn runnable_config_and_provider(
     }
 }
 
-async fn start_new_job(
+async fn start_new_job<R: Runner>(
+    runner: &R,
+    pass_env: &[String],
     prompt: Option<String>,
     prompt_file: Option<PathBuf>,
     repo: Option<PathBuf>,
@@ -251,6 +400,7 @@ async fn start_new_job(
         provider,
         config,
     } = prepare_job(prompt, prompt_file, repo, base_ref, provider).await?;
+    let secrets = runnable_secrets(runner, &config, pass_env).await?;
 
     let meta = JobMeta {
         repo: repo.clone(),
@@ -260,7 +410,7 @@ async fn start_new_job(
     };
     let (paths, mut log) = allocate_job(&meta)?;
 
-    let payload = JobPayload::for_round(
+    let payload = payload_for_runner::<R>(
         &config,
         RoundRequest {
             job_id: paths.id,
@@ -274,11 +424,17 @@ async fn start_new_job(
             // against the repository — not against wherever the user stands.
             seed_from: &repo,
         },
+    )?;
+    let outcome = collect_round(
+        runner,
+        &payload,
+        &secrets,
+        &mut log,
+        &paths.log(),
+        cancel_on_ctrl_c(),
     )
+    .await
     .map_err(|e| e.to_string())?;
-    let outcome = collect_round(&payload, &mut log, &paths.log(), cancel_on_ctrl_c())
-        .await
-        .map_err(|e| e.to_string())?;
 
     let code = finish_job(
         &repo,
@@ -522,7 +678,9 @@ async fn job_branch_tip(repo: &Path, job_id: u64) -> Result<git::PinnedRef, Stri
 }
 
 /// Run a job again with feedback. The round appends to the job's branch.
-async fn revise_existing_job(
+async fn revise_existing_job<R: Runner>(
+    runner: &R,
+    pass_env: &[String],
     job_id: u64,
     feedback: String,
     repo: Option<PathBuf>,
@@ -543,6 +701,7 @@ async fn revise_existing_job(
         .await
         .map_err(|e| e.to_string())?;
     let (config, _) = runnable_config_and_provider(declared, Some(meta.provider.clone()))?;
+    let secrets = runnable_secrets(runner, &config, pass_env).await?;
 
     let mut log =
         EventLog::open_append(paths.events()).map_err(|e| format!("opening the event log: {e}"))?;
@@ -550,7 +709,7 @@ async fn revise_existing_job(
     let round = rounds_so_far(&events) + 1;
     println!("revising job {job_id} (round {round})");
 
-    let payload = JobPayload::for_round(
+    let payload = payload_for_runner::<R>(
         &config,
         RoundRequest {
             job_id,
@@ -562,11 +721,17 @@ async fn revise_existing_job(
             remote_url,
             seed_from: &meta.repo,
         },
+    )?;
+    let outcome = collect_round(
+        runner,
+        &payload,
+        &secrets,
+        &mut log,
+        &paths.log(),
+        cancel_on_ctrl_c(),
     )
+    .await
     .map_err(|e| e.to_string())?;
-    let outcome = collect_round(&payload, &mut log, &paths.log(), cancel_on_ctrl_c())
-        .await
-        .map_err(|e| e.to_string())?;
 
     Ok(finish_job(
         &meta.repo,

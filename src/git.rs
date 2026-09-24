@@ -277,16 +277,39 @@ pub async fn pinned(
     }
 }
 
+/// A credential helper answering with the token in
+/// [`crate::payload::GIT_TOKEN_VAR`], read from the environment when git
+/// asks — never written to disk.
+pub const TOKEN_CREDENTIAL_HELPER: &str = "!f() { test \"$1\" = get && echo username=x-access-token && echo \"password=$ASSEMBLY_GIT_TOKEN\"; }; f";
+
 /// Clone `url` into the existing, empty directory `into`, without checking
 /// anything out — [`check_out_new_branch`] decides what the tree holds.
-pub async fn clone_into(url: &str, into: impl AsRef<Path>) -> anyhow::Result<()> {
-    run_expecting_success(
-        into,
-        &["clone", "--quiet", "--no-checkout", url, "."],
-        "clone",
-    )
-    .await
-    .map(|_| ())
+///
+/// A `credential_helper` authenticates the clone and stays configured in it,
+/// so the job's push authenticates the same way. It *replaces* any helper
+/// the system or global config names: an empty `credential.helper` resets
+/// the list, so git neither asks another helper first nor hands one the
+/// token to `store` once it has worked. `clone -c` writes both settings into
+/// the new repository before anything is fetched, so one command covers the
+/// clone and every later push.
+pub async fn clone_into(
+    url: &str,
+    into: impl AsRef<Path>,
+    credential_helper: Option<&str>,
+) -> anyhow::Result<()> {
+    let helper_setting = credential_helper.map(|helper| format!("credential.helper={helper}"));
+    let args: Vec<&str> = ["clone", "--quiet", "--no-checkout"]
+        .into_iter()
+        .chain(
+            helper_setting
+                .iter()
+                .flat_map(|setting| ["-c", "credential.helper=", "-c", setting.as_str()]),
+        )
+        .chain([url, "."])
+        .collect();
+    run_expecting_success(into, &args, "clone")
+        .await
+        .map(|_| ())
 }
 
 /// Create `branch` at `at` and check it out.

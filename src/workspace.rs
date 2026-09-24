@@ -38,7 +38,8 @@ pub fn job_branch_name(job_id: u64) -> String {
 }
 
 /// Clone `remote_url` into a fresh directory under `scratch_root`, with
-/// `branch` checked out at `start`, and seed it.
+/// `branch` checked out at `start`, and seed it. A `credential_helper`
+/// authenticates both the clone and the eventual push.
 ///
 /// # Errors
 ///
@@ -52,6 +53,7 @@ pub async fn create(
     seed_from: impl AsRef<Path>,
     copy_paths: &[String],
     scratch_root: impl AsRef<Path>,
+    credential_helper: Option<&str>,
 ) -> anyhow::Result<JobWorkspace> {
     let seed_from = seed_from.as_ref();
 
@@ -67,7 +69,7 @@ pub async fn create(
         .prefix("assembly-job-")
         .tempdir_in(scratch_root)?;
 
-    git::clone_into(remote_url, dir.path()).await?;
+    git::clone_into(remote_url, dir.path(), credential_helper).await?;
     // A tag, or a commit reachable only from the ref the job names, is not
     // guaranteed by a plain clone.
     git::run_allowing_failure(dir.path(), &["fetch", "--quiet", CLONE_REMOTE, &start.name]).await?;

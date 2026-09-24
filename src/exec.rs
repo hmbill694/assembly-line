@@ -1,5 +1,5 @@
 use crate::frame::FrameWriter;
-use crate::payload::PAYLOAD_VAR;
+use crate::payload::{GIT_TOKEN_VAR, PAYLOAD_VAR};
 use crate::provider::CommandSpec;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
@@ -99,8 +99,12 @@ async fn supervise<W: Write + Send + 'static>(
 ) -> anyhow::Result<ShellOutcome> {
     let mut child = detach_from_terminal(&mut command)
         .current_dir(cwd.as_ref())
-        // The payload names the job's plan; the agent has no use for it.
+        // The payload names the job's plan; the agent has no use for it. The
+        // git token is the job's to push with, so it is kept out of the
+        // agent's environment — though not out of its reach; see
+        // `GIT_TOKEN_VAR`.
         .env_remove(PAYLOAD_VAR)
+        .env_remove(GIT_TOKEN_VAR)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

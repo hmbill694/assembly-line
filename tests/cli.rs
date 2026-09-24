@@ -53,13 +53,28 @@ async fn publish_to_origin(tmp: &tempfile::TempDir) {
 /// The repository itself comes from `support`, so there is one definition of
 /// "a git repo with a commit in it" across the whole test suite.
 async fn repo_running(script: &str) -> tempfile::TempDir {
+    repo_opted_in_with(&format!(
+        "verify = \"true\"\n{}",
+        support::config_running(script)
+    ))
+    .await
+}
+
+/// Like [`repo_running`], but the config also declares `copy` — which no
+/// container runner can honour.
+async fn repo_running_with_copy(script: &str) -> tempfile::TempDir {
+    repo_opted_in_with(&format!(
+        "verify = \"true\"\ncopy = [\"local.env\"]\n{}",
+        support::config_running(script)
+    ))
+    .await
+}
+
+/// A repository whose committed, published `.assembly/config.toml` is `config`.
+async fn repo_opted_in_with(config: &str) -> tempfile::TempDir {
     let tmp = support::repo_with_initial_commit().await;
     std::fs::create_dir_all(tmp.path().join(".assembly")).unwrap();
-    std::fs::write(
-        tmp.path().join(REPO_CONFIG_PATH),
-        format!("verify = \"true\"\n{}", support::config_running(script)),
-    )
-    .unwrap();
+    std::fs::write(tmp.path().join(REPO_CONFIG_PATH), config).unwrap();
     commit_all(tmp.path(), "opt in").await.unwrap().unwrap();
     publish_to_origin(&tmp).await;
     tmp
@@ -250,6 +265,29 @@ async fn status_and_logs_report_a_finished_job() {
         .assert()
         .success()
         .stdout(contains("giving up"));
+
+    discard_origin(&tmp);
+}
+
+/// The token is for the container runners, which have no credentials of
+/// their own. Exported for them, it must not take over a local run, which
+/// uses whatever git already authenticates with on this machine.
+#[tokio::test]
+async fn the_local_runner_keeps_the_hosts_credentials_even_with_a_token_exported() {
+    let tmp = repo_running("credential-reporting-agent.sh").await;
+
+    assembly(&tmp)
+        .env("ASSEMBLY_GIT_TOKEN", "t")
+        .args(["run", "--prompt", "x"])
+        .assert()
+        .success();
+
+    assembly(&tmp)
+        .args(["logs", "1"])
+        .assert()
+        .success()
+        .stdout(contains("helpers:"))
+        .stdout(contains("x-access-token").not());
 
     discard_origin(&tmp);
 }
@@ -506,5 +544,47 @@ async fn a_job_writes_nothing_outside_dot_assembly_in_the_target_repository() {
 
     assert!(!tmp.path().join("agent-output.txt").exists());
 
+    discard_origin(&tmp);
+}
+
+#[tokio::test]
+async fn container_flags_are_refused_for_the_local_runner() {
+    let tmp = repo_running("fake-agent.sh").await;
+    assembly(&tmp)
+        .args(["run", "--prompt", "x", "--pass-env", "ANTHROPIC_API_KEY"])
+        .assert()
+        .code(2)
+        .stderr(contains("container runners"));
+    discard_origin(&tmp);
+}
+
+/// The docker runner through the real binary, with a fake `docker` first on
+/// PATH. Every preflight problem is reported at once, and nothing is
+/// allocated.
+#[tokio::test]
+async fn docker_preflight_reports_every_problem_before_allocating() {
+    let tmp = repo_running_with_copy("fake-agent.sh").await;
+    let fakes = tempfile::tempdir().unwrap();
+    // A docker that cannot reach its daemon.
+    support::fake_cli(fakes.path(), "docker", "echo 'no daemon' >&2\nexit 1\n");
+
+    assembly(&tmp)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                fakes.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env_remove("ASSEMBLY_GIT_TOKEN")
+        .args(["run", "--prompt", "x", "--runner", "docker"])
+        .assert()
+        .code(2)
+        .stderr(contains("`docker` cannot be reached"))
+        .stderr(contains("declares `copy`"))
+        .stderr(contains("$ASSEMBLY_GIT_TOKEN is not set"));
+
+    assert!(!tmp.path().join(".assembly/jobs/1").exists());
     discard_origin(&tmp);
 }

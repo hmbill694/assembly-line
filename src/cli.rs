@@ -35,6 +35,8 @@ pub enum Command {
         /// Overrides the repository's declared provider
         #[arg(long)]
         provider: Option<String>,
+        #[command(flatten)]
+        runner: RunnerArgs,
     },
 
     /// Run a job again, based on its own branch, with feedback
@@ -48,6 +50,8 @@ pub enum Command {
         /// The repository the job belongs to. Defaults to the enclosing one.
         #[arg(long)]
         repo: Option<PathBuf>,
+        #[command(flatten)]
+        runner: RunnerArgs,
     },
 
     /// Show a job's state, timing and diff
@@ -74,4 +78,27 @@ pub enum Command {
     /// Started by a runner, never by hand.
     #[command(name = "job-exec", hide = true)]
     JobExec,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum RunnerKind {
+    /// A child process on this machine, with its toolchain and credentials
+    Local,
+    /// A container, through the `docker` CLI
+    Docker,
+}
+
+/// Where a round runs. Shared by `run` and `revise`: a revise is a new job
+/// cut from the branch, so it may run somewhere the first round did not.
+#[derive(Debug, clap::Args)]
+pub struct RunnerArgs {
+    #[arg(long, value_enum, default_value_t = RunnerKind::Local)]
+    pub runner: RunnerKind,
+    /// The job image. Defaults to the published image at this version.
+    #[arg(long)]
+    pub image: Option<String>,
+    /// Pass this variable from your environment into the job's container.
+    /// Repeatable. `ASSEMBLY_GIT_TOKEN` is always passed.
+    #[arg(long = "pass-env", value_name = "NAME")]
+    pub pass_env: Vec<String>,
 }
