@@ -6,32 +6,14 @@
 //! pushed *before* success is decided, and why a round that cannot push
 //! fails.
 
-use crate::config::{ConfigError, RepoConfig, parse_duration};
 use crate::event::{EventKind, EventLog};
 use crate::exec::{ShellOutcome, run_command, run_shell};
 use crate::git;
-use crate::paths::{JobMeta, JobPaths};
-use crate::provider::{CommandSpec, render_command};
-use crate::workspace::{self, JobWorkspace, job_branch_name};
-use std::path::{Path, PathBuf};
+use crate::payload::JobPayload;
+use crate::workspace::{self, JobWorkspace};
+use std::path::Path;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-
-/// The parts of running a job that come from the machine rather than from the
-/// repository's own configuration.
-#[derive(Debug, Clone)]
-pub struct RunOpts {
-    pub cancel: CancellationToken,
-    /// The repository the checkout is created from.
-    pub repo: PathBuf,
-    /// Where `copy` paths resolve from.
-    pub seed_from: PathBuf,
-    /// The remote the job's branch is published to.
-    pub remote: String,
-    /// Where the scratch clone is made. The system temp directory in real
-    /// runs; a directory the test owns in tests.
-    pub scratch_root: PathBuf,
-}
 
 /// Whether a job's work was accepted. `verify` decides this when the
 /// repository declares one; otherwise the agent's exit code does.
@@ -46,19 +28,6 @@ impl JobOutcome {
     pub fn passed(self) -> bool {
         matches!(self, Self::Passed)
     }
-}
-
-/// One job: which prompt, run by which provider, against which ref.
-#[derive(Debug, Clone, Copy)]
-pub struct JobSpec<'a> {
-    pub prompt: &'a str,
-    pub provider: &'a str,
-    /// Where this round starts: the base for round 1, the job's own branch
-    /// tip for a revise round. Pinned by the caller, which has already read
-    /// config from the same commit.
-    pub start: &'a git::PinnedRef,
-    /// 1 for a first attempt; higher for a revise round.
-    pub round: u32,
 }
 
 /// What an agent left behind, recorded on the job's branch.
@@ -92,126 +61,28 @@ enum RoundResult {
     },
 }
 
-/// Everything a round needs, resolved before the agent is spawned so a config
-/// mistake is reported against the command line rather than surfacing as a
-/// mysteriously failed job.
-#[derive(Debug)]
-struct JobPlan {
-    /// What the scratch clone is cloned from.
-    remote_url: String,
-    /// The commit the round starts from.
-    start: git::PinnedRef,
-    scratch_root: PathBuf,
-    branch: String,
-    seed_from: PathBuf,
-    copy_paths: Vec<String>,
-    command: CommandSpec,
-    commit_message: String,
-    remote: String,
-    /// The command that decides whether the round's work is accepted, or
-    /// `None` for a repository with no `verify` — which accepts on the
-    /// agent's exit code alone.
-    verify: Option<String>,
-}
-
-/// The cap on one command. Both the agent and `verify` get it in full — see
-/// [`RepoConfig::max_duration`].
-fn wall_clock_limit(config: &RepoConfig) -> anyhow::Result<Option<Duration>> {
-    config
-        .max_duration
-        .as_deref()
-        .map(parse_duration)
-        .transpose()
-}
-
-/// A commit subject a human can scan in `git log`: the job, then the first
-/// non-blank line of what it was asked to do.
-fn commit_message(job_id: u64, prompt: &str) -> String {
-    match prompt.lines().find(|line| !line.trim().is_empty()) {
-        Some(first) => format!("job {job_id}: {}", first.trim()),
-        None => format!("job {job_id}: agent work"),
-    }
-}
-
-/// The prompt a revise round carries: what was originally asked, then what to
-/// change about the answer. See [`revise_job`] for why that is enough.
-fn revised_prompt(original: &str, feedback: &str) -> String {
-    format!(
-        "{original}\n\n---\n\nYour previous attempt is already committed in this \
-         working tree. Revise it based on this feedback:\n\n{feedback}\n"
-    )
-}
-
-/// Resolve a job against the repository's configuration.
+/// Run one round of a job end to end: scratch clone, agent, commit, push,
+/// `verify`, discard.
 ///
 /// # Errors
 ///
-/// Returns a [`ConfigError`] when the repository does not declare the
-/// provider the job asked for.
-fn job_plan(
-    config: &RepoConfig,
-    spec: &JobSpec<'_>,
-    paths: &JobPaths,
-    opts: &RunOpts,
-    remote_url: String,
-) -> anyhow::Result<JobPlan> {
-    let provider = config
-        .providers
-        .get(spec.provider)
-        .ok_or_else(|| ConfigError::UnknownProvider(spec.provider.to_string()))?;
-
-    Ok(JobPlan {
-        remote_url,
-        start: spec.start.clone(),
-        scratch_root: opts.scratch_root.clone(),
-        branch: job_branch_name(paths.id),
-        seed_from: opts.seed_from.clone(),
-        copy_paths: config.copy.clone(),
-        command: render_command(provider, spec.prompt),
-        commit_message: commit_message(paths.id, spec.prompt),
-        remote: opts.remote.clone(),
-        verify: config.verify.clone(),
-    })
-}
-
-/// Where the round clones from. A repository without the remote cannot run a
-/// job at all: the job clones from it and pushes its branch back to it.
-///
-/// # Errors
-///
-/// An error saying to add the remote when the repository has none, or git's
-/// own when the remote cannot be listed.
-pub async fn remote_to_clone(repo: &Path, remote: &str) -> anyhow::Result<String> {
-    git::remote_url(repo, remote).await?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "the repository has no '{remote}' remote — a job clones from it and pushes its \
-             branch back to it, so add one"
-        )
-    })
-}
-
-/// Run one job end to end: scratch clone, agent, commit, push, discard.
-///
-/// # Errors
-///
-/// Returns an error only if the job cannot be *administered* — the event log
-/// cannot be appended to, `max_duration` is unparseable, the repository does
-/// not declare the provider, or it has no remote to clone from. An agent that
-/// runs and fails is not an error: that is [`JobOutcome::Failed`].
-pub async fn run_job(
-    config: &RepoConfig,
-    spec: &JobSpec<'_>,
-    paths: &JobPaths,
+/// Returns an error only if the round cannot be *administered* — the event
+/// log cannot be appended to. An agent that fails, a clone that fails, and a
+/// push that fails are all [`JobOutcome::Failed`], recorded in the log.
+pub async fn run_round(
+    payload: &JobPayload,
     log: &mut EventLog,
-    opts: &RunOpts,
+    log_path: &Path,
+    scratch_root: &Path,
+    cancel: CancellationToken,
 ) -> anyhow::Result<JobOutcome> {
-    let timeout = wall_clock_limit(config)?;
-    let remote_url = remote_to_clone(&opts.repo, &opts.remote).await?;
-    let plan = job_plan(config, spec, paths, opts, remote_url)?;
+    let timeout = payload.command_limit_secs.map(Duration::from_secs);
 
-    log.append(EventKind::JobStarted { round: spec.round })?;
+    log.append(EventKind::JobStarted {
+        round: payload.round,
+    })?;
 
-    let result = round_result(&plan, &paths.log(), timeout, opts.cancel.clone())
+    let result = round_result(payload, log_path, scratch_root, timeout, cancel)
         .await
         // The round could not be administered at all — the clone failed, or
         // the push did and took the work with it. Either way there is no
@@ -222,44 +93,6 @@ pub async fn run_job(
         });
 
     record_completion(log, result)
-}
-
-/// One revise round: what to change about the last one, and which round this
-/// is.
-#[derive(Debug, Clone, Copy)]
-pub struct Revision<'a> {
-    pub feedback: &'a str,
-    pub round: u32,
-}
-
-/// Another round on this job's branch, with feedback folded into the prompt.
-///
-/// A revise is a *new job*, not a resumption. Nothing is kept from the last
-/// round except the branch, and that is enough: the agent's prior work
-/// arrives as files on disk, already committed in the tree it is dropped
-/// into. No session replay, no conversation history — which is what makes
-/// revising behave identically across every provider.
-///
-/// # Errors
-///
-/// See [`run_job`].
-pub async fn revise_job(
-    config: &RepoConfig,
-    meta: &JobMeta,
-    revision: &Revision<'_>,
-    start: &git::PinnedRef,
-    paths: &JobPaths,
-    log: &mut EventLog,
-    opts: &RunOpts,
-) -> anyhow::Result<JobOutcome> {
-    let prompt = revised_prompt(&meta.prompt, revision.feedback);
-    let spec = JobSpec {
-        prompt: &prompt,
-        provider: &meta.provider,
-        start,
-        round: revision.round,
-    };
-    run_job(config, &spec, paths, log, opts).await
 }
 
 /// What a round settled to, in the order it settled: the agent's work
@@ -294,32 +127,49 @@ impl RoundSettlement {
 /// an unrecorded change would be a lost change, and a failure that produced a
 /// diff is exactly the case where the diff is worth reading.
 async fn round_result(
-    plan: &JobPlan,
+    payload: &JobPayload,
     log_path: &Path,
+    scratch_root: &Path,
     timeout: Option<Duration>,
     cancel: CancellationToken,
 ) -> anyhow::Result<RoundResult> {
     let ws = workspace::create(
-        &plan.remote_url,
-        &plan.start,
-        &plan.branch,
-        &plan.seed_from,
-        &plan.copy_paths,
-        &plan.scratch_root,
+        &payload.remote_url,
+        &payload.start,
+        &payload.branch,
+        &payload.seed_from,
+        &payload.copy,
+        scratch_root,
     )
     .await?;
 
     // Taken once, up front: it decides both whether `verify` is worth running
     // and how the round ends, and an agent failure wins over either answer.
     let agent_failure = agent_failure_reason(
-        run_command(&plan.command, ws.path(), log_path, timeout, cancel.clone()).await,
+        run_command(
+            &payload.command,
+            ws.path(),
+            log_path,
+            timeout,
+            cancel.clone(),
+        )
+        .await,
     );
 
     // Bound before the literal: both borrow `ws`, which `discard` consumes.
-    let preserved = agent_work_on_branch(plan, &ws).await;
+    let preserved = agent_work_on_branch(payload, &ws).await;
     let verdict = match agent_failure {
         Some(_) => Ok(VerifyVerdict::NoObjection),
-        None => verify_verdict(plan.verify.as_deref(), ws.path(), log_path, timeout, cancel).await,
+        None => {
+            verify_verdict(
+                payload.verify.as_deref(),
+                ws.path(),
+                log_path,
+                timeout,
+                cancel,
+            )
+            .await
+        }
     };
     let settled = RoundSettlement {
         preserved,
@@ -402,20 +252,20 @@ fn agent_failure_reason(outcome: anyhow::Result<ShellOutcome>) -> Option<String>
 }
 
 async fn agent_work_on_branch(
-    plan: &JobPlan,
+    payload: &JobPayload,
     ws: &JobWorkspace,
 ) -> anyhow::Result<Option<AgentWork>> {
-    let Some(sha) = workspace::commit(ws, &plan.commit_message).await? else {
+    let Some(sha) = workspace::commit(ws, &payload.commit_message).await? else {
         return Ok(None);
     };
-    let stat = git::diff_stat_against(ws.path(), &plan.start.sha).await?;
+    let stat = git::diff_stat_against(ws.path(), &payload.start.sha).await?;
     workspace::publish(ws).await?;
 
     Ok(Some(AgentWork {
         branch: ws.branch.clone(),
         sha,
         stat,
-        pushed_to: plan.remote.clone(),
+        pushed_to: payload.remote_name.clone(),
     }))
 }
 

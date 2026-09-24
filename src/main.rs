@@ -1,10 +1,9 @@
 use assembly_line::cli::{Cli, Command};
 use assembly_line::config::RepoConfig;
 use assembly_line::event::{Event, EventKind, EventLog};
-use assembly_line::job::{
-    JobOutcome, JobSpec, Revision, RunOpts, remote_to_clone, revise_job, run_job,
-};
+use assembly_line::job::{JobOutcome, run_round};
 use assembly_line::paths::{JobMeta, JobPaths};
+use assembly_line::payload::{self, JobPayload, RoundRequest};
 use assembly_line::report::JobReport;
 use assembly_line::workspace::{DEFAULT_REMOTE, job_branch_name};
 use assembly_line::{config, delivery, git, paths};
@@ -90,13 +89,17 @@ fn repository_named_or_enclosing(repo: Option<PathBuf>) -> Result<PathBuf, Strin
     }
 }
 
-fn cancel_on_ctrl_c(cancel: CancellationToken) {
+/// A token that Ctrl-C cancels, for the round about to run.
+fn cancel_on_ctrl_c() -> CancellationToken {
+    let cancel = CancellationToken::new();
+    let on_interrupt = cancel.clone();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
             eprintln!("\ninterrupted — cancelling the running agent");
-            cancel.cancel();
+            on_interrupt.cancel();
         }
     });
+    cancel
 }
 
 fn prompt_text(prompt: Option<String>, prompt_file: Option<PathBuf>) -> Result<String, String> {
@@ -163,21 +166,6 @@ fn runnable_config_and_provider(
     }
 }
 
-fn machine_opts(repo: &Path) -> RunOpts {
-    let cancel = CancellationToken::new();
-    cancel_on_ctrl_c(cancel.clone());
-
-    RunOpts {
-        cancel,
-        repo: repo.to_path_buf(),
-        // `copy` is declared by the repository, so its paths resolve against
-        // the repository — not against wherever the user happened to stand.
-        seed_from: repo.to_path_buf(),
-        remote: DEFAULT_REMOTE.to_string(),
-        scratch_root: std::env::temp_dir(),
-    }
-}
-
 async fn start_new_job(
     prompt: Option<String>,
     prompt_file: Option<PathBuf>,
@@ -189,6 +177,7 @@ async fn start_new_job(
         repo,
         base_ref,
         start,
+        remote_url,
         prompt,
         provider,
         config,
@@ -202,17 +191,44 @@ async fn start_new_job(
     };
     let (paths, mut log) = allocate_job(&meta)?;
 
-    let spec = JobSpec {
-        prompt: &prompt,
-        provider: &provider,
-        start: &start,
-        round: 1,
-    };
-    let outcome = run_job(&config, &spec, &paths, &mut log, &machine_opts(&repo))
-        .await
-        .map_err(|e| e.to_string())?;
+    let payload = JobPayload::for_round(
+        &config,
+        RoundRequest {
+            job_id: paths.id,
+            round: 1,
+            prompt: &prompt,
+            provider: &provider,
+            start,
+            remote_name: DEFAULT_REMOTE,
+            remote_url,
+            // `copy` is declared by the repository, so its paths resolve
+            // against the repository — not against wherever the user stands.
+            seed_from: &repo,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    let outcome = run_round(
+        &payload,
+        &mut log,
+        &paths.log(),
+        &std::env::temp_dir(),
+        cancel_on_ctrl_c(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
-    let code = finish_job(&repo, &config, &base_ref, &paths, outcome).await;
+    let code = finish_job(
+        &repo,
+        &config,
+        &base_ref,
+        &paths,
+        outcome,
+        delivery::PullRequestText {
+            title: &payload.commit_message,
+            body: &prompt,
+        },
+    )
+    .await;
     println!("state: {}", paths.dir.display());
     Ok(code)
 }
@@ -243,9 +259,18 @@ async fn finish_job(
     base_ref: &str,
     paths: &JobPaths,
     outcome: JobOutcome,
+    pull_request: delivery::PullRequestText<'_>,
 ) -> ExitCode {
     let branch = report_and_branch(paths);
-    deliver_if_verified(repo, config, base_ref, branch.as_deref(), outcome).await;
+    deliver_if_verified(
+        repo,
+        config,
+        base_ref,
+        branch.as_deref(),
+        outcome,
+        pull_request,
+    )
+    .await;
     exit_code_for(outcome)
 }
 
@@ -261,6 +286,8 @@ struct PreparedJob {
     /// `base_ref` as the remote has it — what the config was read from and
     /// what the job starts from.
     start: git::PinnedRef,
+    /// Where the job clones from and pushes to — `DEFAULT_REMOTE`'s URL.
+    remote_url: String,
     prompt: String,
     provider: String,
     config: RepoConfig,
@@ -280,7 +307,9 @@ async fn prepare_job(
         None => default_base_ref(&repo).await?,
     };
 
-    remote_to_clone(&repo, DEFAULT_REMOTE)
+    // Before pinning, so a missing remote is reported as missing rather than
+    // as a ref that is not on it.
+    let remote_url = payload::remote_to_clone(&repo, DEFAULT_REMOTE)
         .await
         .map_err(|e| e.to_string())?;
     let start = git::pinned(&repo, DEFAULT_REMOTE, &base_ref)
@@ -297,6 +326,7 @@ async fn prepare_job(
         repo,
         base_ref,
         start,
+        remote_url,
         prompt,
         provider,
         config,
@@ -334,6 +364,7 @@ async fn deliver_if_verified(
     base_ref: &str,
     branch: Option<&str>,
     outcome: JobOutcome,
+    pull_request: delivery::PullRequestText<'_>,
 ) {
     let Some(branch) = branch else {
         return;
@@ -356,7 +387,7 @@ async fn deliver_if_verified(
 
     println!(
         "{}",
-        delivery::deliver(repo, &config.delivery, branch, base).await
+        delivery::deliver(repo, &config.delivery, branch, base, pull_request).await
     );
 }
 
@@ -436,7 +467,7 @@ async fn revise_existing_job(
     let (paths, meta) = locate_job(Some(job_id), repo)?;
     let events = events_of(&paths)?;
 
-    remote_to_clone(&meta.repo, DEFAULT_REMOTE)
+    let remote_url = payload::remote_to_clone(&meta.repo, DEFAULT_REMOTE)
         .await
         .map_err(|e| e.to_string())?;
     let base = git::pinned(&meta.repo, DEFAULT_REMOTE, &meta.base_ref)
@@ -456,23 +487,42 @@ async fn revise_existing_job(
     let round = rounds_so_far(&events) + 1;
     println!("revising job {job_id} (round {round})");
 
-    let revision = Revision {
-        feedback: &feedback,
-        round,
-    };
-    let outcome = revise_job(
+    let payload = JobPayload::for_round(
         &config,
-        &meta,
-        &revision,
-        &tip,
-        &paths,
+        RoundRequest {
+            job_id,
+            round,
+            prompt: &payload::revised_prompt(&meta.prompt, &feedback),
+            provider: &meta.provider,
+            start: tip,
+            remote_name: DEFAULT_REMOTE,
+            remote_url,
+            seed_from: &meta.repo,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    let outcome = run_round(
+        &payload,
         &mut log,
-        &machine_opts(&meta.repo),
+        &paths.log(),
+        &std::env::temp_dir(),
+        cancel_on_ctrl_c(),
     )
     .await
     .map_err(|e| e.to_string())?;
 
-    Ok(finish_job(&meta.repo, &config, &meta.base_ref, &paths, outcome).await)
+    Ok(finish_job(
+        &meta.repo,
+        &config,
+        &meta.base_ref,
+        &paths,
+        outcome,
+        delivery::PullRequestText {
+            title: &payload.commit_message,
+            body: &meta.prompt,
+        },
+    )
+    .await)
 }
 
 fn print_job_log(job_id: u64, follow: bool, repo: Option<PathBuf>) -> ExitCode {

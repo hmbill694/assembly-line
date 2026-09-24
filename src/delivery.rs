@@ -32,6 +32,17 @@ impl std::fmt::Display for Delivered {
     }
 }
 
+/// What a pull request says about itself.
+///
+/// Given explicitly rather than left to `gh pr create --fill`, which reads
+/// the branch's commits from the local repository — and a job's branch
+/// exists only on the remote.
+#[derive(Debug, Clone, Copy)]
+pub struct PullRequestText<'a> {
+    pub title: &'a str,
+    pub body: &'a str,
+}
+
 /// Ask for a pull request from `job_branch` into `base`. The job already
 /// pushed the branch, so nothing here can lose work.
 pub async fn deliver(
@@ -39,18 +50,25 @@ pub async fn deliver(
     delivery: &Delivery,
     job_branch: &str,
     base: &str,
+    text: PullRequestText<'_>,
 ) -> Delivered {
     match delivery.mode {
         DeliveryMode::None => Delivered::Skipped("delivery mode is \"none\"".into()),
-        DeliveryMode::Pr => open_pull_request(repo.as_ref(), job_branch, base).await,
+        DeliveryMode::Pr => open_pull_request(repo.as_ref(), job_branch, base, text).await,
     }
 }
 
 /// Ask `gh` for a pull request. Never fatal — the branch is already pushed.
-async fn open_pull_request(repo: &Path, job_branch: &str, base: &str) -> Delivered {
+async fn open_pull_request(
+    repo: &Path,
+    job_branch: &str,
+    base: &str,
+    text: PullRequestText<'_>,
+) -> Delivered {
     let attempt = Command::new("gh")
         .args([
-            "pr", "create", "--base", base, "--head", job_branch, "--fill",
+            "pr", "create", "--base", base, "--head", job_branch, "--title", text.title, "--body",
+            text.body,
         ])
         .current_dir(repo)
         .output()

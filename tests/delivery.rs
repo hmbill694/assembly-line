@@ -1,5 +1,5 @@
 use assembly_line::config::{Delivery, DeliveryMode, RepoConfig};
-use assembly_line::delivery::{Delivered, deliver};
+use assembly_line::delivery::{Delivered, PullRequestText, deliver};
 use assembly_line::git::{self, commit_all};
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
@@ -31,7 +31,17 @@ fn mode(mode: DeliveryMode) -> Delivery {
 #[tokio::test]
 async fn delivery_is_skipped_when_it_is_turned_off() {
     let fx = Fixture::new().await;
-    let outcome = deliver(&fx.repo, &mode(DeliveryMode::None), "al/job-1", "main").await;
+    let outcome = deliver(
+        &fx.repo,
+        &mode(DeliveryMode::None),
+        "al/job-1",
+        "main",
+        PullRequestText {
+            title: "job 1: x",
+            body: "x",
+        },
+    )
+    .await;
     assert!(matches!(outcome, Delivered::Skipped(_)), "{outcome:?}");
 }
 
@@ -235,6 +245,35 @@ async fn configured_base_reaches_the_pull_request_and_the_divergence_is_reported
         invocation.contains("--head al/job-1"),
         "gh was not asked to deliver the job's own branch: {invocation}"
     );
+
+    discard_origin(&tmp);
+}
+
+/// `gh pr create --fill` works out a title from the branch's commits in the
+/// local repository, which never has a job's branch — so the pull request is
+/// told what the job was asked to do instead.
+#[tokio::test]
+async fn a_pull_request_is_titled_and_described_from_the_job_not_from_local_commits() {
+    let tmp = repo_running("fake-agent.sh", "true").await;
+    let (fake_bin, gh_capture) = fake_gh_capturing_args(&tmp);
+    let path_with_fake_gh = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    assembly(&tmp)
+        .env("PATH", path_with_fake_gh)
+        .args(["run", "--prompt", "write a file"])
+        .assert()
+        .success();
+
+    let invocation = std::fs::read_to_string(&gh_capture).unwrap();
+    assert!(
+        invocation.contains("--title job 1: write a file --body write a file"),
+        "{invocation}"
+    );
+    assert!(!invocation.contains("--fill"), "{invocation}");
 
     discard_origin(&tmp);
 }

@@ -8,8 +8,9 @@
 use assembly_line::config::RepoConfig;
 use assembly_line::event::{EventKind, EventLog};
 use assembly_line::git::{self, commit_all};
-use assembly_line::job::{JobSpec, RunOpts, run_job};
+use assembly_line::job::run_round;
 use assembly_line::paths::{self, JobPaths};
+use assembly_line::payload::{self, JobPayload, RoundRequest};
 use assembly_line::state::JobState;
 use assembly_line::workspace;
 use std::path::{Path, PathBuf};
@@ -189,14 +190,11 @@ impl Harness {
         self.round_from(&start, prompt, provider, round).await
     }
 
-    /// A first round from a start the test has already pinned — for a test
-    /// that needs to change the repository between pinning and running.
-    pub async fn run_from(&self, start: &git::PinnedRef, prompt: &str) -> anyhow::Result<Outcome> {
-        self.round_from(start, prompt, None, 1).await
-    }
-
-    /// Everything a round does once its start is pinned. [`Self::attempt_round`]
-    /// and [`Self::run_from`] both come through here, so the two cannot drift.
+    /// Everything a round does once its start is pinned: resolve a payload
+    /// the way `main.rs` does, then run it.
+    ///
+    /// An undeclared provider or an unparseable `max_duration` is refused by
+    /// [`JobPayload::for_round`], and propagates as the error.
     async fn round_from(
         &self,
         start: &git::PinnedRef,
@@ -212,21 +210,28 @@ impl Harness {
         let paths = self.job_paths();
         let mut log = EventLog::open_append(paths.events()).unwrap();
 
-        let opts = RunOpts {
-            cancel: CancellationToken::new(),
-            repo: self.repo.clone(),
-            seed_from: self.repo.clone(),
-            remote: workspace::DEFAULT_REMOTE.to_string(),
-            scratch_root: self.scratch_root(),
-        };
-        let spec = JobSpec {
-            prompt,
-            provider: &provider,
-            start,
-            round,
-        };
+        let payload = JobPayload::for_round(
+            &config,
+            RoundRequest {
+                job_id: paths.id,
+                round,
+                prompt,
+                provider: &provider,
+                start: start.clone(),
+                remote_name: workspace::DEFAULT_REMOTE,
+                remote_url: payload::remote_to_clone(&self.repo, workspace::DEFAULT_REMOTE).await?,
+                seed_from: &self.repo,
+            },
+        )?;
 
-        let outcome = run_job(&config, &spec, &paths, &mut log, &opts).await?;
+        let outcome = run_round(
+            &payload,
+            &mut log,
+            &paths.log(),
+            &self.scratch_root(),
+            CancellationToken::new(),
+        )
+        .await?;
         let events = EventLog::read(paths.events()).unwrap();
 
         Ok(Outcome {

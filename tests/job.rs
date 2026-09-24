@@ -1,6 +1,7 @@
 use assembly_line::config::REPO_CONFIG_PATH;
 use assembly_line::event::EventKind;
 use assembly_line::git::{self, commit_all, head_sha};
+use assembly_line::payload;
 use assembly_line::state::JobState;
 use assembly_line::workspace::job_branch_name;
 use support::{Harness, config_running, provider_block};
@@ -247,14 +248,14 @@ async fn a_refused_push_fails_the_job_and_says_the_work_is_lost() {
 #[tokio::test]
 async fn a_repository_with_no_remote_has_nothing_to_clone() {
     let h = Harness::new().await;
-    // Pin while the remote exists: pinning needs it too, and this test is
-    // about the round's own check.
-    let start = git::pinned(&h.repo, "origin", "main").await.unwrap();
     git::run_allowing_failure(&h.repo, &["remote", "remove", "origin"])
         .await
         .unwrap();
 
-    let err = h.run_from(&start, "x").await.unwrap_err().to_string();
+    let err = payload::remote_to_clone(&h.repo, "origin")
+        .await
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("no 'origin' remote"), "{err}");
 }
 

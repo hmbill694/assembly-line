@@ -9,6 +9,7 @@ pub mod frame;
 pub mod git;
 pub mod job;
 pub mod paths;
+pub mod payload;
 pub mod provider;
 pub mod report;
 pub mod state;
