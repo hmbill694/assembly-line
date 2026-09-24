@@ -588,3 +588,33 @@ async fn docker_preflight_reports_every_problem_before_allocating() {
     assert!(!tmp.path().join(".assembly/jobs/1").exists());
     discard_origin(&tmp);
 }
+
+#[tokio::test]
+async fn the_k8s_runner_requires_a_namespace() {
+    let tmp = repo_running("fake-agent.sh").await;
+    assembly(&tmp)
+        .args(["run", "--prompt", "x", "--runner", "k8s"])
+        .assert()
+        .code(2)
+        .stderr(contains("--namespace"));
+    discard_origin(&tmp);
+}
+
+#[tokio::test]
+async fn a_namespace_is_refused_for_runners_that_have_none() {
+    let tmp = repo_running("fake-agent.sh").await;
+    assembly(&tmp)
+        .args([
+            "run",
+            "--prompt",
+            "x",
+            "--runner",
+            "docker",
+            "--namespace",
+            "factory",
+        ])
+        .assert()
+        .code(2)
+        .stderr(contains("k8s runner"));
+    discard_origin(&tmp);
+}

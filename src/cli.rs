@@ -86,6 +86,9 @@ pub enum RunnerKind {
     Local,
     /// A container, through the `docker` CLI
     Docker,
+    /// A k8s Job, through the `kubectl` CLI
+    #[value(name = "k8s")]
+    K8s,
 }
 
 /// Where a round runs. Shared by `run` and `revise`: a revise is a new job
@@ -101,4 +104,10 @@ pub struct RunnerArgs {
     /// Repeatable. `ASSEMBLY_GIT_TOKEN` is always passed.
     #[arg(long = "pass-env", value_name = "NAME")]
     pub pass_env: Vec<String>,
+    /// Where k8s Jobs and their Secrets are created. Required for k8s.
+    #[arg(long, required_if_eq("runner", "k8s"))]
+    pub namespace: Option<String>,
+    /// The kubectl context. Defaults to kubectl's current one.
+    #[arg(long)]
+    pub context: Option<String>,
 }

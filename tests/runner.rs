@@ -98,6 +98,11 @@ fn every_runner_problem_says_what_to_do_about_it() {
             runner: "docker",
             detail: "no daemon".into(),
         },
+        RunnerProblem::NotPermitted {
+            verb: "create".into(),
+            resource: "jobs".into(),
+            namespace: "factory".into(),
+        },
         RunnerProblem::CopyNeedsLocalRunner,
         RunnerProblem::MissingEnvironment("X".into()),
     ];

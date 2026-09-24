@@ -2,6 +2,7 @@
 
 pub mod child;
 pub mod docker;
+pub mod kubernetes;
 pub mod local;
 
 use crate::payload::{GIT_TOKEN_VAR, JobPayload};
@@ -89,6 +90,11 @@ pub enum RunnerProblem {
         runner: &'static str,
         detail: String,
     },
+    NotPermitted {
+        verb: String,
+        resource: String,
+        namespace: String,
+    },
     CopyNeedsLocalRunner,
     MissingEnvironment(String),
 }
@@ -99,6 +105,15 @@ impl std::fmt::Display for RunnerProblem {
             Self::Unreachable { runner, detail } => write!(
                 f,
                 "`{runner}` cannot be reached — install it or check its context: {detail}"
+            ),
+            Self::NotPermitted {
+                verb,
+                resource,
+                namespace,
+            } => write!(
+                f,
+                "cannot {verb} {resource} in namespace '{namespace}' — grant the permission, \
+                 or pass a --namespace where you have it"
             ),
             Self::CopyNeedsLocalRunner => write!(
                 f,

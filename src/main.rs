@@ -8,6 +8,7 @@ use assembly_line::paths::{JobMeta, JobPaths};
 use assembly_line::payload::{self, JobPayload, PAYLOAD_VAR, RoundRequest};
 use assembly_line::report::JobReport;
 use assembly_line::runner::docker::DockerRunner;
+use assembly_line::runner::kubernetes::KubernetesRunner;
 use assembly_line::runner::local::LocalRunner;
 use assembly_line::runner::{
     self, JobSecrets, Runner, RunnerProblem, reasons_a_container_cannot_run,
@@ -145,6 +146,11 @@ enum Work {
 /// generic over [`Runner`].
 async fn run_work_on_chosen_runner(args: RunnerArgs, work: Work) -> Result<ExitCode, String> {
     match args.runner {
+        RunnerKind::Local | RunnerKind::Docker
+            if args.namespace.is_some() || args.context.is_some() =>
+        {
+            Err("--namespace and --context apply to the k8s runner".into())
+        }
         RunnerKind::Local if args.image.is_some() || !args.pass_env.is_empty() => Err(
             "--image and --pass-env apply to container runners; the local runner uses your \
              machine as it is"
@@ -161,6 +167,18 @@ async fn run_work_on_chosen_runner(args: RunnerArgs, work: Work) -> Result<ExitC
         RunnerKind::Docker => {
             let image = args.image.unwrap_or_else(runner::published_image);
             run_work(&DockerRunner::new(image), &args.pass_env, work).await
+        }
+        RunnerKind::K8s => {
+            let image = args.image.unwrap_or_else(runner::published_image);
+            // clap has already required a namespace for k8s, so the default
+            // is never taken.
+            let namespace = args.namespace.unwrap_or_default();
+            run_work(
+                &KubernetesRunner::new(image, namespace, args.context),
+                &args.pass_env,
+                work,
+            )
+            .await
         }
     }
 }
