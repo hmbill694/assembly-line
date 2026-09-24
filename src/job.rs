@@ -11,11 +11,21 @@ use crate::exec::{ShellOutcome, run_command, run_shell};
 use crate::frame::FrameWriter;
 use crate::git;
 use crate::payload::{GIT_TOKEN_VAR, JobPayload};
+use crate::provider::CommandSpec;
 use crate::workspace::{self, JobWorkspace};
 use std::io::Write;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+
+/// How long cloning and provisioning may take together. Not `max_duration`:
+/// that is the repository's statement about its own commands, and a cold
+/// toolchain install should not eat the agent's budget.
+const PROVISIONING_LIMIT: Duration = Duration::from_mins(15);
+
+/// `mise trust` first: `mise` refuses to act on a `mise.toml` in a directory
+/// it has not been told to trust, and a fresh clone is exactly that.
+const PROVISIONING_STEPS: [&[&str]; 2] = [&["trust", "--all", "--yes"], &["install", "--yes"]];
 
 /// Whether a job's work was accepted. `verify` decides this when the
 /// repository declares one; otherwise the agent's exit code does.
@@ -109,19 +119,45 @@ async fn round_result<W: Write + Send + 'static>(
     timeout: Option<Duration>,
     cancel: CancellationToken,
 ) -> anyhow::Result<RoundResult> {
-    let ws = workspace::create(
-        &payload.remote_url,
-        &payload.start,
-        &payload.branch,
-        &payload.seed_from,
-        &payload.copy,
-        scratch_root,
-        // A container runner always sends the token, having no other
-        // credentials to offer; without one, git uses whatever this
-        // environment already has.
-        std::env::var_os(GIT_TOKEN_VAR)
-            .is_some()
-            .then_some(git::TOKEN_CREDENTIAL_HELPER),
+    // Set before the clone, so a slow clone leaves less of the shared budget
+    // for provisioning rather than a fresh 15 minutes of its own.
+    let provisioning_deadline = Instant::now() + PROVISIONING_LIMIT;
+    // Unlike `mise` below, the clone may be dropped from outside — timed out
+    // or cancelled — because dropping `git` kills its whole process group
+    // (`git::run_allowing_failure`).
+    let cloning = tokio::time::timeout(
+        PROVISIONING_LIMIT,
+        workspace::create(
+            &payload.remote_url,
+            &payload.start,
+            &payload.branch,
+            &payload.seed_from,
+            &payload.copy,
+            scratch_root,
+            // A container runner always sends the token, having no other
+            // credentials to offer; without one, git uses whatever this
+            // environment already has.
+            std::env::var_os(GIT_TOKEN_VAR)
+                .is_some()
+                .then_some(git::TOKEN_CREDENTIAL_HELPER),
+        ),
+    );
+    let ws = tokio::select! {
+        cloned = cloning => cloned.map_err(|_| {
+            anyhow::anyhow!(
+                "provisioning timed out after {}",
+                humantime::format_duration(PROVISIONING_LIMIT)
+            )
+        })??,
+        () = cancel.cancelled() => anyhow::bail!("cancelled"),
+    };
+
+    provision_toolchain(
+        payload,
+        ws.path(),
+        frames,
+        provisioning_deadline,
+        cancel.clone(),
     )
     .await?;
 
@@ -166,6 +202,53 @@ async fn round_result<W: Write + Send + 'static>(
             Some(work) => RoundResult::Committed { work },
         },
     })
+}
+
+/// Install the repository's toolchain in `cwd`, when the payload asks.
+///
+/// Each step's `run_command` timeout is what remains of `deadline` — the
+/// clone and provisioning's shared budget, fixed once before the clone — so
+/// a step that runs out of time expires through `exec::supervise`'s own
+/// `TimedOut` path, which kills its whole process group. Not an outer
+/// `tokio::time::timeout`: that would drop `run_command` from outside, and
+/// `kill_on_drop` signals `mise`'s own pid, orphaning anything it spawned. A
+/// step started with no budget left fails immediately as timed out without
+/// being run at all.
+async fn provision_toolchain<W: Write + Send + 'static>(
+    payload: &JobPayload,
+    cwd: &Path,
+    frames: &FrameWriter<W>,
+    deadline: Instant,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    if !payload.provision_toolchain {
+        return Ok(());
+    }
+    // A loop: each step is sequential I/O, and a failure ends it.
+    for args in PROVISIONING_STEPS {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let spec = CommandSpec {
+            program: "mise".into(),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+        };
+        let outcome = if remaining.is_zero() {
+            ShellOutcome::TimedOut
+        } else {
+            run_command(&spec, cwd, frames, Some(remaining), cancel.clone()).await?
+        };
+        match (outcome, outcome.failure_reason()) {
+            (_, None) => {}
+            (ShellOutcome::TimedOut, Some(_)) => anyhow::bail!(
+                "provisioning timed out after {}",
+                humantime::format_duration(PROVISIONING_LIMIT)
+            ),
+            (_, Some(reason)) => anyhow::bail!(
+                "provisioning the toolchain failed: `mise {}` {reason}",
+                args.join(" ")
+            ),
+        }
+    }
+    Ok(())
 }
 
 /// What `verify` had to say about the tree the branch carries.
@@ -318,5 +401,73 @@ fn events_for_completion(result: RoundResult) -> (Vec<EventKind>, JobOutcome) {
                 .collect(),
             JobOutcome::Passed,
         ),
+    }
+}
+
+#[cfg(test)]
+mod provisioning_tests {
+    //! `provision_toolchain` is private, and the deadline it takes
+    //! cannot be exercised through the public `job-exec` surface without
+    //! either waiting out the real 15-minute `PROVISIONING_LIMIT` or making
+    //! it configurable — both ruled out. This calls the internal function
+    //! directly instead, which needs no subprocess: a deadline that has
+    //! already passed must fail the very first step without ever running
+    //! `mise`, so no fake binary or `PATH` juggling is needed either.
+
+    use super::*;
+    use crate::git::PinnedRef;
+    use std::path::PathBuf;
+
+    fn payload_asking_for_provisioning() -> JobPayload {
+        JobPayload {
+            job_id: 1,
+            round: 1,
+            remote_url: "does-not-matter".to_string(),
+            remote_name: "origin".to_string(),
+            start: PinnedRef {
+                name: "main".to_string(),
+                sha: "0".repeat(40),
+            },
+            branch: "al/job-1".to_string(),
+            command: CommandSpec {
+                program: "true".to_string(),
+                args: Vec::new(),
+            },
+            commit_message: "job 1".to_string(),
+            verify: None,
+            command_limit_secs: None,
+            copy: Vec::new(),
+            seed_from: PathBuf::from("."),
+            provision_toolchain: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deadline_already_passed_fails_the_next_step_without_running_it() {
+        let payload = payload_asking_for_provisioning();
+        let frames = FrameWriter::new(Vec::new());
+        // In the past, so `saturating_duration_since` has already floored
+        // at zero by the time the first step checks it.
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("the process has been up for over a second");
+
+        let result = provision_toolchain(
+            &payload,
+            Path::new("/nonexistent-provisioning-test-cwd"),
+            &frames,
+            deadline,
+            CancellationToken::new(),
+        )
+        .await;
+
+        let error = result.expect_err(
+            "a step given no remaining budget must fail as timed out, not run `mise` \
+             against a `cwd` that does not even exist",
+        );
+        assert!(
+            error.to_string().contains("provisioning timed out"),
+            "{error}"
+        );
     }
 }

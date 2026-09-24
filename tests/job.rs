@@ -482,3 +482,48 @@ async fn a_revise_round_continues_the_branch_instead_of_starting_over() {
         "round 2 never saw the feedback: {body}"
     );
 }
+
+/// `git` leads a session of its own, so no terminal signal reaches a clone
+/// in progress: only the round's cancel can stop it. SIGTERM is what the
+/// local runner sends `job-exec` on Ctrl-C.
+#[tokio::test]
+async fn cancelling_a_round_stops_a_clone_in_progress() {
+    let h = Harness::new().await;
+    let fakes = h.scratch_root().with_file_name("fakes");
+    support::fake_cli(&fakes, "git-remote-hang", "sleep 60\n");
+    let payload = payload::JobPayload {
+        remote_url: "hang::nowhere".into(),
+        ..h.payload_for("x").await
+    };
+
+    let started = std::time::Instant::now();
+    let job_exec = std::process::Command::new(assert_cmd::cargo::cargo_bin("assembly"))
+        .arg("job-exec")
+        .env(
+            payload::PAYLOAD_VAR,
+            serde_json::to_string(&payload).unwrap(),
+        )
+        .env(
+            "PATH",
+            format!("{}:{}", fakes.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("TMPDIR", h.scratch_root())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(job_exec.id()).unwrap()),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    let output = job_exec.wait_with_output().unwrap();
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "the clone ran on past its cancel: {:?}",
+        started.elapsed()
+    );
+    let frames = String::from_utf8_lossy(&output.stdout);
+    assert!(frames.contains("\"reason\":\"cancelled\""), "{frames}");
+}

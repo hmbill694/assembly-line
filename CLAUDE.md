@@ -226,7 +226,10 @@ Where a type owns a sink or source, make it generic with a sensible default
 
 ## Testing
 
-- Integration tests in `tests/`, one file per module concern.
+- Integration tests in `tests/`, one file per module concern. The one
+  exception: a `#[cfg(test)]` unit test in `src/` is acceptable only where
+  the behaviour is unreachable through the public API in reasonable time —
+  today that is `src/job.rs`'s provisioning deadline.
 - Test through the public API. `JobState::replay` and `JobReport::from_events`
   are both pure folds over an event stream, so most behavior can be asserted
   by feeding them events, with no processes involved (`src/state.rs`,

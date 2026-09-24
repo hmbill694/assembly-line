@@ -606,3 +606,40 @@ async fn the_token_helper_replaces_every_helper_the_machine_configures() {
         std::fs::read_to_string(&consulted).unwrap_or_default()
     );
 }
+
+/// A clone that is given up on — dropped by a timeout around it — takes the
+/// `ssh` it started with it, rather than leaving it running.
+#[tokio::test]
+async fn a_git_given_up_on_takes_what_it_started_with_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A stand-in `ssh` that hangs, named uniquely enough to look for.
+    let hang = format!("sleep 9{}", std::process::id());
+    let ssh_command = format!("core.sshCommand={hang} #");
+
+    let gave_up = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        git::run_allowing_failure(
+            tmp.path(),
+            &[
+                "-c",
+                &ssh_command,
+                "clone",
+                "ssh://example.invalid/r.git",
+                ".",
+            ],
+        ),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    assert!(gave_up.is_err(), "the stand-in ssh did not hang");
+    let still_running = std::process::Command::new("pgrep")
+        .args(["-f", &hang])
+        .output()
+        .unwrap();
+    assert!(
+        !still_running.status.success(),
+        "the ssh outlived its git: {}",
+        String::from_utf8_lossy(&still_running.stdout)
+    );
+}

@@ -51,26 +51,59 @@ impl GitOutput {
 }
 
 /// Run `git` in `dir`, leaving the caller to judge the result.
+///
+/// `git` leads a process group of its own, detached from any terminal so a
+/// credential or host-key prompt fails rather than waits forever (see
+/// `exec::detach_from_terminal`). One dropped before it finishes —
+/// a clone whose caller gave up waiting — is killed with that whole group,
+/// so an `ssh` or remote helper it started does not outlive it.
 pub async fn run_allowing_failure(
     dir: impl AsRef<Path>,
     args: &[&str],
 ) -> anyhow::Result<GitOutput> {
-    let output = Command::new("git")
+    let failed = |e: std::io::Error| anyhow::anyhow!("running `git {}`: {e}", args.join(" "));
+    let child = crate::exec::detach_from_terminal(&mut Command::new("git"))
         .args(args)
         // Machine-readable formats (`--porcelain`, `--numstat`) are stable, but
         // pinning the locale keeps any incidental output predictable too.
         .env("LC_ALL", "C")
         .current_dir(dir.as_ref())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("running `git {}`: {e}", args.join(" ")))?;
+        .spawn()
+        .map_err(failed)?;
+    let group = GroupKilledOnDrop(child.id().and_then(|id| i32::try_from(id).ok()));
+    let output = child.wait_with_output().await.map_err(failed)?;
+    group.disarm();
 
     Ok(GitOutput {
         exit_code: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
+}
+
+/// A process group killed when this is dropped, unless disarmed first.
+struct GroupKilledOnDrop(Option<i32>);
+
+impl GroupKilledOnDrop {
+    /// The leader finished on its own; nothing is left to kill.
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupKilledOnDrop {
+    fn drop(&mut self) {
+        if let Some(group) = self.0 {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(group),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
 }
 
 async fn run_expecting_success(
