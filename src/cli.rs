@@ -69,4 +69,9 @@ pub enum Command {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
+
+    /// Run the round in `ASSEMBLY_JOB` and report it as frames on stdout.
+    /// Started by a runner, never by hand.
+    #[command(name = "job-exec", hide = true)]
+    JobExec,
 }

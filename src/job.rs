@@ -6,11 +6,13 @@
 //! pushed *before* success is decided, and why a round that cannot push
 //! fails.
 
-use crate::event::{EventKind, EventLog};
+use crate::event::EventKind;
 use crate::exec::{ShellOutcome, run_command, run_shell};
+use crate::frame::FrameWriter;
 use crate::git;
 use crate::payload::JobPayload;
 use crate::workspace::{self, JobWorkspace};
+use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -66,59 +68,33 @@ enum RoundResult {
 ///
 /// # Errors
 ///
-/// Returns an error only if the round cannot be *administered* — the event
-/// log cannot be appended to. An agent that fails, a clone that fails, and a
-/// push that fails are all [`JobOutcome::Failed`], recorded in the log.
-pub async fn run_round(
+/// Returns an error only if the round cannot be *administered* — its frames
+/// cannot be written. An agent that fails, a clone that fails, and a push
+/// that fails are all [`JobOutcome::Failed`], reported as events.
+pub async fn run_round<W: Write + Send + 'static>(
     payload: &JobPayload,
-    log: &mut EventLog,
-    log_path: &Path,
+    frames: &FrameWriter<W>,
     scratch_root: &Path,
     cancel: CancellationToken,
 ) -> anyhow::Result<JobOutcome> {
     let timeout = payload.command_limit_secs.map(Duration::from_secs);
 
-    log.append(EventKind::JobStarted {
+    frames.append_event(EventKind::JobStarted {
         round: payload.round,
     })?;
 
-    let result = round_result(payload, log_path, scratch_root, timeout, cancel)
+    let result = round_result(payload, frames, scratch_root, timeout, cancel)
         .await
-        // The round could not be administered at all — the clone failed, or
-        // the push did and took the work with it. Either way there is no
+        // The round could not be administered at all — the clone or
+        // provisioning failed, a git step before the push could not run, or
+        // the push failed and took the work with it. Either way there is no
         // branch to name.
         .unwrap_or_else(|e| RoundResult::Failed {
             reason: e.to_string(),
             work: None,
         });
 
-    record_completion(log, result)
-}
-
-/// What a round settled to, in the order it settled: the agent's work
-/// preserved on the branch, the verdict on it, then the scratch checkout's
-/// removal.
-///
-/// Three held `Result`s rather than three `?`s. The checkout is scratch
-/// holding whatever was seeded into it, so leaving it behind because an
-/// earlier git call failed is not an option — and building this as one
-/// value leaves nowhere to put a `?` that would skip the discard.
-#[derive(Debug)]
-struct RoundSettlement {
-    preserved: anyhow::Result<Option<AgentWork>>,
-    verdict: anyhow::Result<VerifyVerdict>,
-    discarded: anyhow::Result<()>,
-}
-
-impl RoundSettlement {
-    /// What the round produced and what was made of it — answered only once
-    /// the checkout is gone.
-    fn work_and_verdict(self) -> anyhow::Result<(Option<AgentWork>, VerifyVerdict)> {
-        let work = self.preserved?;
-        let verdict = self.verdict?;
-        self.discarded?;
-        Ok((work, verdict))
-    }
+    record_completion(frames, result)
 }
 
 /// One round, from empty checkout to discarded checkout.
@@ -126,9 +102,9 @@ impl RoundSettlement {
 /// The agent's work is committed and published *before* success is decided:
 /// an unrecorded change would be a lost change, and a failure that produced a
 /// diff is exactly the case where the diff is worth reading.
-async fn round_result(
+async fn round_result<W: Write + Send + 'static>(
     payload: &JobPayload,
-    log_path: &Path,
+    frames: &FrameWriter<W>,
     scratch_root: &Path,
     timeout: Option<Duration>,
     cancel: CancellationToken,
@@ -146,37 +122,31 @@ async fn round_result(
     // Taken once, up front: it decides both whether `verify` is worth running
     // and how the round ends, and an agent failure wins over either answer.
     let agent_failure = agent_failure_reason(
-        run_command(
-            &payload.command,
-            ws.path(),
-            log_path,
-            timeout,
-            cancel.clone(),
-        )
-        .await,
+        run_command(&payload.command, ws.path(), frames, timeout, cancel.clone()).await,
     );
 
     // Bound before the literal: both borrow `ws`, which `discard` consumes.
     let preserved = agent_work_on_branch(payload, &ws).await;
     let verdict = match agent_failure {
-        Some(_) => Ok(VerifyVerdict::NoObjection),
+        Some(_) => VerifyVerdict::NoObjection,
         None => {
             verify_verdict(
                 payload.verify.as_deref(),
                 ws.path(),
-                log_path,
+                frames,
                 timeout,
                 cancel,
             )
             .await
         }
     };
-    let settled = RoundSettlement {
-        preserved,
-        verdict,
-        discarded: workspace::discard(ws).map_err(anyhow::Error::from),
-    };
-    let (work, verdict) = settled.work_and_verdict()?;
+    // Removing the checkout is housekeeping: failing at it neither undoes a
+    // pushed branch nor says anything about the work, so it is reported
+    // rather than allowed to replace what the round did.
+    if let Err(e) = workspace::discard(ws) {
+        frames.append_output(&format!("could not remove the scratch checkout: {e}"))?;
+    }
+    let work = preserved?;
 
     Ok(match (agent_failure, verdict) {
         // Neither of these is a judgement about the work, so neither becomes
@@ -202,10 +172,10 @@ enum VerifyVerdict {
     /// `verify` ran to completion and exited non-zero — a judgement about the
     /// work, and the only thing that gates delivery.
     Rejected { reason: String },
-    /// `verify` was killed before it could judge anything: cancelled, or cut
-    /// off at `max_duration`. Ctrl-C during a long test suite is ordinary,
-    /// and recording it as a rejection would put a claim about the work into
-    /// an append-only log that can never be corrected.
+    /// `verify` never got to judge anything: it could not be started, was
+    /// cancelled, or was cut off at `max_duration`. Ctrl-C during a long test
+    /// suite is ordinary, and recording it as a rejection would put a claim
+    /// about the work into an append-only log that can never be corrected.
     Interrupted { reason: String },
 }
 
@@ -214,31 +184,34 @@ enum VerifyVerdict {
 ///
 /// The outcome is matched here rather than flattened through
 /// `ShellOutcome::failure_reason`, which cannot tell `exit 1` from a kill.
-async fn verify_verdict(
+async fn verify_verdict<W: Write + Send + 'static>(
     verify: Option<&str>,
     workspace: &Path,
-    log_path: &Path,
+    frames: &FrameWriter<W>,
     timeout: Option<Duration>,
     cancel: CancellationToken,
-) -> anyhow::Result<VerifyVerdict> {
+) -> VerifyVerdict {
     let Some(command) = verify else {
-        return Ok(VerifyVerdict::NoObjection);
+        return VerifyVerdict::NoObjection;
     };
 
-    Ok(
-        match run_shell(command, workspace, log_path, timeout, cancel).await? {
-            ShellOutcome::Exited(0) => VerifyVerdict::NoObjection,
-            ShellOutcome::Exited(code) => VerifyVerdict::Rejected {
-                reason: format!("exit {code}"),
-            },
-            ShellOutcome::TimedOut => VerifyVerdict::Interrupted {
-                reason: "verify timed out".to_string(),
-            },
-            ShellOutcome::Cancelled => VerifyVerdict::Interrupted {
-                reason: "verify cancelled".to_string(),
-            },
+    match run_shell(command, workspace, frames, timeout, cancel).await {
+        Ok(ShellOutcome::Exited(0)) => VerifyVerdict::NoObjection,
+        Ok(ShellOutcome::Exited(code)) => VerifyVerdict::Rejected {
+            reason: format!("exit {code}"),
         },
-    )
+        Ok(ShellOutcome::TimedOut) => VerifyVerdict::Interrupted {
+            reason: "verify timed out".to_string(),
+        },
+        Ok(ShellOutcome::Cancelled) => VerifyVerdict::Interrupted {
+            reason: "verify cancelled".to_string(),
+        },
+        // A verdict rather than an error: the branch is already on the
+        // remote, and an error would take the round's record of it down too.
+        Err(e) => VerifyVerdict::Interrupted {
+            reason: format!("verify could not run: {e}"),
+        },
+    }
 }
 
 /// Why the agent failed, or `None` when it ran to a clean exit. A program that
@@ -269,12 +242,15 @@ async fn agent_work_on_branch(
     }))
 }
 
-fn record_completion(log: &mut EventLog, result: RoundResult) -> anyhow::Result<JobOutcome> {
+fn record_completion<W: Write>(
+    frames: &FrameWriter<W>,
+    result: RoundResult,
+) -> anyhow::Result<JobOutcome> {
     let (events, outcome) = events_for_completion(result);
 
     events
         .into_iter()
-        .try_for_each(|kind| log.append(kind).map(|_| ()))?;
+        .try_for_each(|kind| frames.append_event(kind).map(|_| ()))?;
 
     Ok(outcome)
 }

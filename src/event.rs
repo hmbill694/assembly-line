@@ -114,11 +114,25 @@ impl<W: Write> EventLog<W> {
             at: Utc::now(),
             kind,
         };
-        let line = serde_json::to_string(&event).map_err(io::Error::other)?;
+        self.write_line(&event)?;
+        Ok(event)
+    }
+
+    /// Append an event exactly as a job recorded it, keeping its own
+    /// timestamp: the collector's copy of the job's log, not a new event.
+    ///
+    /// # Errors
+    ///
+    /// As [`EventLog::append`].
+    pub fn append_collected(&mut self, event: &Event) -> io::Result<()> {
+        self.write_line(event)
+    }
+
+    fn write_line(&mut self, event: &Event) -> io::Result<()> {
+        let line = serde_json::to_string(event).map_err(io::Error::other)?;
         self.sink.write_all(line.as_bytes())?;
         self.sink.write_all(b"\n")?;
-        self.sink.flush()?;
-        Ok(event)
+        self.sink.flush()
     }
 
     pub fn sink(&self) -> &W {

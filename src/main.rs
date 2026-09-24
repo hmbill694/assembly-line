@@ -1,10 +1,13 @@
 use assembly_line::cli::{Cli, Command};
+use assembly_line::collect::{collect, record_launch_failure};
 use assembly_line::config::RepoConfig;
 use assembly_line::event::{Event, EventKind, EventLog};
+use assembly_line::frame::FrameWriter;
 use assembly_line::job::{JobOutcome, run_round};
 use assembly_line::paths::{JobMeta, JobPaths};
-use assembly_line::payload::{self, JobPayload, RoundRequest};
+use assembly_line::payload::{self, JobPayload, PAYLOAD_VAR, RoundRequest};
 use assembly_line::report::JobReport;
+use assembly_line::runner::local::LocalRunner;
 use assembly_line::workspace::{DEFAULT_REMOTE, job_branch_name};
 use assembly_line::{config, delivery, git, paths};
 use clap::Parser;
@@ -39,9 +42,11 @@ fn main() -> ExitCode {
             follow,
             repo,
         } => print_job_log(job_id, follow, repo),
+        Command::JobExec => in_async_runtime(execute_payload_from_environment()),
     }
 }
 
+/// On stderr: stdout belongs to frames.
 fn install_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -49,7 +54,71 @@ fn install_tracing() {
                 .unwrap_or_else(|_| "assembly_line=info".into()),
         )
         .with_target(false)
+        .with_writer(std::io::stderr)
         .init();
+}
+
+/// `job-exec`: read the payload, run the round, report it on stdout.
+///
+/// The exit code mirrors the round, but the collector decides from the
+/// frames — the code only matters when the frames never said.
+async fn execute_payload_from_environment() -> Result<ExitCode, String> {
+    let payload: JobPayload = std::env::var(PAYLOAD_VAR)
+        .map_err(|_| format!("{PAYLOAD_VAR} is not set — job-exec is started by a runner"))
+        .and_then(|json| {
+            serde_json::from_str(&json)
+                .map_err(|e| format!("{PAYLOAD_VAR} is not a job payload: {e}"))
+        })?;
+
+    let frames = FrameWriter::new(std::io::stdout());
+    let cancel = CancellationToken::new();
+    cancel_on_termination_signal(cancel.clone());
+
+    run_round(&payload, &frames, &std::env::temp_dir(), cancel)
+        .await
+        .map(exit_code_for)
+        .map_err(|e| e.to_string())
+}
+
+/// SIGTERM is how the local runner cancels, SIGINT is Ctrl-C reaching the
+/// whole foreground process group, and SIGHUP is the terminal closing — which
+/// the agent, leading a session of its own, never hears. Any of them cancels
+/// the round, which then still reports itself.
+fn cancel_on_termination_signal(cancel: CancellationToken) {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    tokio::spawn(async move {
+        let (Ok(mut terminate), Ok(mut hangup)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        ) else {
+            return;
+        };
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = hangup.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+        cancel.cancel();
+    });
+}
+
+/// Launch the round and collect it. A launch failure is a failed round, not
+/// a usage error: the job directory already exists and must say what
+/// became of it.
+async fn collect_round(
+    payload: &JobPayload,
+    log: &mut EventLog,
+    output_log: &Path,
+    cancel: CancellationToken,
+) -> anyhow::Result<JobOutcome> {
+    match LocalRunner::current_binary()
+        .map_err(anyhow::Error::from)
+        .and_then(|runner| runner.launch(payload))
+    {
+        Ok(job) => collect(job, log, output_log, cancel).await,
+        Err(e) => record_launch_failure(log, &e),
+    }
 }
 
 /// Where every async command's usage error is reported, so none of them has to
@@ -207,15 +276,9 @@ async fn start_new_job(
         },
     )
     .map_err(|e| e.to_string())?;
-    let outcome = run_round(
-        &payload,
-        &mut log,
-        &paths.log(),
-        &std::env::temp_dir(),
-        cancel_on_ctrl_c(),
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    let outcome = collect_round(&payload, &mut log, &paths.log(), cancel_on_ctrl_c())
+        .await
+        .map_err(|e| e.to_string())?;
 
     let code = finish_job(
         &repo,
@@ -501,15 +564,9 @@ async fn revise_existing_job(
         },
     )
     .map_err(|e| e.to_string())?;
-    let outcome = run_round(
-        &payload,
-        &mut log,
-        &paths.log(),
-        &std::env::temp_dir(),
-        cancel_on_ctrl_c(),
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    let outcome = collect_round(&payload, &mut log, &paths.log(), cancel_on_ctrl_c())
+        .await
+        .map_err(|e| e.to_string())?;
 
     Ok(finish_job(
         &meta.repo,

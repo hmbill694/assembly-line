@@ -96,9 +96,7 @@ async fn a_job_whose_verify_passes_succeeds() {
     );
     assert!(!outcome.has(|e| matches!(e, EventKind::JobVerifyFailed { .. })));
     assert!(
-        std::fs::read_to_string(&outcome.log)
-            .unwrap()
-            .contains(VERIFY_RAN),
+        outcome.output.contains(VERIFY_RAN),
         "a round the agent succeeded is a round verify is asked about"
     );
 }
@@ -141,10 +139,10 @@ async fn an_agent_failure_wins_over_verify() {
         !outcome.has(|e| matches!(e, EventKind::JobVerifyFailed { .. })),
         "nothing may claim verify rejected work it never looked at"
     );
-    let job_log = std::fs::read_to_string(&outcome.log).unwrap();
     assert!(
-        !job_log.contains(VERIFY_RAN),
-        "verify ran on a round the agent had already failed: {job_log}"
+        !outcome.output.contains(VERIFY_RAN),
+        "verify ran on a round the agent had already failed: {}",
+        outcome.output
     );
     assert!(
         outcome.has(|e| matches!(e, EventKind::JobCommitted { .. })),

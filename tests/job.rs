@@ -182,6 +182,115 @@ async fn a_failing_agent_preserves_its_work_on_a_branch_and_leaves_no_checkout()
     );
 }
 
+/// The checkout is the agent's to change, permissions included. One it has
+/// made hard to delete still goes, and the work it holds is still recorded.
+#[tokio::test]
+async fn a_checkout_the_agent_write_protected_is_still_discarded_and_its_work_kept() {
+    let h = Harness::with_config(&config_running("locking-agent.sh")).await;
+
+    let outcome = h.run_job("x").await;
+
+    assert!(outcome.succeeded, "{:?}", outcome.state);
+    assert!(outcome.has(|k| matches!(k, EventKind::JobCommitted { .. })));
+    assert!(
+        h.files_on_remote_branch(&job_branch_name(outcome.job_id))
+            .await
+            .contains("locked/work.txt")
+    );
+    assert!(
+        h.scratch_is_empty(),
+        "the write-protected checkout survived"
+    );
+}
+
+/// The branch is pushed before `verify` runs, so a `verify` that cannot even
+/// start must not take the round's record of that branch down with it.
+#[tokio::test]
+async fn a_verify_that_cannot_start_still_records_the_pushed_branch() {
+    let h = Harness::new().await;
+    // No `sh` on PATH, so `verify` cannot be spawned; the agent runs under
+    // an absolute `/bin/bash` and git is found through its own link.
+    let only_git = h.scratch_root().with_file_name("only-git");
+    std::fs::create_dir_all(&only_git).unwrap();
+    let git_binary = std::env::var("PATH")
+        .unwrap()
+        .split(':')
+        .map(|dir| std::path::Path::new(dir).join("git"))
+        .find(|candidate| candidate.is_file())
+        .unwrap();
+    std::os::unix::fs::symlink(git_binary, only_git.join("git")).unwrap();
+    let base = h.payload_for("x").await;
+    let command = assembly_line::provider::CommandSpec {
+        program: "/bin/bash".into(),
+        ..base.command.clone()
+    };
+    let payload = payload::JobPayload {
+        command,
+        verify: Some("true".into()),
+        ..base
+    };
+
+    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("assembly"))
+        .arg("job-exec")
+        .env(
+            payload::PAYLOAD_VAR,
+            serde_json::to_string(&payload).unwrap(),
+        )
+        .env("PATH", &only_git)
+        .env("TMPDIR", h.scratch_root())
+        .output()
+        .unwrap();
+
+    let frames = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        frames.contains("\"t\":\"job_branch_published\""),
+        "the pushed branch went unrecorded: {frames}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(frames.contains("verify could not run"), "{frames}");
+}
+
+/// The agent leads a session of its own, so a terminal's hangup never
+/// reaches it: `job-exec` has to cancel the round itself, or the agent runs
+/// on with nothing left to stop it.
+#[tokio::test]
+async fn a_hangup_cancels_the_round_rather_than_orphaning_the_agent() {
+    use std::io::BufRead;
+
+    let h = Harness::with_config(&config_running("sleeping-agent.sh")).await;
+    let payload = h.payload_for("x").await;
+
+    let mut job_exec = std::process::Command::new(assert_cmd::cargo::cargo_bin("assembly"))
+        .arg("job-exec")
+        .env(
+            payload::PAYLOAD_VAR,
+            serde_json::to_string(&payload).unwrap(),
+        )
+        .env("TMPDIR", h.scratch_root())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut frames = std::io::BufReader::new(job_exec.stdout.take().unwrap()).lines();
+    let before_hangup: Vec<String> = frames
+        .by_ref()
+        .map(Result::unwrap)
+        .take_while(|line| !line.contains("sleeping-agent:"))
+        .collect();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(job_exec.id()).unwrap()),
+        nix::sys::signal::Signal::SIGHUP,
+    )
+    .unwrap();
+    let after_hangup: String = frames.map(Result::unwrap).collect();
+    job_exec.wait().unwrap();
+
+    assert!(
+        after_hangup.contains("\"reason\":\"cancelled\""),
+        "the round never reported itself: {before_hangup:?} {after_hangup}"
+    );
+    assert!(h.scratch_is_empty(), "the scratch clone was left behind");
+}
+
 /// A job whose branch cannot leave the scratch clone has lost its work, and
 /// must say so rather than record a branch that exists nowhere.
 #[tokio::test]

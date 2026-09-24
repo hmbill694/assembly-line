@@ -7,6 +7,7 @@
 
 use assembly_line::config::RepoConfig;
 use assembly_line::event::{EventKind, EventLog};
+use assembly_line::frame::{FrameWriter, Routed, StreamPosition};
 use assembly_line::git::{self, commit_all};
 use assembly_line::job::run_round;
 use assembly_line::paths::{self, JobPaths};
@@ -190,30 +191,33 @@ impl Harness {
         self.round_from(&start, prompt, provider, round).await
     }
 
-    /// Everything a round does once its start is pinned: resolve a payload
-    /// the way `main.rs` does, then run it.
+    /// The payload the host would build for round 1 of this job.
+    pub async fn payload_for(&self, prompt: &str) -> JobPayload {
+        let start = git::pinned(&self.repo, "origin", "main").await.unwrap();
+        self.payload_from(&start, prompt, None, 1).await.unwrap()
+    }
+
+    /// Resolve a round's payload the way `main.rs` does.
     ///
     /// An undeclared provider or an unparseable `max_duration` is refused by
     /// [`JobPayload::for_round`], and propagates as the error.
-    async fn round_from(
+    async fn payload_from(
         &self,
         start: &git::PinnedRef,
         prompt: &str,
         provider: Option<&str>,
         round: u32,
-    ) -> anyhow::Result<Outcome> {
+    ) -> anyhow::Result<JobPayload> {
         let config = RepoConfig::from_ref(&self.repo, &start.sha).await?;
         let provider = provider
             .map(str::to_string)
             .or_else(|| config.provider.clone())
             .unwrap_or_default();
-        let paths = self.job_paths();
-        let mut log = EventLog::open_append(paths.events()).unwrap();
 
-        let payload = JobPayload::for_round(
+        JobPayload::for_round(
             &config,
             RoundRequest {
-                job_id: paths.id,
+                job_id: THE_JOB,
                 round,
                 prompt,
                 provider: &provider,
@@ -222,16 +226,53 @@ impl Harness {
                 remote_url: payload::remote_to_clone(&self.repo, workspace::DEFAULT_REMOTE).await?,
                 seed_from: &self.repo,
             },
-        )?;
+        )
+    }
 
+    /// Everything a round does once its start is pinned: resolve a payload,
+    /// run it in-process against an in-memory frame stream, and route the
+    /// frames into the job's event log. A lighter collector than the host's
+    /// `collect`: an in-memory stream never replays, so there is no position
+    /// to carry, and a round that ends without a verdict is left without one.
+    async fn round_from(
+        &self,
+        start: &git::PinnedRef,
+        prompt: &str,
+        provider: Option<&str>,
+        round: u32,
+    ) -> anyhow::Result<Outcome> {
+        let payload = self.payload_from(start, prompt, provider, round).await?;
+        let paths = self.job_paths();
+        let mut log = EventLog::open_append(paths.events()).unwrap();
+
+        let frames = FrameWriter::new(Vec::new());
         let outcome = run_round(
             &payload,
-            &mut log,
-            &paths.log(),
+            &frames,
             &self.scratch_root(),
             CancellationToken::new(),
         )
         .await?;
+        let routed: Vec<Routed> = String::from_utf8(frames.copy_of_sink())
+            .unwrap()
+            .lines()
+            .map(|line| StreamPosition::default().route(line).1)
+            .collect();
+        let output: String = routed
+            .iter()
+            .filter_map(|r| match r {
+                Routed::Output(text) => Some(format!("{text}\n")),
+                _ => None,
+            })
+            .collect();
+        routed
+            .into_iter()
+            .filter_map(|r| match r {
+                Routed::Event { event, .. } => Some(event),
+                _ => None,
+            })
+            .try_for_each(|event| log.append_collected(&event))
+            .unwrap();
         let events = EventLog::read(paths.events()).unwrap();
 
         Ok(Outcome {
@@ -239,7 +280,7 @@ impl Harness {
             job_id: paths.id,
             state: JobState::replay(&events),
             events: events.into_iter().map(|e| e.kind).collect(),
-            log: paths.log(),
+            output,
         })
     }
 }
@@ -251,8 +292,8 @@ pub struct Outcome {
     pub job_id: u64,
     pub state: JobState,
     pub events: Vec<EventKind>,
-    /// Where the agent's captured output went.
-    pub log: PathBuf,
+    /// What the round's commands printed, one line per output frame.
+    pub output: String,
 }
 
 impl Outcome {

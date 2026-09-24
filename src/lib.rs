@@ -1,6 +1,7 @@
 //! assembly-line: run one coding-agent job and keep the branch it leaves.
 
 pub mod cli;
+pub mod collect;
 pub mod config;
 pub mod delivery;
 pub mod event;
@@ -12,5 +13,6 @@ pub mod paths;
 pub mod payload;
 pub mod provider;
 pub mod report;
+pub mod runner;
 pub mod state;
 pub mod workspace;

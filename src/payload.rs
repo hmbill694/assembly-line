@@ -1,9 +1,9 @@
 //! Everything a round needs to run, resolved by the host before it starts.
 //!
-//! The payload is the whole plan. Whoever runs the round — this process
-//! today, `job-exec` in a container from Task 6 on — executes exactly what
-//! it says and reads no configuration of its own, so nothing inside the
-//! boundary can influence the settings that govern it.
+//! The payload is the whole plan. `job-exec` runs the round, wherever its
+//! runner puts it, and executes exactly what it says, reading no
+//! configuration of its own, so nothing inside the boundary can influence
+//! the settings that govern it.
 
 use crate::config::{ConfigError, RepoConfig, parse_duration};
 use crate::git::{self, PinnedRef};
