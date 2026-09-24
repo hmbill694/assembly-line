@@ -436,3 +436,195 @@ async fn a_ref_resolves_to_the_commit_it_names() {
     );
     assert!(git::sha_at_ref(&fx.repo, "no-such-ref").await.is_err());
 }
+
+#[tokio::test]
+async fn a_remotes_url_is_read_back_and_a_missing_remote_is_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    support::init_git_repo(&repo).await;
+    assert_eq!(git::remote_url(&repo, "origin").await.unwrap(), None);
+
+    let origin = tmp.path().join("origin.git");
+    support::add_origin(&repo, &origin).await;
+    assert_eq!(
+        git::remote_url(&repo, "origin").await.unwrap().as_deref(),
+        Some(origin.to_str().unwrap())
+    );
+}
+
+/// Git reads a relative remote path from the repository; a job's clone runs
+/// from a scratch directory, where the same path names nothing.
+#[tokio::test]
+async fn a_relative_remote_path_is_resolved_against_the_repository() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    support::init_git_repo(&repo).await;
+    git::run_allowing_failure(&repo, &["remote", "add", "origin", "../origin.git"])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        git::remote_url(&repo, "origin").await.unwrap(),
+        Some(repo.join("../origin.git").to_string_lossy().into_owned())
+    );
+}
+
+#[tokio::test]
+async fn remote_urls_that_name_a_host_are_left_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    support::init_git_repo(&repo).await;
+
+    for url in [
+        "git@example.com:team/repo.git",
+        "https://example.com/team/repo.git",
+    ] {
+        git::run_allowing_failure(&repo, &["remote", "add", "origin", url])
+            .await
+            .unwrap();
+        assert_eq!(
+            git::remote_url(&repo, "origin").await.unwrap().as_deref(),
+            Some(url)
+        );
+        git::run_allowing_failure(&repo, &["remote", "remove", "origin"])
+            .await
+            .unwrap();
+    }
+}
+
+/// A job's clone pushes back to where it cloned from, so a remote that
+/// pushes elsewhere would send the job's branch to the wrong place.
+#[tokio::test]
+async fn a_remote_that_pushes_somewhere_else_is_refused_with_what_to_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    support::init_git_repo(&repo).await;
+    support::add_origin(&repo, &tmp.path().join("origin.git")).await;
+    git::run_allowing_failure(
+        &repo,
+        &["remote", "set-url", "--push", "origin", "/elsewhere.git"],
+    )
+    .await
+    .unwrap();
+
+    let err = git::remote_url(&repo, "origin")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("remote.origin.pushurl"), "{err}");
+}
+
+/// A push rewrite in the repository's own config is as invisible to the
+/// clone as a pushurl, and the refusal names the setting that caused it.
+#[tokio::test]
+async fn a_push_rewrite_only_this_repository_holds_is_refused_by_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let origin = tmp.path().join("origin.git");
+    support::init_git_repo(&repo).await;
+    support::add_origin(&repo, &origin).await;
+    let rewrite_key = format!(
+        "url.{}.pushInsteadOf",
+        tmp.path().join("elsewhere.git").display()
+    );
+    git::run_allowing_failure(&repo, &["config", &rewrite_key, origin.to_str().unwrap()])
+        .await
+        .unwrap();
+
+    let err = git::remote_url(&repo, "origin")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("pushinsteadof"), "{err}");
+    assert!(err.contains("global config"), "{err}");
+}
+
+/// A job starts from what the remote says a ref is, not what the local
+/// repository says: unpushed work is not something a clone can see.
+#[tokio::test]
+async fn a_ref_is_pinned_to_the_commit_the_remote_has_for_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    support::init_git_repo(&repo).await;
+    support::add_origin(&repo, &tmp.path().join("origin.git")).await;
+    support::publish_main(&repo).await;
+    let pushed = head_sha(&repo).await.unwrap();
+
+    std::fs::write(repo.join("unpushed.txt"), "local only\n").unwrap();
+    commit_all(&repo, "unpushed").await.unwrap().unwrap();
+
+    let pinned = git::pinned(&repo, "origin", "main").await.unwrap();
+    assert_eq!(
+        pinned,
+        git::PinnedRef {
+            name: "main".into(),
+            sha: pushed
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_ref_the_remote_does_not_have_cannot_be_pinned() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    support::init_git_repo(&repo).await;
+    support::add_origin(&repo, &tmp.path().join("origin.git")).await;
+    support::publish_main(&repo).await;
+
+    let err = git::pinned(&repo, "origin", "never-pushed")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("never-pushed"), "{err}");
+    assert!(err.to_string().contains("push it first"), "{err}");
+}
+
+/// Pushing cannot fix a remote that does not answer, so a fetch that failed
+/// for any reason other than the ref being absent keeps git's own complaint.
+#[tokio::test]
+async fn a_remote_that_cannot_be_reached_is_not_told_to_push_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    support::init_git_repo(&repo).await;
+    let nowhere = tmp.path().join("no-such-origin.git");
+    let added = git::run_allowing_failure(
+        &repo,
+        &["remote", "add", "origin", nowhere.to_str().unwrap()],
+    )
+    .await
+    .unwrap();
+    assert!(added.succeeded(), "{}", added.stderr);
+
+    let err = git::pinned(&repo, "origin", "main")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(!err.contains("push it first"), "{err}");
+    assert!(err.contains("fetch origin main"), "{err}");
+}
+
+#[tokio::test]
+async fn a_clone_checks_out_a_new_branch_at_the_commit_it_is_given() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    support::init_git_repo(&repo).await;
+    let origin = tmp.path().join("origin.git");
+    support::add_origin(&repo, &origin).await;
+    support::publish_main(&repo).await;
+    let at = head_sha(&repo).await.unwrap();
+
+    let clone = tmp.path().join("clone");
+    std::fs::create_dir_all(&clone).unwrap();
+    git::clone_into(origin.to_str().unwrap(), &clone)
+        .await
+        .unwrap();
+    git::check_out_new_branch(&clone, "al/job-1", &at)
+        .await
+        .unwrap();
+
+    assert_eq!(head_sha(&clone).await.unwrap(), at);
+    assert_eq!(
+        git::current_branch(&clone).await.unwrap().as_deref(),
+        Some("al/job-1")
+    );
+    assert!(clone.join("README.md").is_file());
+}

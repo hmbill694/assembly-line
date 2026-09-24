@@ -38,7 +38,6 @@ async fn a_job_whose_verify_fails_is_a_failed_job() {
         config_running("fake-agent.sh")
     ))
     .await;
-    let origin = h.with_origin().await;
 
     let outcome = h.run_job("write a file").await;
 
@@ -62,12 +61,12 @@ async fn a_job_whose_verify_fails_is_a_failed_job() {
         "the branch survives a failed verify — that is what makes it inspectable"
     );
     assert!(
-        !h.worktree_root().join("checkout").exists(),
+        h.scratch_is_empty(),
         "a job's checkout is scratch — even one verify rejected discards it"
     );
 
     let on_remote =
-        git::run_allowing_failure(&origin, &["show", "--name-only", "--format=", &branch])
+        git::run_allowing_failure(&h.origin, &["show", "--name-only", "--format=", &branch])
             .await
             .unwrap();
     assert!(on_remote.succeeded(), "{}", on_remote.stderr);

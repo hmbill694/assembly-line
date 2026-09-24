@@ -1,14 +1,16 @@
 //! Running one job: a repository, a ref and a prompt.
 //!
-//! A job is stateless. Its checkout is scratch and is discarded whatever
-//! happened, including on failure; its branch is the whole durable output,
-//! which is why work is committed and published *before* success is decided.
+//! A job is stateless. Its checkout is a scratch clone and is discarded
+//! whatever happened, including on failure; its branch, pushed to the
+//! remote, is the whole durable output — which is why work is committed and
+//! pushed *before* success is decided, and why a round that cannot push
+//! fails.
 
 use crate::config::{ConfigError, RepoConfig, parse_duration};
 use crate::event::{EventKind, EventLog};
 use crate::exec::{ShellOutcome, run_command, run_shell};
 use crate::git;
-use crate::paths::{self, JobMeta, JobPaths};
+use crate::paths::{JobMeta, JobPaths};
 use crate::provider::{CommandSpec, render_command};
 use crate::workspace::{self, JobWorkspace, job_branch_name};
 use std::path::{Path, PathBuf};
@@ -26,6 +28,9 @@ pub struct RunOpts {
     pub seed_from: PathBuf,
     /// The remote the job's branch is published to.
     pub remote: String,
+    /// Where the scratch clone is made. The system temp directory in real
+    /// runs; a directory the test owns in tests.
+    pub scratch_root: PathBuf,
 }
 
 /// Whether a job's work was accepted. `verify` decides this when the
@@ -48,7 +53,10 @@ impl JobOutcome {
 pub struct JobSpec<'a> {
     pub prompt: &'a str,
     pub provider: &'a str,
-    pub base_ref: &'a str,
+    /// Where this round starts: the base for round 1, the job's own branch
+    /// tip for a revise round. Pinned by the caller, which has already read
+    /// config from the same commit.
+    pub start: &'a git::PinnedRef,
     /// 1 for a first attempt; higher for a revise round.
     pub round: u32,
 }
@@ -59,8 +67,9 @@ struct AgentWork {
     branch: String,
     sha: String,
     stat: git::DiffStat,
-    /// As recorded in [`EventKind::JobBranchPublished`].
-    pushed_to: Option<String>,
+    /// The remote the branch reached. A round that could not push has no
+    /// `AgentWork` at all.
+    pushed_to: String,
 }
 
 /// How a round ended. Every variant that can carry work does carry it: a
@@ -88,11 +97,11 @@ enum RoundResult {
 /// mysteriously failed job.
 #[derive(Debug)]
 struct JobPlan {
-    repo: PathBuf,
-    /// Where the checkout begins, and whether that cuts the branch or
-    /// continues it — see [`round_start`].
-    start: git::WorktreeStart,
-    workspace_path: PathBuf,
+    /// What the scratch clone is cloned from.
+    remote_url: String,
+    /// The commit the round starts from.
+    start: git::PinnedRef,
+    scratch_root: PathBuf,
     branch: String,
     seed_from: PathBuf,
     copy_paths: Vec<String>,
@@ -138,28 +147,23 @@ fn revised_prompt(original: &str, feedback: &str) -> String {
 /// # Errors
 ///
 /// Returns a [`ConfigError`] when the repository does not declare the
-/// provider the job asked for, and a plain error when there is nowhere to put
-/// a worktree.
+/// provider the job asked for.
 fn job_plan(
     config: &RepoConfig,
     spec: &JobSpec<'_>,
     paths: &JobPaths,
     opts: &RunOpts,
-    start: git::WorktreeStart,
+    remote_url: String,
 ) -> anyhow::Result<JobPlan> {
     let provider = config
         .providers
         .get(spec.provider)
         .ok_or_else(|| ConfigError::UnknownProvider(spec.provider.to_string()))?;
 
-    let workspace_path = paths.worktree(&opts.repo).ok_or_else(|| {
-        anyhow::anyhow!("HOME is unset, so assembly-line has nowhere to put worktrees")
-    })?;
-
     Ok(JobPlan {
-        repo: opts.repo.clone(),
-        start,
-        workspace_path,
+        remote_url,
+        start: spec.start.clone(),
+        scratch_root: opts.scratch_root.clone(),
         branch: job_branch_name(paths.id),
         seed_from: opts.seed_from.clone(),
         copy_paths: config.copy.clone(),
@@ -170,46 +174,29 @@ fn job_plan(
     })
 }
 
-/// What must be true, and true on disk, before a round can start: the
-/// repository has something to branch from, and its worktree directory
-/// records which repository it belongs to — which is what lets `gc` collect
-/// those worktrees without being run from the repository itself.
-async fn ready_repository_for_worktrees(repo: &Path) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        git::has_commits(repo).await?,
-        "the repository has no commits, so a job has nothing to branch from"
-    );
-    paths::record_repository_for_worktrees(repo)?;
-    Ok(())
-}
-
-/// Where this round's checkout begins: a fresh branch at the ref the job was
-/// cut from, or the job's own branch continued from its tip — which is how the
-/// agent arrives at its prior work.
+/// Where the round clones from. A repository without the remote cannot run a
+/// job at all: the job clones from it and pushes its branch back to it.
 ///
-/// The one place a round number decides anything.
-async fn round_start(
-    repo: &Path,
-    branch: &str,
-    spec: &JobSpec<'_>,
-) -> anyhow::Result<git::WorktreeStart> {
-    match spec.round > 1 {
-        true => git::branch_tip(repo, branch)
-            .await
-            .map(|tip| git::WorktreeStart::OnExistingBranch { tip }),
-        false => git::sha_at_ref(repo, spec.base_ref)
-            .await
-            .map(|at| git::WorktreeStart::CreatingBranch { at }),
-    }
+/// # Errors
+///
+/// An error saying to add the remote when the repository has none, or git's
+/// own when the remote cannot be listed.
+pub async fn remote_to_clone(repo: &Path, remote: &str) -> anyhow::Result<String> {
+    git::remote_url(repo, remote).await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "the repository has no '{remote}' remote — a job clones from it and pushes its \
+             branch back to it, so add one"
+        )
+    })
 }
 
-/// Run one job end to end: scratch checkout, agent, commit, publish, discard.
+/// Run one job end to end: scratch clone, agent, commit, push, discard.
 ///
 /// # Errors
 ///
 /// Returns an error only if the job cannot be *administered* — the event log
 /// cannot be appended to, `max_duration` is unparseable, the repository does
-/// not declare the provider, or git refused to make a checkout. An agent that
+/// not declare the provider, or it has no remote to clone from. An agent that
 /// runs and fails is not an error: that is [`JobOutcome::Failed`].
 pub async fn run_job(
     config: &RepoConfig,
@@ -219,19 +206,16 @@ pub async fn run_job(
     opts: &RunOpts,
 ) -> anyhow::Result<JobOutcome> {
     let timeout = wall_clock_limit(config)?;
-    ready_repository_for_worktrees(&opts.repo).await?;
-
-    let branch = job_branch_name(paths.id);
-    let start = round_start(&opts.repo, &branch, spec).await?;
-    let plan = job_plan(config, spec, paths, opts, start)?;
+    let remote_url = remote_to_clone(&opts.repo, &opts.remote).await?;
+    let plan = job_plan(config, spec, paths, opts, remote_url)?;
 
     log.append(EventKind::JobStarted { round: spec.round })?;
 
     let result = round_result(&plan, &paths.log(), timeout, opts.cancel.clone())
         .await
-        // The round could not be administered at all — no sandbox, or git
-        // refused. Any partial work is described by the error, not by a branch
-        // we can name.
+        // The round could not be administered at all — the clone failed, or
+        // the push did and took the work with it. Either way there is no
+        // branch to name.
         .unwrap_or_else(|e| RoundResult::Failed {
             reason: e.to_string(),
             work: None,
@@ -263,6 +247,7 @@ pub async fn revise_job(
     config: &RepoConfig,
     meta: &JobMeta,
     revision: &Revision<'_>,
+    start: &git::PinnedRef,
     paths: &JobPaths,
     log: &mut EventLog,
     opts: &RunOpts,
@@ -271,7 +256,7 @@ pub async fn revise_job(
     let spec = JobSpec {
         prompt: &prompt,
         provider: &meta.provider,
-        base_ref: &meta.base_ref,
+        start,
         round: revision.round,
     };
     run_job(config, &spec, paths, log, opts).await
@@ -282,8 +267,8 @@ pub async fn revise_job(
 /// removal.
 ///
 /// Three held `Result`s rather than three `?`s. The checkout is scratch
-/// holding whatever was seeded into it, so leaving it behind for `gc` because
-/// an earlier git call failed is not an option — and building this as one
+/// holding whatever was seeded into it, so leaving it behind because an
+/// earlier git call failed is not an option — and building this as one
 /// value leaves nowhere to put a `?` that would skip the discard.
 #[derive(Debug)]
 struct RoundSettlement {
@@ -315,30 +300,31 @@ async fn round_result(
     cancel: CancellationToken,
 ) -> anyhow::Result<RoundResult> {
     let ws = workspace::create(
-        &plan.repo,
-        &plan.workspace_path,
-        &plan.branch,
+        &plan.remote_url,
         &plan.start,
+        &plan.branch,
         &plan.seed_from,
         &plan.copy_paths,
+        &plan.scratch_root,
     )
     .await?;
 
     // Taken once, up front: it decides both whether `verify` is worth running
     // and how the round ends, and an agent failure wins over either answer.
     let agent_failure = agent_failure_reason(
-        run_command(&plan.command, &ws.path, log_path, timeout, cancel.clone()).await,
+        run_command(&plan.command, ws.path(), log_path, timeout, cancel.clone()).await,
     );
 
+    // Bound before the literal: both borrow `ws`, which `discard` consumes.
+    let preserved = agent_work_on_branch(plan, &ws).await;
+    let verdict = match agent_failure {
+        Some(_) => Ok(VerifyVerdict::NoObjection),
+        None => verify_verdict(plan.verify.as_deref(), ws.path(), log_path, timeout, cancel).await,
+    };
     let settled = RoundSettlement {
-        preserved: agent_work_on_branch(plan, &ws).await,
-        verdict: match agent_failure {
-            Some(_) => Ok(VerifyVerdict::NoObjection),
-            None => {
-                verify_verdict(plan.verify.as_deref(), &ws.path, log_path, timeout, cancel).await
-            }
-        },
-        discarded: workspace::discard(&plan.repo, &ws).await,
+        preserved,
+        verdict,
+        discarded: workspace::discard(ws).map_err(anyhow::Error::from),
     };
     let (work, verdict) = settled.work_and_verdict()?;
 
@@ -422,30 +408,15 @@ async fn agent_work_on_branch(
     let Some(sha) = workspace::commit(ws, &plan.commit_message).await? else {
         return Ok(None);
     };
+    let stat = git::diff_stat_against(ws.path(), &plan.start.sha).await?;
+    workspace::publish(ws).await?;
 
     Ok(Some(AgentWork {
         branch: ws.branch.clone(),
         sha,
-        stat: git::diff_stat_against(&ws.path, plan.start.start_commit()).await?,
-        pushed_to: remote_the_branch_reached(plan, ws).await,
+        stat,
+        pushed_to: plan.remote.clone(),
     }))
-}
-
-/// A refused push is swallowed rather than failing the round: dropping
-/// [`EventKind::JobBranchPublished`] would erase the record of the branch,
-/// which holds the work either way.
-async fn remote_the_branch_reached(plan: &JobPlan, ws: &JobWorkspace) -> Option<String> {
-    match workspace::publish(&plan.repo, ws, &plan.remote).await {
-        Ok(reached) => reached,
-        Err(e) => {
-            tracing::warn!(
-                "'{}' branch stays local: publishing to '{}' failed: {e}",
-                ws.branch,
-                plan.remote
-            );
-            None
-        }
-    }
 }
 
 fn record_completion(log: &mut EventLog, result: RoundResult) -> anyhow::Result<JobOutcome> {
@@ -470,7 +441,7 @@ fn work_recorded(work: Option<&AgentWork>) -> Vec<EventKind> {
             },
             EventKind::JobBranchPublished {
                 branch: w.branch.clone(),
-                pushed_to: w.pushed_to.clone(),
+                pushed_to: Some(w.pushed_to.clone()),
             },
         ]
     })

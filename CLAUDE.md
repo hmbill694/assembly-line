@@ -255,9 +255,12 @@ Where a type owns a sink or source, make it generic with a sensible default
   from that id alone (`al/job-{id}`, `workspace::job_branch_name`) — always a
   well-formed git ref, with no pattern check needed because nothing
   user-authored ever reaches it.
-- The target repository is never modified beyond `.assembly/jobs/`, where a
-  job's event log and metadata live until a later milestone moves that state
-  out of the repository entirely (`src/paths.rs`). Worktrees live under
+- The target repository's working tree is never modified beyond
+  `.assembly/jobs/`, where a job's event log and metadata live until a later
+  milestone moves that state out of the repository entirely
+  (`src/paths.rs`). Its `.git` gains only what a fetch writes — objects,
+  `FETCH_HEAD`, remote-tracking refs — when a job pins its start to the
+  remote (`git::pinned`). Worktrees live under
   `$HOME` (or `$ASSEMBLY_WORKTREE_ROOT`, which tests set), never inside the
   repo: the target repo must stay untouched, and a worktree inside it would
   need a `.gitignore` entry assembly-line is not entitled to add.

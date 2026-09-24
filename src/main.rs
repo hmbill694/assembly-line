@@ -1,10 +1,13 @@
 use assembly_line::cli::{Cli, Command};
 use assembly_line::config::RepoConfig;
 use assembly_line::event::{Event, EventKind, EventLog};
-use assembly_line::job::{JobOutcome, JobSpec, Revision, RunOpts, revise_job, run_job};
+use assembly_line::job::{
+    JobOutcome, JobSpec, Revision, RunOpts, remote_to_clone, revise_job, run_job,
+};
 use assembly_line::paths::{JobMeta, JobPaths};
 use assembly_line::report::JobReport;
-use assembly_line::{config, delivery, gc, paths};
+use assembly_line::workspace::{DEFAULT_REMOTE, job_branch_name};
+use assembly_line::{config, delivery, gc, git, paths};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -111,13 +114,29 @@ fn prompt_text(prompt: Option<String>, prompt_file: Option<PathBuf>) -> Result<S
     }
 }
 
-/// What a job is cut from when the command line does not say: whatever the
-/// repository has checked out, never an assumed `main`.
+/// What a job is cut from when the command line does not say: the branch the
+/// repository has checked out, as the remote has it.
 async fn default_base_ref(repo: &Path) -> Result<String, String> {
-    assembly_line::git::current_branch(repo)
-        .await
-        .map_err(|e| e.to_string())
-        .map(|branch| branch.unwrap_or_else(|| "HEAD".to_string()))
+    match git::current_branch(repo).await {
+        Ok(Some(branch)) => Ok(branch),
+        Ok(None) => Err("HEAD is detached — name the ref to start from with --ref".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// A job starts from the remote's copy of a ref. When the user's own copy
+/// differs — usually unpushed commits — say so, rather than let them wonder
+/// where their work went.
+async fn note_if_local_ref_differs(repo: &Path, base_ref: &str, start: &git::PinnedRef) {
+    if let Ok(local) = git::sha_at_ref(repo, base_ref).await
+        && local != start.sha
+    {
+        println!(
+            "note: your '{base_ref}' is not what '{DEFAULT_REMOTE}' has — the job starts \
+             from {DEFAULT_REMOTE}'s ({}); push first if you meant yours",
+            &start.sha[..12.min(start.sha.len())]
+        );
+    }
 }
 
 /// The repository's settings and the provider the job will use, once the two
@@ -158,7 +177,8 @@ fn machine_opts(repo: &Path) -> RunOpts {
         // `copy` is declared by the repository, so its paths resolve against
         // the repository — not against wherever the user happened to stand.
         seed_from: repo.to_path_buf(),
-        remote: assembly_line::workspace::DEFAULT_REMOTE.to_string(),
+        remote: DEFAULT_REMOTE.to_string(),
+        scratch_root: std::env::temp_dir(),
     }
 }
 
@@ -172,6 +192,7 @@ async fn start_new_job(
     let PreparedJob {
         repo,
         base_ref,
+        start,
         prompt,
         provider,
         config,
@@ -188,7 +209,7 @@ async fn start_new_job(
     let spec = JobSpec {
         prompt: &prompt,
         provider: &provider,
-        base_ref: &base_ref,
+        start: &start,
         round: 1,
     };
     let outcome = run_job(&config, &spec, &paths, &mut log, &machine_opts(&repo))
@@ -241,6 +262,9 @@ async fn finish_job(
 struct PreparedJob {
     repo: PathBuf,
     base_ref: String,
+    /// `base_ref` as the remote has it — what the config was read from and
+    /// what the job starts from.
+    start: git::PinnedRef,
     prompt: String,
     provider: String,
     config: RepoConfig,
@@ -260,7 +284,15 @@ async fn prepare_job(
         None => default_base_ref(&repo).await?,
     };
 
-    let declared = RepoConfig::from_ref(&repo, &base_ref)
+    remote_to_clone(&repo, DEFAULT_REMOTE)
+        .await
+        .map_err(|e| e.to_string())?;
+    let start = git::pinned(&repo, DEFAULT_REMOTE, &base_ref)
+        .await
+        .map_err(|e| e.to_string())?;
+    note_if_local_ref_differs(&repo, &base_ref, &start).await;
+
+    let declared = RepoConfig::from_ref(&repo, &start.sha)
         .await
         .map_err(|e| e.to_string())?;
     let (config, provider) = runnable_config_and_provider(declared, provider)?;
@@ -268,6 +300,7 @@ async fn prepare_job(
     Ok(PreparedJob {
         repo,
         base_ref,
+        start,
         prompt,
         provider,
         config,
@@ -325,18 +358,10 @@ async fn deliver_if_verified(
         );
     }
 
-    match delivery::deliver(
-        repo,
-        &config.delivery,
-        assembly_line::workspace::DEFAULT_REMOTE,
-        branch,
-        base,
-    )
-    .await
-    {
-        Ok(outcome) => println!("{outcome}"),
-        Err(e) => eprintln!("warn: delivering {branch}: {e}"),
-    }
+    println!(
+        "{}",
+        delivery::deliver(repo, &config.delivery, branch, base).await
+    );
 }
 
 fn locate_job(job_id: Option<u64>, repo: Option<PathBuf>) -> Result<(JobPaths, JobMeta), String> {
@@ -387,6 +412,25 @@ fn rounds_so_far(events: &[Event]) -> u32 {
     .unwrap_or(u32::MAX)
 }
 
+/// Where a revise round starts: the remote's copy of the job's branch.
+///
+/// A job whose earlier rounds committed nothing pushed nothing, so its branch
+/// is absent rather than unpushed, and "push it first" would be the wrong
+/// advice.
+async fn job_branch_tip(repo: &Path, job_id: u64) -> Result<git::PinnedRef, String> {
+    let branch = job_branch_name(job_id);
+    match git::pinned(repo, DEFAULT_REMOTE, &branch).await {
+        Ok(tip) => Ok(tip),
+        Err(e) => match git::remote_lacks_ref(repo, DEFAULT_REMOTE, &branch).await {
+            Ok(true) => Err(format!(
+                "job {job_id} has no branch on '{DEFAULT_REMOTE}' — its first round committed \
+                 nothing, so there is nothing to revise"
+            )),
+            Ok(false) | Err(_) => Err(e.to_string()),
+        },
+    }
+}
+
 /// Run a job again with feedback. The round appends to the job's branch.
 async fn revise_existing_job(
     job_id: u64,
@@ -396,9 +440,16 @@ async fn revise_existing_job(
     let (paths, meta) = locate_job(Some(job_id), repo)?;
     let events = events_of(&paths)?;
 
-    // `base_ref`, not the job's own branch: the previous round is not allowed
-    // to have changed the settings that govern this one.
-    let declared = RepoConfig::from_ref(&meta.repo, &meta.base_ref)
+    remote_to_clone(&meta.repo, DEFAULT_REMOTE)
+        .await
+        .map_err(|e| e.to_string())?;
+    let base = git::pinned(&meta.repo, DEFAULT_REMOTE, &meta.base_ref)
+        .await
+        .map_err(|e| e.to_string())?;
+    let tip = job_branch_tip(&meta.repo, job_id).await?;
+    // `base`, not the job's own branch: the previous round is not allowed to
+    // have changed the settings that govern this one.
+    let declared = RepoConfig::from_ref(&meta.repo, &base.sha)
         .await
         .map_err(|e| e.to_string())?;
     let (config, _) = runnable_config_and_provider(declared, Some(meta.provider.clone()))?;
@@ -417,6 +468,7 @@ async fn revise_existing_job(
         &config,
         &meta,
         &revision,
+        &tip,
         &paths,
         &mut log,
         &machine_opts(&meta.repo),

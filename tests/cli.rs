@@ -26,17 +26,43 @@ fn assembly(tmp: &tempfile::TempDir) -> Command {
     cmd
 }
 
-fn git(tmp: &tempfile::TempDir, args: &[&str]) -> String {
+fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
     let out = std::process::Command::new("git")
-        .args(["-C", tmp.path().to_str().unwrap()])
+        .args(["-C", dir.to_str().unwrap()])
         .args(args)
         .output()
         .unwrap();
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+fn git(tmp: &tempfile::TempDir, args: &[&str]) -> String {
+    git_in(tmp.path(), args)
+}
+
+/// Where this test's bare remote lives: outside the repository, so the
+/// repository's own `git status` stays clean.
+fn origin_for(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "assembly-test-origin-{}",
+        tmp.path().file_name().unwrap().to_string_lossy()
+    ))
+}
+
+/// `git` run against this test's remote, which is where a job's branch lives.
+fn git_on_origin(tmp: &tempfile::TempDir, args: &[&str]) -> String {
+    git_in(&origin_for(tmp), args)
+}
+
+/// Give the repository a remote and publish `main` to it — every job clones
+/// from one.
+async fn publish_to_origin(tmp: &tempfile::TempDir) {
+    support::add_origin(tmp.path(), &origin_for(tmp)).await;
+    support::publish_main(tmp.path()).await;
+}
+
 /// A repository that has opted in: its `.assembly/config.toml` is committed,
-/// which is the only thing that makes it runnable.
+/// which is the only thing that makes it runnable, and published to its
+/// origin, which is where a job starts from.
 ///
 /// The repository itself comes from `support`, so there is one definition of
 /// "a git repo with a commit in it" across the whole test suite.
@@ -49,24 +75,15 @@ async fn repo_running(script: &str) -> tempfile::TempDir {
     )
     .unwrap();
     commit_all(tmp.path(), "opt in").await.unwrap().unwrap();
+    publish_to_origin(&tmp).await;
     tmp
 }
 
-/// Where the binary will put job `id`'s worktrees, given the root this test
-/// hands it. On macOS a tempdir sits under a symlink, so the slug must be
-/// computed from the path the binary itself resolves.
-fn job_worktrees(tmp: &tempfile::TempDir, id: u64) -> std::path::PathBuf {
-    worktree_root_for(tmp)
-        .join(assembly_line::paths::repo_slug(
-            &std::fs::canonicalize(tmp.path()).unwrap(),
-        ))
-        .join(id.to_string())
-}
-
-/// Worktrees outlive the tempdir, so a test that starts a job has to take them
-/// with it.
+/// Worktrees and the bare remote outlive the tempdir, so a test that makes
+/// them has to take them with it.
 fn discard_worktrees(tmp: &tempfile::TempDir) {
     let _ = std::fs::remove_dir_all(worktree_root_for(tmp));
+    let _ = std::fs::remove_dir_all(origin_for(tmp));
 }
 
 #[tokio::test]
@@ -97,7 +114,7 @@ async fn run_exits_one_when_the_agent_fails_but_still_leaves_the_branch() {
 
     // The branch is the durable artifact, and it survives a failure.
     assert_eq!(
-        git(&tmp, &["rev-parse", "--verify", "-q", "al/job-1"]).len(),
+        git_on_origin(&tmp, &["rev-parse", "--verify", "-q", "al/job-1"]).len(),
         40
     );
 
@@ -107,6 +124,7 @@ async fn run_exits_one_when_the_agent_fails_but_still_leaves_the_branch() {
 #[tokio::test]
 async fn a_repository_that_has_not_opted_in_is_told_which_file_to_write() {
     let tmp = support::repo_with_initial_commit().await;
+    publish_to_origin(&tmp).await;
 
     assembly(&tmp)
         .args(["run", "--prompt", "x"])
@@ -118,6 +136,41 @@ async fn a_repository_that_has_not_opted_in_is_told_which_file_to_write() {
         !tmp.path().join(".assembly/jobs/1").exists(),
         "a repository that cannot run should not allocate a job directory"
     );
+
+    discard_worktrees(&tmp);
+}
+
+/// A job clones from the remote and pushes back to it, so a repository
+/// without one is told to add one — not to push to a remote it lacks.
+#[tokio::test]
+async fn a_repository_with_no_remote_is_told_to_add_one() {
+    let tmp = support::repo_with_initial_commit().await;
+
+    assembly(&tmp)
+        .args(["run", "--prompt", "x"])
+        .assert()
+        .code(2)
+        .stderr(contains("no 'origin' remote").and(contains("add one")))
+        .stderr(contains("push it first").not());
+}
+
+/// A first round that committed nothing pushed nothing, so there is no
+/// branch on the remote to continue.
+#[tokio::test]
+async fn revising_a_job_that_left_no_branch_says_there_is_nothing_to_revise() {
+    let tmp = repo_running("noop-agent.sh").await;
+    assembly(&tmp)
+        .args(["run", "--prompt", "x"])
+        .assert()
+        .success();
+
+    assembly(&tmp)
+        .args(["revise", "1", "try again"])
+        .assert()
+        .code(2)
+        .stderr(contains("job 1 has no branch on 'origin'").and(contains("nothing to revise")));
+
+    discard_worktrees(&tmp);
 }
 
 #[tokio::test]
@@ -131,6 +184,8 @@ async fn an_undeclared_provider_is_rejected_before_a_job_directory_is_allocated(
         .stderr(contains("ghost").and(contains("add a block for it")));
 
     assert!(!tmp.path().join(".assembly/jobs/1").exists());
+
+    discard_worktrees(&tmp);
 }
 
 #[tokio::test]
@@ -151,6 +206,8 @@ async fn a_run_with_no_prompt_at_all_is_a_usage_error() {
     let tmp = repo_running("fake-agent.sh").await;
 
     assembly(&tmp).arg("run").assert().code(2);
+
+    discard_worktrees(&tmp);
 }
 
 #[tokio::test]
@@ -163,7 +220,7 @@ async fn a_prompt_can_come_from_a_file_instead() {
         .assert()
         .success();
 
-    let on_branch = git(&tmp, &["show", "al/job-1:agent-output.txt"]);
+    let on_branch = git_on_origin(&tmp, &["show", "al/job-1:agent-output.txt"]);
     assert!(on_branch.contains("Implement auth"), "{on_branch}");
 
     discard_worktrees(&tmp);
@@ -180,6 +237,8 @@ async fn a_missing_prompt_file_is_reported_before_the_job_starts() {
         .stderr(contains("gone.md"));
 
     assert!(!tmp.path().join(".assembly/jobs/1").exists());
+
+    discard_worktrees(&tmp);
 }
 
 #[tokio::test]
@@ -260,6 +319,44 @@ async fn a_job_started_elsewhere_is_found_by_pointing_the_read_commands_at_it() 
         .stdout(contains("round 2"));
 
     discard_worktrees(&standing_in);
+    discard_worktrees(&target);
+}
+
+/// A global `pushInsteadOf` — fetch over one transport, push over another —
+/// is the user's own config, which the job's clone reads too: the job runs,
+/// and its branch goes where the user's own push would.
+#[tokio::test]
+async fn a_global_push_rewrite_is_followed_rather_than_refused() {
+    let tmp = repo_running("fake-agent.sh").await;
+    let elsewhere = tempfile::tempdir().unwrap();
+    let pushed_to = elsewhere.path().join("pushed.git");
+    git_in(
+        elsewhere.path(),
+        &["init", "--quiet", "--bare", pushed_to.to_str().unwrap()],
+    );
+    let global_config = elsewhere.path().join("gitconfig");
+    std::fs::write(
+        &global_config,
+        format!(
+            "[url \"{}\"]\n\tpushInsteadOf = {}\n",
+            pushed_to.display(),
+            origin_for(&tmp).display()
+        ),
+    )
+    .unwrap();
+
+    assembly(&tmp)
+        .env("GIT_CONFIG_GLOBAL", &global_config)
+        .args(["run", "--prompt", "x"])
+        .assert()
+        .success();
+    assert_eq!(
+        git_in(&pushed_to, &["rev-parse", "--verify", "-q", "al/job-1"]).len(),
+        40,
+        "the job's push did not follow the rewrite"
+    );
+
+    discard_worktrees(&tmp);
 }
 
 /// `--ref` decides what the job is cut from; with none, the checked-out
@@ -269,9 +366,11 @@ async fn a_job_branches_from_the_ref_it_is_given() {
     let tmp = repo_running("fake-agent.sh").await;
     let earlier = git(&tmp, &["rev-parse", "HEAD"]);
     git(&tmp, &["tag", "start-here"]);
+    git(&tmp, &["push", "--quiet", "origin", "start-here"]);
 
     std::fs::write(tmp.path().join("later.txt"), "after\n").unwrap();
     commit_all(tmp.path(), "later work").await.unwrap().unwrap();
+    support::publish_main(tmp.path()).await;
     assert_ne!(git(&tmp, &["rev-parse", "HEAD"]), earlier);
 
     assembly(&tmp)
@@ -279,7 +378,7 @@ async fn a_job_branches_from_the_ref_it_is_given() {
         .assert()
         .success();
     assert_eq!(
-        git(&tmp, &["rev-parse", "al/job-1^"]),
+        git_on_origin(&tmp, &["rev-parse", "al/job-1^"]),
         earlier,
         "--ref was ignored"
     );
@@ -290,10 +389,39 @@ async fn a_job_branches_from_the_ref_it_is_given() {
         .assert()
         .success();
     assert_eq!(
-        git(&tmp, &["rev-parse", "al/job-2^"]),
+        git_on_origin(&tmp, &["rev-parse", "al/job-2^"]),
         git(&tmp, &["rev-parse", "main"]),
         "the default base ref is not the checked-out branch"
     );
+
+    discard_worktrees(&tmp);
+}
+
+#[tokio::test]
+async fn a_detached_head_is_asked_to_name_its_ref() {
+    let tmp = repo_running("fake-agent.sh").await;
+    git(&tmp, &["checkout", "--detach"]);
+
+    assembly(&tmp)
+        .args(["run", "--prompt", "x"])
+        .assert()
+        .code(2)
+        .stderr(contains("--ref"));
+
+    discard_worktrees(&tmp);
+}
+
+#[tokio::test]
+async fn unpushed_local_work_is_pointed_out_and_the_remotes_ref_is_used() {
+    let tmp = repo_running("fake-agent.sh").await;
+    std::fs::write(tmp.path().join("unpushed.txt"), "mine\n").unwrap();
+    commit_all(tmp.path(), "unpushed").await.unwrap().unwrap();
+
+    assembly(&tmp)
+        .args(["run", "--prompt", "x"])
+        .assert()
+        .success()
+        .stdout(contains("push first"));
 
     discard_worktrees(&tmp);
 }
@@ -337,14 +465,14 @@ async fn a_revise_round_continues_the_branch_instead_of_starting_over() {
         .stdout(contains("round 2").and(contains("job 1: succeeded")));
 
     // Two commits on the job's branch, not one replaced by another.
-    let count: usize = git(&tmp, &["rev-list", "--count", "al/job-1"])
+    let count: usize = git_on_origin(&tmp, &["rev-list", "--count", "al/job-1"])
         .parse()
         .unwrap();
     // README, the opt-in commit, then one per round. Three would mean round 2
     // cut a fresh branch off the base instead of continuing round 1's.
     assert_eq!(count, 4, "expected base + two rounds");
 
-    let body = git(&tmp, &["show", "al/job-1:rounds.txt"]);
+    let body = git_on_origin(&tmp, &["show", "al/job-1:rounds.txt"]);
     assert!(
         body.starts_with("hi\n"),
         "round 1's line is gone, so round 2 started from scratch: {body}"
@@ -364,6 +492,8 @@ async fn revise_without_feedback_is_a_usage_error() {
     let tmp = repo_running("fake-agent.sh").await;
 
     assembly(&tmp).args(["revise", "1"]).assert().code(2);
+
+    discard_worktrees(&tmp);
 }
 
 #[tokio::test]
@@ -408,77 +538,6 @@ async fn gc_with_nothing_to_collect_says_so() {
         .assert()
         .success()
         .stdout(contains("nothing to collect"));
-
-    discard_worktrees(&tmp);
-}
-
-#[tokio::test]
-async fn gc_collects_a_jobs_worktrees_only_once_its_job_state_is_gone() {
-    let tmp = repo_running("failing-agent.sh").await;
-    assembly(&tmp)
-        .args(["run", "--prompt", "x"])
-        .assert()
-        .code(1);
-
-    let worktrees = job_worktrees(&tmp, 1);
-    assert!(
-        !worktrees.join("checkout").exists(),
-        "a job's checkout is scratch — even a failed one discards it"
-    );
-
-    // The job still exists, so its worktrees are still wanted.
-    assembly(&tmp)
-        .args(["gc"])
-        .assert()
-        .success()
-        .stdout(contains("nothing to collect"));
-    assert!(worktrees.exists());
-
-    std::fs::remove_dir_all(tmp.path().join(".assembly/jobs")).unwrap();
-
-    assembly(&tmp)
-        .args(["gc", "--dry-run"])
-        .assert()
-        .success()
-        .stdout(contains("would remove").and(contains("no state directory")));
-    assert!(worktrees.exists(), "--dry-run removed something");
-
-    assembly(&tmp)
-        .args(["gc"])
-        .assert()
-        .success()
-        .stdout(contains("removed 1"));
-    assert!(!worktrees.exists());
-
-    discard_worktrees(&tmp);
-}
-
-#[tokio::test]
-async fn gc_older_than_collects_a_live_jobs_worktrees_but_only_when_asked() {
-    let tmp = repo_running("failing-agent.sh").await;
-    assembly(&tmp)
-        .args(["run", "--prompt", "x"])
-        .assert()
-        .code(1);
-
-    let worktrees = job_worktrees(&tmp, 1);
-    assert!(worktrees.is_dir());
-
-    // The job's state is still there, so nothing is stale by default...
-    assembly(&tmp)
-        .args(["gc"])
-        .assert()
-        .success()
-        .stdout(contains("nothing to collect"));
-    assert!(worktrees.exists());
-
-    // ...but an explicit age cutoff sweeps it anyway.
-    assembly(&tmp)
-        .args(["gc", "--older-than", "0s"])
-        .assert()
-        .success()
-        .stdout(contains("untouched for"));
-    assert!(!worktrees.exists());
 
     discard_worktrees(&tmp);
 }

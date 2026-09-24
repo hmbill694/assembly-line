@@ -40,9 +40,9 @@ pub fn config_running(script: &str) -> String {
     format!("provider = \"fake\"\n{}", provider_block(script, "a"))
 }
 
-/// Turn `at` into a git repository with no commits at all — nothing for a job
-/// to branch from. The one definition of "a git repo with nothing in it".
-pub async fn init_git_repo_with_no_commits(at: &Path) {
+/// Turn `at` into a git repository with one commit, so a job has somewhere to
+/// branch from. The one definition of "a git repo with a commit in it".
+pub async fn init_git_repo(at: &Path) {
     std::fs::create_dir_all(at).unwrap();
     for args in [
         vec!["init", "--initial-branch=main"],
@@ -53,12 +53,6 @@ pub async fn init_git_repo_with_no_commits(at: &Path) {
         let out = git::run_allowing_failure(at, &args).await.unwrap();
         assert!(out.succeeded(), "git {args:?} failed: {}", out.stderr);
     }
-}
-
-/// Turn `at` into a git repository with one commit, so a job has somewhere to
-/// branch from. The one definition of "a git repo with a commit in it".
-pub async fn init_git_repo(at: &Path) {
-    init_git_repo_with_no_commits(at).await;
     std::fs::write(at.join("README.md"), "base\n").unwrap();
     commit_all(at, "initial").await.unwrap().unwrap();
 }
@@ -77,6 +71,11 @@ pub async fn add_origin(repo: &Path, origin: &Path) {
     }
 }
 
+/// Push `main` to `origin`, so the remote has something a job can start from.
+pub async fn publish_main(repo: &Path) {
+    git::push_branch(repo, "origin", "main").await.unwrap();
+}
+
 /// A bare repository with one commit, and nothing else. The tempdir *is* the
 /// repository, so `repo.path()` is the repository root.
 pub async fn repo_with_initial_commit() -> tempfile::TempDir {
@@ -90,6 +89,9 @@ pub struct Harness {
     tmp: tempfile::TempDir,
     /// The repository a job runs against.
     pub repo: PathBuf,
+    /// The bare remote the repository's `main` is published to, which every
+    /// job clones from and pushes its branch back to.
+    pub origin: PathBuf,
 }
 
 /// Worktrees live under `$HOME`. A job discards its own, but a job that dies
@@ -122,18 +124,34 @@ impl Harness {
             .unwrap()
             .unwrap();
 
-        Harness { tmp, repo }
+        let origin = tmp.path().join("origin.git");
+        add_origin(&repo, &origin).await;
+        publish_main(&repo).await;
+
+        Harness { tmp, repo, origin }
     }
 
-    pub async fn with_origin(&self) -> PathBuf {
-        let origin = self.tmp.path().join("origin.git");
-        add_origin(&self.repo, &origin).await;
-        origin
+    /// Where this harness's jobs make their scratch clones.
+    pub fn scratch_root(&self) -> PathBuf {
+        self.tmp.path().join("scratch")
     }
 
-    /// The repository's configuration as the job will read it.
-    pub async fn repo_config(&self) -> RepoConfig {
-        RepoConfig::from_ref(&self.repo, "HEAD").await.unwrap()
+    /// Whether every scratch clone a job made is gone again.
+    pub fn scratch_is_empty(&self) -> bool {
+        std::fs::read_dir(self.scratch_root()).map_or(true, |mut entries| entries.next().is_none())
+    }
+
+    /// What the remote's copy of `branch` carries at `path`, or `None`.
+    pub async fn file_on_remote_branch(&self, branch: &str, path: &str) -> Option<String> {
+        git::file_at_ref(&self.origin, branch, path).await.unwrap()
+    }
+
+    /// The files the remote's copy of `branch` carries.
+    pub async fn files_on_remote_branch(&self, branch: &str) -> String {
+        git::run_allowing_failure(&self.origin, &["ls-tree", "--name-only", "-r", branch])
+            .await
+            .unwrap()
+            .stdout
     }
 
     /// Job state lives outside the repository, so nothing a test does dirties
@@ -147,12 +165,12 @@ impl Harness {
         paths::worktree_root(&self.repo, THE_JOB).expect("HOME is set in the test environment")
     }
 
-    /// Run one job against this repository, with `prompt`, from `HEAD`.
+    /// Run one job against this repository, with `prompt`, from `main`.
     pub async fn run_job(&self, prompt: &str) -> Outcome {
         self.attempt_round(prompt, None, None, 1).await.unwrap()
     }
 
-    /// Run one job cut from a named ref rather than `HEAD`.
+    /// Run one job cut from a named ref rather than `main`.
     pub async fn run_job_from(&self, prompt: &str, base_ref: &str) -> Outcome {
         self.attempt_round(prompt, None, Some(base_ref), 1)
             .await
@@ -169,7 +187,9 @@ impl Harness {
     /// than failed jobs, and this is how a test sees the difference.
     ///
     /// `provider` and `base_ref` default to what the repository declares and
-    /// to `HEAD`; the wrappers above cover the ordinary cases.
+    /// to `main`; the wrappers above cover the ordinary cases. The start is
+    /// pinned the way `main.rs` pins it: round 1 from the remote's copy of
+    /// the base, a revise round from the remote's copy of the job's branch.
     pub async fn attempt_round(
         &self,
         prompt: &str,
@@ -177,7 +197,29 @@ impl Harness {
         base_ref: Option<&str>,
         round: u32,
     ) -> anyhow::Result<Outcome> {
-        let config = self.repo_config().await;
+        let start = match round {
+            1 => git::pinned(&self.repo, "origin", base_ref.unwrap_or("main")).await?,
+            _ => git::pinned(&self.repo, "origin", &workspace::job_branch_name(THE_JOB)).await?,
+        };
+        self.round_from(&start, prompt, provider, round).await
+    }
+
+    /// A first round from a start the test has already pinned — for a test
+    /// that needs to change the repository between pinning and running.
+    pub async fn run_from(&self, start: &git::PinnedRef, prompt: &str) -> anyhow::Result<Outcome> {
+        self.round_from(start, prompt, None, 1).await
+    }
+
+    /// Everything a round does once its start is pinned. [`Self::attempt_round`]
+    /// and [`Self::run_from`] both come through here, so the two cannot drift.
+    async fn round_from(
+        &self,
+        start: &git::PinnedRef,
+        prompt: &str,
+        provider: Option<&str>,
+        round: u32,
+    ) -> anyhow::Result<Outcome> {
+        let config = RepoConfig::from_ref(&self.repo, &start.sha).await?;
         let provider = provider
             .map(str::to_string)
             .or_else(|| config.provider.clone())
@@ -190,11 +232,12 @@ impl Harness {
             repo: self.repo.clone(),
             seed_from: self.repo.clone(),
             remote: workspace::DEFAULT_REMOTE.to_string(),
+            scratch_root: self.scratch_root(),
         };
         let spec = JobSpec {
             prompt,
             provider: &provider,
-            base_ref: base_ref.unwrap_or("HEAD"),
+            start,
             round,
         };
 

@@ -1,12 +1,9 @@
-use assembly_line::config::{REPO_CONFIG_PATH, RepoConfig};
-use assembly_line::event::{EventKind, EventLog};
+use assembly_line::config::REPO_CONFIG_PATH;
+use assembly_line::event::EventKind;
 use assembly_line::git::{self, commit_all, head_sha};
-use assembly_line::job::{JobSpec, RunOpts, run_job};
-use assembly_line::paths;
 use assembly_line::state::JobState;
-use assembly_line::workspace::{DEFAULT_REMOTE, job_branch_name};
-use support::{Harness, config_running, init_git_repo_with_no_commits, provider_block};
-use tokio_util::sync::CancellationToken;
+use assembly_line::workspace::job_branch_name;
+use support::{Harness, config_running, provider_block};
 
 mod support;
 
@@ -25,13 +22,13 @@ async fn a_job_leaves_one_branch_carrying_its_work() {
         "the agent's work should be committed"
     );
     assert!(
-        git::branch_exists(&h.repo, &job_branch_name(outcome.job_id))
+        !h.files_on_remote_branch(&job_branch_name(outcome.job_id))
             .await
-            .unwrap(),
+            .is_empty(),
         "the branch is the job's whole durable output"
     );
     assert!(
-        !h.worktree_root().join("checkout").exists(),
+        h.scratch_is_empty(),
         "the checkout is scratch and never survives"
     );
 }
@@ -45,16 +42,22 @@ async fn a_job_is_cut_from_the_ref_it_names_not_from_head() {
     git::run_allowing_failure(&h.repo, &["tag", "start-here"])
         .await
         .unwrap();
+    let pushed = git::run_allowing_failure(&h.repo, &["push", "origin", "start-here"])
+        .await
+        .unwrap();
+    assert!(pushed.succeeded(), "{}", pushed.stderr);
 
-    // The branch moves on after the ref the job will name.
+    // The branch moves on after the ref the job will name — on the remote
+    // too, so the job could only miss it by honouring the ref.
     std::fs::write(h.repo.join("later.txt"), "after\n").unwrap();
     commit_all(&h.repo, "later work").await.unwrap().unwrap();
+    support::publish_main(&h.repo).await;
     assert_ne!(head_sha(&h.repo).await.unwrap(), earlier);
 
     let outcome = h.run_job_from("go", "start-here").await;
 
     let branch = job_branch_name(outcome.job_id);
-    let parent = git::run_allowing_failure(&h.repo, &["rev-parse", &format!("{branch}^")])
+    let parent = git::run_allowing_failure(&h.origin, &["rev-parse", &format!("{branch}^")])
         .await
         .unwrap();
     assert_eq!(
@@ -63,10 +66,7 @@ async fn a_job_is_cut_from_the_ref_it_names_not_from_head() {
         "the job ignored the ref it was given"
     );
 
-    let listed = git::run_allowing_failure(&h.repo, &["ls-tree", "--name-only", "-r", &branch])
-        .await
-        .unwrap()
-        .stdout;
+    let listed = h.files_on_remote_branch(&branch).await;
     assert!(
         !listed.contains("later.txt"),
         "the job saw commits the ref it named does not carry: {listed}"
@@ -96,18 +96,9 @@ async fn a_job_obeys_the_committed_config_not_the_working_trees() {
         "the working tree's provider ran: {:?}",
         outcome.events
     );
-    let listed = git::run_allowing_failure(
-        &h.repo,
-        &[
-            "ls-tree",
-            "--name-only",
-            "-r",
-            &job_branch_name(outcome.job_id),
-        ],
-    )
-    .await
-    .unwrap()
-    .stdout;
+    let listed = h
+        .files_on_remote_branch(&job_branch_name(outcome.job_id))
+        .await;
     assert!(
         listed.contains("agent-output.txt"),
         "the committed provider did not run: {listed}"
@@ -134,13 +125,9 @@ async fn a_job_leaves_the_target_repositorys_working_tree_untouched() {
     assert!(!h.repo.join("agent-output.txt").exists());
     assert!(!git::is_dirty(&h.repo).await.unwrap());
 
-    let listed = git::run_allowing_failure(
-        &h.repo,
-        &["ls-tree", "--name-only", &job_branch_name(outcome.job_id)],
-    )
-    .await
-    .unwrap()
-    .stdout;
+    let listed = h
+        .files_on_remote_branch(&job_branch_name(outcome.job_id))
+        .await;
     assert!(listed.contains("agent-output.txt"), "{listed}");
 }
 
@@ -151,16 +138,10 @@ async fn the_prompt_reaches_the_agent_intact() {
     let prompt = "quotes \" and $HOME and ; semicolons";
     let outcome = h.run_job(prompt).await;
 
-    let content = git::run_allowing_failure(
-        &h.repo,
-        &[
-            "show",
-            &format!("{}:agent-output.txt", job_branch_name(outcome.job_id)),
-        ],
-    )
-    .await
-    .unwrap()
-    .stdout;
+    let content = h
+        .file_on_remote_branch(&job_branch_name(outcome.job_id), "agent-output.txt")
+        .await
+        .expect("the agent's output reached the branch");
     // Equality, not `contains`: the quote is a hazard too, and a `contains`
     // pair would pass with it stripped.
     assert_eq!(content.trim_end_matches('\n'), prompt);
@@ -187,21 +168,16 @@ async fn a_failing_agent_preserves_its_work_on_a_branch_and_leaves_no_worktree()
             .has(|k| matches!(k, EventKind::JobBranchPublished { branch: b, .. } if *b == branch))
     );
     assert!(
-        !h.worktree_root().join("checkout").exists(),
+        h.scratch_is_empty(),
         "a job's checkout is scratch — even a failed one discards it"
     );
 
     // The work is on the branch, which is what makes the failure inspectable
     // from anywhere rather than only on the machine that ran it.
-    let on_branch =
-        git::run_allowing_failure(&h.repo, &["show", "--name-only", "--format=", &branch])
-            .await
-            .unwrap();
-    assert!(on_branch.succeeded(), "{}", on_branch.stderr);
+    let on_branch = h.files_on_remote_branch(&branch).await;
     assert!(
-        on_branch.stdout.contains("partial.txt"),
-        "the agent's partial work is not on the branch: {}",
-        on_branch.stdout
+        on_branch.contains("partial.txt"),
+        "the agent's partial work is not on the branch: {on_branch}"
     );
 }
 
@@ -209,7 +185,6 @@ async fn a_failing_agent_preserves_its_work_on_a_branch_and_leaves_no_worktree()
 #[tokio::test]
 async fn a_failed_jobs_branch_reaches_the_remote() {
     let h = Harness::with_config(&config_running("failing-agent.sh")).await;
-    let origin = h.with_origin().await;
 
     let outcome = h.run_job("x").await;
 
@@ -219,7 +194,7 @@ async fn a_failed_jobs_branch_reaches_the_remote() {
     ));
 
     let on_remote = git::run_allowing_failure(
-        &origin,
+        &h.origin,
         &[
             "show",
             "--name-only",
@@ -237,14 +212,11 @@ async fn a_failed_jobs_branch_reaches_the_remote() {
     );
 }
 
-/// A remote that refuses the push must not cost the job the record of its own
-/// branch. The branch exists locally and holds the work — which is the whole
-/// durable artifact — so it is still recorded, with `pushed_to: None`, and the
-/// scratch checkout still goes.
+/// A job whose branch cannot leave the scratch clone has lost its work, and
+/// must say so rather than record a branch that exists nowhere.
 #[tokio::test]
-async fn a_refused_push_still_records_the_branch_and_still_discards_the_checkout() {
+async fn a_refused_push_fails_the_job_and_says_the_work_is_lost() {
     let h = Harness::new().await;
-    let origin = h.with_origin().await;
 
     // The remote already carries an unrelated `al/job-1`, so the job's push is
     // a non-fast-forward and git refuses it.
@@ -265,7 +237,7 @@ async fn a_refused_push_still_records_the_branch_and_still_discards_the_checkout
         &h.repo,
         &[
             "push",
-            &origin.to_string_lossy(),
+            &h.origin.to_string_lossy(),
             &format!("{unrelated}:refs/heads/al/job-1"),
         ],
     )
@@ -275,32 +247,25 @@ async fn a_refused_push_still_records_the_branch_and_still_discards_the_checkout
 
     let outcome = h.run_job("write a file").await;
 
+    assert!(!outcome.succeeded);
     assert!(
-        outcome.succeeded,
-        "a remote refusing the push is not the agent's failure: {:?}",
+        !outcome.has(|k| matches!(k, EventKind::JobBranchPublished { .. })),
+        "a branch that never left the clone was recorded as published: {:?}",
         outcome.events
     );
     assert!(
         outcome.has(
-            |k| matches!(k, EventKind::JobBranchPublished { pushed_to, .. } if pushed_to.is_none())
-        ),
-        "the branch fell out of the record when the push was refused: {:?}",
-        outcome.events
+            |k| matches!(k, EventKind::JobFailed { reason } if reason.contains("work is lost"))
+        )
     );
     assert!(
-        git::branch_exists(&h.repo, &job_branch_name(outcome.job_id))
-            .await
-            .unwrap(),
-        "the local branch is the durable artifact and must survive"
-    );
-    assert!(
-        !h.worktree_root().join("checkout").exists(),
+        h.scratch_is_empty(),
         "the checkout leaked when the push failed"
     );
 
     // Without this the test would pass for the wrong reason: it only says
     // anything if the push was actually refused.
-    let on_remote = git::run_allowing_failure(&origin, &["rev-parse", "al/job-1"])
+    let on_remote = git::run_allowing_failure(&h.origin, &["rev-parse", "al/job-1"])
         .await
         .unwrap();
     assert_eq!(
@@ -310,18 +275,18 @@ async fn a_refused_push_still_records_the_branch_and_still_discards_the_checkout
     );
 }
 
-/// With no remote configured the branch simply stays local. That is a complete
-/// outcome, not a degraded one, so it is still recorded as published.
 #[tokio::test]
-async fn publishing_without_a_remote_keeps_the_branch_local() {
+async fn a_repository_with_no_remote_has_nothing_to_clone() {
     let h = Harness::new().await;
+    // Pin while the remote exists: pinning needs it too, and this test is
+    // about the round's own check.
+    let start = git::pinned(&h.repo, "origin", "main").await.unwrap();
+    git::run_allowing_failure(&h.repo, &["remote", "remove", "origin"])
+        .await
+        .unwrap();
 
-    let outcome = h.run_job("x").await;
-
-    assert!(outcome.succeeded);
-    assert!(outcome.has(
-        |k| matches!(k, EventKind::JobBranchPublished { pushed_to, .. } if pushed_to.is_none())
-    ));
+    let err = h.run_from(&start, "x").await.unwrap_err().to_string();
+    assert!(err.contains("no 'origin' remote"), "{err}");
 }
 
 #[tokio::test]
@@ -347,18 +312,9 @@ async fn seeded_files_reach_the_agent_but_never_the_branch() {
     let outcome = h.run_job("x").await;
     assert!(outcome.succeeded);
 
-    let listed = git::run_allowing_failure(
-        &h.repo,
-        &[
-            "ls-tree",
-            "--name-only",
-            "-r",
-            &job_branch_name(outcome.job_id),
-        ],
-    )
-    .await
-    .unwrap()
-    .stdout;
+    let listed = h
+        .files_on_remote_branch(&job_branch_name(outcome.job_id))
+        .await;
     assert!(
         !listed.contains(".env"),
         "the seeded secret reached a branch: {listed}"
@@ -420,42 +376,6 @@ async fn an_unparseable_max_duration_stops_the_job_before_it_starts() {
     assert!(err.contains("soon"), "{err}");
 }
 
-/// Reachable only from a library caller. Through the CLI, `RepoConfig::from_ref`
-/// fails first — a commitless repository carries no ref to read a config from —
-/// so this guard is what protects `run_job`'s own contract.
-#[tokio::test]
-async fn a_repository_with_no_commits_has_nothing_to_branch_from() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("repo");
-    init_git_repo_with_no_commits(&repo).await;
-
-    // Built by hand rather than read from a ref, for the reason above.
-    let config =
-        RepoConfig::parse("provider = \"fake\"\n[providers.fake]\ncmd = \"true\"\n").unwrap();
-    let paths = paths::create_job(&paths::jobs_root(tmp.path()), 1).unwrap();
-    let mut log = EventLog::open_append(paths.events()).unwrap();
-
-    let opts = RunOpts {
-        cancel: CancellationToken::new(),
-        repo: repo.clone(),
-        seed_from: repo,
-        remote: DEFAULT_REMOTE.to_string(),
-    };
-    let spec = JobSpec {
-        prompt: "x",
-        provider: "fake",
-        base_ref: "HEAD",
-        round: 1,
-    };
-
-    let err = run_job(&config, &spec, &paths, &mut log, &opts)
-        .await
-        .expect_err("a repository with no commits is not a job that failed")
-        .to_string();
-
-    assert!(err.contains("no commits"), "{err}");
-}
-
 /// The heart of the stateless design: a revise round is a new job that sees
 /// its prior work because that work *is* the branch it starts from. Nothing
 /// was kept on disk between the rounds.
@@ -470,10 +390,10 @@ async fn a_revise_round_continues_the_branch_instead_of_starting_over() {
     assert!(second.succeeded);
 
     let branch = job_branch_name(second.job_id);
-    let body = git::run_allowing_failure(&h.repo, &["show", &format!("{branch}:rounds.txt")])
+    let body = h
+        .file_on_remote_branch(&branch, "rounds.txt")
         .await
-        .unwrap()
-        .stdout;
+        .unwrap_or_default();
     assert!(
         body.starts_with("hi\n"),
         "round 1's line is gone, so round 2 started from scratch: {body}"

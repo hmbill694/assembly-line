@@ -1,38 +1,49 @@
-use assembly_line::git::{self, WorktreeStart, head_sha};
+use assembly_line::git::{self, PinnedRef, head_sha};
 use assembly_line::workspace::{self, job_branch_name};
 use std::path::PathBuf;
 
 mod support;
 
+/// A repository published to a bare origin, and a scratch root the test owns.
 struct Fixture {
-    _tmp: tempfile::TempDir,
+    tmp: tempfile::TempDir,
     repo: PathBuf,
-    seed: PathBuf,
-    wt_root: PathBuf,
+    origin: PathBuf,
 }
 
 impl Fixture {
     async fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        let seed = tmp.path().join("seed");
-        let wt_root = tmp.path().join("wt");
-        std::fs::create_dir_all(&seed).unwrap();
-        std::fs::create_dir_all(&wt_root).unwrap();
         support::init_git_repo(&repo).await;
-
-        Fixture {
-            _tmp: tmp,
-            repo,
-            seed,
-            wt_root,
-        }
+        let origin = tmp.path().join("origin.git");
+        support::add_origin(&repo, &origin).await;
+        support::publish_main(&repo).await;
+        Fixture { tmp, repo, origin }
     }
-}
 
-fn fresh_branch_at(commit: &str) -> WorktreeStart {
-    WorktreeStart::CreatingBranch {
-        at: commit.to_string(),
+    fn url(&self) -> &str {
+        self.origin.to_str().unwrap()
+    }
+
+    fn scratch(&self) -> PathBuf {
+        self.tmp.path().join("scratch")
+    }
+
+    async fn main(&self) -> PinnedRef {
+        git::pinned(&self.repo, "origin", "main").await.unwrap()
+    }
+
+    async fn workspace(&self, copy: &[String]) -> anyhow::Result<workspace::JobWorkspace> {
+        workspace::create(
+            self.url(),
+            &self.main().await,
+            "al/job-1",
+            &self.repo,
+            copy,
+            self.scratch(),
+        )
+        .await
     }
 }
 
@@ -47,58 +58,52 @@ fn a_branch_name_identifies_the_job_that_produced_it() {
 }
 
 #[tokio::test]
-async fn creating_a_workspace_checks_out_the_base_commit() {
+async fn creating_a_workspace_checks_out_the_pinned_commit_on_the_jobs_branch() {
     let fx = Fixture::new().await;
-    let base = head_sha(&fx.repo).await.unwrap();
+    let ws = fx.workspace(&[]).await.unwrap();
 
-    let ws = workspace::create(
-        &fx.repo,
-        fx.wt_root.join("impl-auth"),
-        "al/job-1",
-        &fresh_branch_at(&base),
-        &fx.seed,
-        &[],
-    )
-    .await
-    .unwrap();
-
+    assert_eq!(head_sha(ws.path()).await.unwrap(), fx.main().await.sha);
     assert_eq!(
-        head_sha(&ws.path).await.unwrap(),
-        base,
-        "the checkout should start at the commit it was given"
+        git::current_branch(ws.path()).await.unwrap().as_deref(),
+        Some("al/job-1")
     );
-    assert!(ws.path.join("README.md").is_file());
-    assert_eq!(ws.branch, "al/job-1");
-    assert!(ws.seeded.is_empty());
+    assert!(ws.path().starts_with(fx.scratch()));
+}
+
+/// Agent work is never attributed to a person — not the repository's
+/// configured author, nor whoever's global config the clone happens to see.
+#[tokio::test]
+async fn a_workspace_commits_as_assembly_line() {
+    let fx = Fixture::new().await;
+    let ws = fx.workspace(&[]).await.unwrap();
+
+    std::fs::write(ws.path().join("work.txt"), "did the work\n").unwrap();
+    workspace::commit(&ws, "work").await.unwrap().unwrap();
+
+    let author = git::run_allowing_failure(ws.path(), &["log", "-1", "--format=%an <%ae>"])
+        .await
+        .unwrap()
+        .stdout;
+    assert_eq!(author.trim(), "assembly-line <assembly-line@localhost>");
 }
 
 #[tokio::test]
 async fn seeded_files_are_copied_in_and_kept_out_of_the_commit() {
     let fx = Fixture::new().await;
-    std::fs::write(fx.seed.join(".env"), "API_KEY=hunter2\n").unwrap();
-    let base = head_sha(&fx.repo).await.unwrap();
+    std::fs::write(fx.repo.join(".env"), "API_KEY=hunter2\n").unwrap();
 
-    let ws = workspace::create(
-        &fx.repo,
-        fx.wt_root.join("n"),
-        "al/job-1",
-        &fresh_branch_at(&base),
-        &fx.seed,
-        &[".env".to_string()],
-    )
-    .await
-    .unwrap();
+    let ws = fx.workspace(&[".env".to_string()]).await.unwrap();
 
     assert_eq!(
-        std::fs::read_to_string(ws.path.join(".env")).unwrap(),
+        std::fs::read_to_string(ws.path().join(".env")).unwrap(),
         "API_KEY=hunter2\n",
         "the agent must be able to read it"
     );
 
-    std::fs::write(ws.path.join("work.txt"), "did the work\n").unwrap();
+    std::fs::write(ws.path().join("work.txt"), "did the work\n").unwrap();
     workspace::commit(&ws, "node work").await.unwrap().unwrap();
 
-    let tracked = git::run_allowing_failure(&ws.path, &["ls-files"])
+    let tracked = git::run_allowing_failure(ws.path(), &["ls-files"])
         .await
         .unwrap()
         .stdout;
@@ -112,61 +117,37 @@ async fn seeded_files_are_copied_in_and_kept_out_of_the_commit() {
 #[tokio::test]
 async fn seeding_preserves_nested_paths() {
     let fx = Fixture::new().await;
-    std::fs::create_dir_all(fx.seed.join(".claude")).unwrap();
-    std::fs::write(fx.seed.join(".claude/settings.local.json"), "{}\n").unwrap();
-    let base = head_sha(&fx.repo).await.unwrap();
+    std::fs::create_dir_all(fx.repo.join(".claude")).unwrap();
+    std::fs::write(fx.repo.join(".claude/settings.local.json"), "{}\n").unwrap();
 
-    let ws = workspace::create(
-        &fx.repo,
-        fx.wt_root.join("n"),
-        "al/job-1",
-        &fresh_branch_at(&base),
-        &fx.seed,
-        &[".claude/settings.local.json".to_string()],
-    )
-    .await
-    .unwrap();
+    let ws = fx
+        .workspace(&[".claude/settings.local.json".to_string()])
+        .await
+        .unwrap();
 
-    assert!(ws.path.join(".claude/settings.local.json").is_file());
+    assert!(ws.path().join(".claude/settings.local.json").is_file());
 }
 
 #[tokio::test]
-async fn a_missing_seed_path_names_the_file_and_leaves_no_worktree() {
+async fn a_missing_seed_path_names_the_file_and_leaves_no_checkout() {
     let fx = Fixture::new().await;
-    let base = head_sha(&fx.repo).await.unwrap();
-    let path = fx.wt_root.join("n");
 
-    let err = workspace::create(
-        &fx.repo,
-        &path,
-        "al/job-1",
-        &fresh_branch_at(&base),
-        &fx.seed,
-        &["nope.env".to_string()],
-    )
-    .await
-    .unwrap_err()
-    .to_string();
+    let err = fx
+        .workspace(&["nope.env".to_string()])
+        .await
+        .unwrap_err()
+        .to_string();
 
     assert!(err.contains("nope.env"), "{err}");
-    assert!(!path.exists(), "a typo should cost nothing");
-    assert!(!git::branch_exists(&fx.repo, "al/job-1").await.unwrap());
+    let scratch_is_empty =
+        std::fs::read_dir(fx.scratch()).map_or(true, |mut entries| entries.next().is_none());
+    assert!(scratch_is_empty, "a typo should cost nothing");
 }
 
 #[tokio::test]
 async fn committing_an_untouched_workspace_produces_nothing() {
     let fx = Fixture::new().await;
-    let base = head_sha(&fx.repo).await.unwrap();
-    let ws = workspace::create(
-        &fx.repo,
-        fx.wt_root.join("n"),
-        "al/job-1",
-        &fresh_branch_at(&base),
-        &fx.seed,
-        &[],
-    )
-    .await
-    .unwrap();
+    let ws = fx.workspace(&[]).await.unwrap();
 
     assert!(
         workspace::commit(&ws, "nothing happened")
@@ -178,148 +159,58 @@ async fn committing_an_untouched_workspace_produces_nothing() {
 }
 
 #[tokio::test]
-async fn discarding_a_workspace_removes_it_but_keeps_the_branch() {
+async fn discarding_a_workspace_removes_it_and_the_published_branch_survives() {
     let fx = Fixture::new().await;
-    let base = head_sha(&fx.repo).await.unwrap();
-    let ws = workspace::create(
-        &fx.repo,
-        fx.wt_root.join("n"),
-        "al/job-1",
-        &fresh_branch_at(&base),
-        &fx.seed,
-        &[],
-    )
-    .await
-    .unwrap();
+    let ws = fx.workspace(&[]).await.unwrap();
+    std::fs::write(ws.path().join("work.txt"), "done\n").unwrap();
+    let sha = workspace::commit(&ws, "work").await.unwrap().unwrap();
+    workspace::publish(&ws).await.unwrap();
+    let path = ws.path().to_path_buf();
 
-    workspace::discard(&fx.repo, &ws).await.unwrap();
+    workspace::discard(ws).unwrap();
 
-    assert!(!ws.path.exists());
-    assert!(
-        git::branch_exists(&fx.repo, "al/job-1").await.unwrap(),
-        "the branch is the record of the work; only the checkout is disposable"
-    );
+    assert!(!path.exists());
+    let on_remote = git::run_allowing_failure(&fx.origin, &["rev-parse", "al/job-1"])
+        .await
+        .unwrap();
+    assert_eq!(on_remote.stdout.trim(), sha);
 }
 
 /// What a revise round does: the checkout from the last round is long gone,
 /// but continuing the branch puts that work back on disk. This is the whole
-/// mechanism by which an agent revises rather than restarts — no worktree had
+/// mechanism by which an agent revises rather than restarts — no checkout had
 /// to be kept alive to make it happen.
 #[tokio::test]
 async fn continuing_a_branch_restores_the_previous_rounds_work() {
     let fx = Fixture::new().await;
-    let base = head_sha(&fx.repo).await.unwrap();
-    let path = fx.wt_root.join("n");
+    let first = fx.workspace(&[]).await.unwrap();
+    std::fs::write(first.path().join("rounds.txt"), "one\n").unwrap();
+    workspace::commit(&first, "round 1").await.unwrap().unwrap();
+    workspace::publish(&first).await.unwrap();
+    workspace::discard(first).unwrap();
 
-    let round_one = workspace::create(
-        &fx.repo,
-        &path,
-        "al/job-1",
-        &fresh_branch_at(&base),
-        &fx.seed,
-        &[],
-    )
-    .await
-    .unwrap();
-    std::fs::write(round_one.path.join("work.txt"), "round one\n").unwrap();
-    let first_sha = workspace::commit(&round_one, "round 1")
+    let tip = git::pinned(&fx.repo, "origin", "al/job-1").await.unwrap();
+    let second = workspace::create(fx.url(), &tip, "al/job-1", &fx.repo, &[], fx.scratch())
         .await
-        .unwrap()
         .unwrap();
-    workspace::discard(&fx.repo, &round_one).await.unwrap();
-    assert!(!path.exists(), "the round's scratch is gone");
-
-    let round_two = workspace::create(
-        &fx.repo,
-        &path,
-        "al/job-1",
-        &WorktreeStart::OnExistingBranch {
-            tip: first_sha.clone(),
-        },
-        &fx.seed,
-        &[],
-    )
-    .await
-    .unwrap();
 
     assert_eq!(
-        std::fs::read_to_string(round_two.path.join("work.txt")).unwrap(),
-        "round one\n",
+        std::fs::read_to_string(second.path().join("rounds.txt")).unwrap(),
+        "one\n",
         "the agent cannot revise work it cannot see"
     );
-    assert_eq!(head_sha(&round_two.path).await.unwrap(), first_sha);
 }
 
 #[tokio::test]
-async fn a_second_attempt_supersedes_the_worktree_and_branch_of_the_first() {
-    // A job that died mid-round can orphan a checkout, and its branch outlives
-    // that. Git will reuse neither name, so a fresh attempt has to clear both —
-    // otherwise it fails on the sandbox instead of on the work.
+async fn a_refused_publish_names_the_branch_and_what_was_lost() {
     let fx = Fixture::new().await;
-    let base = head_sha(&fx.repo).await.unwrap();
-    let path = fx.wt_root.join("n");
+    let ws = fx.workspace(&[]).await.unwrap();
+    std::fs::write(ws.path().join("work.txt"), "done\n").unwrap();
+    workspace::commit(&ws, "work").await.unwrap().unwrap();
+    // A remote that no longer exists refuses every attempt.
+    std::fs::remove_dir_all(&fx.origin).unwrap();
 
-    let first = workspace::create(
-        &fx.repo,
-        &path,
-        "al/job-1",
-        &fresh_branch_at(&base),
-        &fx.seed,
-        &[],
-    )
-    .await
-    .unwrap();
-    std::fs::write(first.path.join("attempt.txt"), "first try\n").unwrap();
-    workspace::commit(&first, "first attempt").await.unwrap();
-
-    let second = workspace::create(
-        &fx.repo,
-        &path,
-        "al/job-1",
-        &fresh_branch_at(&base),
-        &fx.seed,
-        &[],
-    )
-    .await
-    .unwrap();
-
-    assert!(
-        !second.path.join("attempt.txt").exists(),
-        "the second attempt inherited the first attempt's work"
-    );
-    assert_eq!(head_sha(&second.path).await.unwrap(), base);
-}
-
-#[tokio::test]
-async fn a_branch_left_without_its_worktree_does_not_block_the_next_attempt() {
-    // `gc` removes checkouts but never branches, so this is the state a
-    // collected run leaves behind.
-    let fx = Fixture::new().await;
-    let base = head_sha(&fx.repo).await.unwrap();
-    let path = fx.wt_root.join("n");
-
-    let first = workspace::create(
-        &fx.repo,
-        &path,
-        "al/job-1",
-        &fresh_branch_at(&base),
-        &fx.seed,
-        &[],
-    )
-    .await
-    .unwrap();
-    workspace::discard(&fx.repo, &first).await.unwrap();
-    assert!(git::branch_exists(&fx.repo, "al/job-1").await.unwrap());
-
-    let second = workspace::create(
-        &fx.repo,
-        &path,
-        "al/job-1",
-        &fresh_branch_at(&base),
-        &fx.seed,
-        &[],
-    )
-    .await
-    .unwrap();
-    assert!(second.path.join("README.md").is_file());
+    let err = workspace::publish(&ws).await.unwrap_err().to_string();
+    assert!(err.contains("al/job-1"), "{err}");
+    assert!(err.contains("work is lost"), "{err}");
 }

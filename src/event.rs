@@ -22,15 +22,16 @@ pub enum EventKind {
         insertions: usize,
         deletions: usize,
     },
-    /// The branch was made durable. `pushed_to` names the remote it reached,
-    /// or is `None` when the branch stayed a local ref — because the
-    /// repository has no such remote, or because the remote refused the push.
-    /// Both are complete outcomes, not degraded ones: the branch exists and
-    /// holds the work.
+    /// The branch reached the remote. `pushed_to` names it.
     ///
-    /// Emitted for failed jobs too, and whatever became of the push. A job
-    /// leaves nothing but its branch, so this is what makes the work findable
-    /// at all.
+    /// `pushed_to` is an `Option` only so logs written before F2 still
+    /// parse: those recorded `None` for a branch that stayed a local ref.
+    /// Since F2 a job's only local ref is in a scratch clone deleted with
+    /// it, so a branch that cannot be pushed fails the round instead, and
+    /// every new log carries `Some`.
+    ///
+    /// Emitted for failed jobs too. A job leaves nothing but its branch, so
+    /// this is what makes the work findable at all.
     JobBranchPublished {
         branch: String,
         pushed_to: Option<String>,

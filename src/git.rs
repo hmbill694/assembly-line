@@ -1,7 +1,7 @@
 //! Git operations, run as subprocesses.
 //!
 //! Two rules shape this module. The user's working tree is never touched — all
-//! writes happen in worktrees assembly-line creates elsewhere. And every
+//! writes happen in scratch clones assembly-line creates elsewhere. And every
 //! operation names the repository or worktree it acts on, so nothing depends
 //! on the process's current directory.
 //!
@@ -61,6 +61,7 @@ pub async fn run_allowing_failure(
         // pinning the locale keeps any incidental output predictable too.
         .env("LC_ALL", "C")
         .current_dir(dir.as_ref())
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| anyhow::anyhow!("running `git {}`: {e}", args.join(" ")))?;
@@ -86,16 +87,9 @@ pub async fn head_sha(repo: impl AsRef<Path>) -> anyhow::Result<String> {
     run_expecting_success(repo, &["rev-parse", "HEAD"], "rev-parse HEAD").await
 }
 
-/// The commit `git_ref` names — a branch, a tag, `HEAD`, or a raw sha.
-///
-/// This pins the checkout to one commit rather than handing git the ref name
-/// and letting it re-resolve later. It does not, on its own, make the whole
-/// job atomic with respect to the ref: [`RepoConfig::from_ref`] resolves the
-/// same ref name earlier, to read config, and this resolves it again when the
-/// checkout starts. A branch that moves in between gives config from one
-/// commit and a tree from another — a window this function does not close.
-///
-/// [`RepoConfig::from_ref`]: crate::config::RepoConfig::from_ref
+/// The commit `git_ref` names in this repository — a branch, a tag, `HEAD`,
+/// or a raw sha. A job starts from the remote's copy of the ref instead
+/// ([`pinned`]); this local answer is only compared against it.
 pub async fn sha_at_ref(repo: impl AsRef<Path>, git_ref: &str) -> anyhow::Result<String> {
     run_expecting_success(
         repo,
@@ -130,6 +124,199 @@ pub async fn file_at_ref(
             .stdout_verbatim_or_error(&format!("show {spec}"))
             .map(Some),
     }
+}
+
+/// A ref name and the commit it named when the job was planned.
+///
+/// The name is kept because a clone fetches by name; the sha is what the job
+/// actually starts from, so config read at planning time and the tree the job
+/// runs on are the same commit even if the ref moves in between.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PinnedRef {
+    pub name: String,
+    pub sha: String,
+}
+
+/// The URL a job clones `remote` from and pushes its branch back to, or
+/// `None` when the repository has no such remote.
+///
+/// A relative path is resolved against `repo`: git reads it relative to the
+/// repository, and from a scratch clone anywhere else it names nothing.
+///
+/// # Errors
+///
+/// When `remote` pushes somewhere the job's clone cannot know about: a
+/// `remote.<name>.pushurl`, or a `url.<base>.pushInsteadOf` in the
+/// repository's own config. The clone has the fetch URL and none of the
+/// repository's config, so its push would go to the wrong place. A rewrite
+/// in global or system config is no reason to refuse: the clone reads that
+/// config too, and pushes where the user's own push would.
+pub async fn remote_url(repo: impl AsRef<Path>, remote: &str) -> anyhow::Result<Option<String>> {
+    let repo = repo.as_ref();
+    let fetched = run_allowing_failure(repo, &["remote", "get-url", remote]).await?;
+    let Some(fetch_url) = fetched
+        .succeeded()
+        .then(|| fetched.stdout.trim().to_string())
+    else {
+        return Ok(None);
+    };
+    let pushurl_key = format!("remote.{remote}.pushurl");
+    let has_pushurl = run_allowing_failure(repo, &["config", "--get-all", &pushurl_key])
+        .await?
+        .succeeded();
+    let local_rewrites = run_allowing_failure(
+        repo,
+        &[
+            "config",
+            "--local",
+            "--includes",
+            "--get-regexp",
+            r"^url\..*\.pushinsteadof$",
+        ],
+    )
+    .await?
+    .stdout;
+    let local_rewrite_of_this_url = local_rewrites
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .find(|(_, prefix)| fetch_url.starts_with(prefix))
+        .map(|(key, _)| key.to_string());
+
+    match (has_pushurl, local_rewrite_of_this_url) {
+        (true, _) => Err(anyhow::anyhow!(
+            "'{remote}' fetches from {fetch_url} but pushes elsewhere — a job clones from and \
+             pushes back to one URL, so unset {pushurl_key} or point it at the same place"
+        )),
+        (false, Some(key)) => Err(anyhow::anyhow!(
+            "'{remote}' fetches from {fetch_url} but {key} in this repository's config rewrites \
+             where it pushes — a job's clone does not see this repository's config, so its push \
+             would go to {fetch_url}; move the setting to your global config, or remove it"
+        )),
+        (false, None) => Ok(Some(reachable_from_anywhere(repo, &fetch_url))),
+    }
+}
+
+/// `url` as git reaches it from `repo`, made to mean the same from any
+/// directory: a relative path joined onto the repository, anything else as
+/// it is.
+fn reachable_from_anywhere(repo: &Path, url: &str) -> String {
+    // `host:path` is ssh's scp-like form — and a `scheme://` URL has a colon
+    // before any slash too — unless a slash comes first, making it a path.
+    let names_a_host = url
+        .split_once(':')
+        .is_some_and(|(before, _)| !before.contains('/'));
+    match names_a_host || Path::new(url).is_absolute() {
+        true => url.to_string(),
+        false => repo.join(url).to_string_lossy().into_owned(),
+    }
+}
+
+/// Fetch `git_ref` from `remote` and return the commit it names *there*.
+///
+/// Writes the fetched objects and `FETCH_HEAD` into the repository's `.git`,
+/// never its working tree.
+async fn fetched_sha(
+    repo: impl AsRef<Path>,
+    remote: &str,
+    git_ref: &str,
+) -> anyhow::Result<String> {
+    let repo = repo.as_ref();
+    run_expecting_success(
+        repo,
+        &["fetch", "--quiet", remote, git_ref],
+        &format!("fetch {remote} {git_ref}"),
+    )
+    .await?;
+    run_expecting_success(
+        repo,
+        &["rev-parse", "FETCH_HEAD^{commit}"],
+        "rev-parse FETCH_HEAD",
+    )
+    .await
+}
+
+/// Whether `remote` answered and does not carry `git_ref` — as opposed to not
+/// answering at all, which is `false`: nothing is known to be missing.
+pub async fn remote_lacks_ref(
+    repo: impl AsRef<Path>,
+    remote: &str,
+    git_ref: &str,
+) -> anyhow::Result<bool> {
+    // `--exit-code` makes "no matching ref" exit 2, distinct from the 128 of
+    // a remote that could not be read.
+    let listed = run_allowing_failure(repo, &["ls-remote", "--exit-code", remote, git_ref]).await?;
+    Ok(listed.exit_code == 2)
+}
+
+/// `git_ref` as `remote` has it, pinned to one commit.
+///
+/// # Errors
+///
+/// Beyond the usual, an error naming the ref when the remote does not carry
+/// it — a job can only start from what a clone of the remote can see. Any
+/// other fetch failure keeps git's own complaint, since pushing would not
+/// fix it.
+pub async fn pinned(
+    repo: impl AsRef<Path>,
+    remote: &str,
+    git_ref: &str,
+) -> anyhow::Result<PinnedRef> {
+    let repo = repo.as_ref();
+    match fetched_sha(repo, remote, git_ref).await {
+        Ok(sha) => Ok(PinnedRef {
+            name: git_ref.to_string(),
+            sha,
+        }),
+        Err(fetch_failure) if remote_lacks_ref(repo, remote, git_ref).await? => {
+            Err(anyhow::anyhow!(
+                "'{git_ref}' is not on '{remote}' — a job starts from a clone of the remote, \
+                 so push it first: {fetch_failure}"
+            ))
+        }
+        Err(fetch_failure) => Err(fetch_failure),
+    }
+}
+
+/// Clone `url` into the existing, empty directory `into`, without checking
+/// anything out — [`check_out_new_branch`] decides what the tree holds.
+pub async fn clone_into(url: &str, into: impl AsRef<Path>) -> anyhow::Result<()> {
+    run_expecting_success(
+        into,
+        &["clone", "--quiet", "--no-checkout", url, "."],
+        "clone",
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Create `branch` at `at` and check it out.
+pub async fn check_out_new_branch(
+    clone: impl AsRef<Path>,
+    branch: &str,
+    at: &str,
+) -> anyhow::Result<()> {
+    run_expecting_success(
+        clone,
+        &["checkout", "--quiet", "-b", branch, at],
+        &format!("checkout -b {branch}"),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Make every commit in a clone — the round's own, and any the agent makes —
+/// carry assembly-line's identity rather than a person's, whatever config
+/// the environment would otherwise supply.
+pub async fn commit_as_assembly_line(clone: impl AsRef<Path>) -> anyhow::Result<()> {
+    let clone = clone.as_ref();
+    run_expecting_success(clone, &["config", "user.name", "assembly-line"], "config").await?;
+    run_expecting_success(
+        clone,
+        &["config", "user.email", "assembly-line@localhost"],
+        "config",
+    )
+    .await
+    .map(|_| ())
 }
 
 /// The commit `branch` points at. A revise round starts here, so the agent
