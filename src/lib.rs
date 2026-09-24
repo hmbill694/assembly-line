@@ -5,6 +5,7 @@ pub mod config;
 pub mod delivery;
 pub mod event;
 pub mod exec;
+pub mod frame;
 pub mod gc;
 pub mod git;
 pub mod job;
