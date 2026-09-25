@@ -305,7 +305,11 @@ async fn a_pod_that_never_starts_fails_at_the_scheduling_deadline_with_its_reaso
     };
 
     let err = k8s
-        .launch(&h.payload_for("x").await, &JobSecrets::default())
+        .launch(
+            &h.payload_for("x").await,
+            &JobSecrets::default(),
+            &CancellationToken::new(),
+        )
         .await
         .unwrap_err()
         .to_string();
@@ -403,7 +407,11 @@ async fn collected_round(h: &Harness, k8s: &KubernetesRunner) -> (bool, Vec<Even
     let paths = h.job_paths();
     let mut log = EventLog::open_append(paths.events()).unwrap();
     let job = k8s
-        .launch(&h.payload_for("x").await, &JobSecrets::default())
+        .launch(
+            &h.payload_for("x").await,
+            &JobSecrets::default(),
+            &CancellationToken::new(),
+        )
         .await
         .unwrap();
     let outcome = tokio::time::timeout(
@@ -430,7 +438,11 @@ async fn a_job_create_that_fails_still_deletes_the_job_by_name() {
     ));
 
     let err = k8s
-        .launch(&h.payload_for("x").await, &JobSecrets::default())
+        .launch(
+            &h.payload_for("x").await,
+            &JobSecrets::default(),
+            &CancellationToken::new(),
+        )
         .await
         .unwrap_err()
         .to_string();
@@ -486,7 +498,11 @@ async fn a_launch_that_fails_after_the_job_exists_deletes_the_job() {
     ));
 
     let err = k8s
-        .launch(&h.payload_for("x").await, &JobSecrets::default())
+        .launch(
+            &h.payload_for("x").await,
+            &JobSecrets::default(),
+            &CancellationToken::new(),
+        )
         .await
         .unwrap_err()
         .to_string();
@@ -646,6 +662,53 @@ async fn a_quiet_pod_whose_connection_keeps_dropping_is_not_abandoned() {
     );
 }
 
+const PENDING_POD: &str = r#"{"items":[{"metadata":{"name":"p"},"status":{"phase":"Pending"}}]}"#;
+
+/// Ctrl-C while the pod is still `Pending` ends the launch at once, rather
+/// than after the scheduling deadline, and takes the Job and its Secret
+/// down with it.
+#[tokio::test]
+async fn cancelling_a_launch_whose_pod_is_pending_deletes_the_job_and_its_secret() {
+    let h = Harness::new().await;
+    let fakes = h.scratch_root().with_file_name("fakes");
+    let k8s = KubernetesRunner {
+        scheduling_deadline: std::time::Duration::from_secs(60),
+        ..runner(kubectl_answering(
+            &fakes,
+            &format!("cat >/dev/null; echo '{CREATED_JOB}'"),
+            &format!("echo '{PENDING_POD}'"),
+            "cat frames",
+        ))
+    };
+    let cancel = CancellationToken::new();
+    let payload = h.payload_for("x").await;
+    let interrupt = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        interrupt.cancel();
+    });
+
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        k8s.launch(&payload, &JobSecrets::default(), &cancel),
+    )
+    .await
+    .expect("the launch waited out the scheduling deadline despite the cancel")
+    .unwrap_err()
+    .to_string();
+
+    assert!(err.contains("cancelled before the pod started"), "{err}");
+    let argv = std::fs::read_to_string(fakes.join("argv")).unwrap();
+    assert!(
+        argv.contains("delete job"),
+        "the Job was left behind: {argv}"
+    );
+    assert!(
+        argv.contains("delete secret"),
+        "the credential Secret was left behind: {argv}"
+    );
+}
+
 /// Cancelling a job whose pod is running deletes both the Job and the
 /// Secret carrying its credentials.
 #[tokio::test]
@@ -660,7 +723,11 @@ async fn cancelling_a_running_job_deletes_the_job_and_its_secret() {
     ));
 
     let mut job = k8s
-        .launch(&h.payload_for("x").await, &JobSecrets::default())
+        .launch(
+            &h.payload_for("x").await,
+            &JobSecrets::default(),
+            &CancellationToken::new(),
+        )
         .await
         .unwrap();
     job.cancel().await;

@@ -5,6 +5,7 @@ use super::{JobSecrets, Runner, RunnerProblem, RunningJob, Termination, job_reso
 use crate::payload::{JobPayload, PAYLOAD_VAR};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 /// How long a cancelled container has to wind its round down — push
 /// included — before `docker stop` kills it. k8s's own default grace.
@@ -74,11 +75,12 @@ impl Runner for DockerRunner {
     }
 
     /// Spawning the client does not wait on it, so the launch is ready at
-    /// once.
+    /// once, with nothing for `cancel` to interrupt.
     fn launch(
         &self,
         payload: &JobPayload,
         secrets: &JobSecrets,
+        _cancel: &CancellationToken,
     ) -> impl Future<Output = anyhow::Result<DockerJob>> + Send {
         std::future::ready(self.spawn_docker_run(payload, secrets))
     }

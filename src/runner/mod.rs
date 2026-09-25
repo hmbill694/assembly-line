@@ -7,6 +7,7 @@ pub mod local;
 
 use crate::payload::{GIT_TOKEN_VAR, JobPayload};
 use std::collections::{BTreeMap, BTreeSet};
+use tokio_util::sync::CancellationToken;
 
 /// Where the image a container runner launches is published.
 pub const PUBLISHED_IMAGE_REPOSITORY: &str = "ghcr.io/hmbill694/assembly-line";
@@ -44,10 +45,14 @@ pub trait Runner {
     /// before a job directory is allocated.
     fn reasons_it_cannot_run(&self) -> impl Future<Output = Vec<RunnerProblem>> + Send;
 
+    /// Start the job. A runner whose launch waits — on a pod being
+    /// scheduled, say — gives up when `cancel` fires, cleaning up whatever
+    /// it had already created, so Ctrl-C reaches a job still starting.
     fn launch(
         &self,
         payload: &JobPayload,
         secrets: &JobSecrets,
+        cancel: &CancellationToken,
     ) -> impl Future<Output = anyhow::Result<Self::Running>> + Send;
 }
 

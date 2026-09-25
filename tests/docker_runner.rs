@@ -55,7 +55,10 @@ async fn a_round_in_docker_is_launched_collected_and_cleaned_up() {
     let paths = h.job_paths();
     let mut log = EventLog::open_append(paths.events()).unwrap();
 
-    let job = runner.launch(&payload, &token()).await.unwrap();
+    let job = runner
+        .launch(&payload, &token(), &CancellationToken::new())
+        .await
+        .unwrap();
     let outcome = collect(job, &mut log, &paths.log(), 1, CancellationToken::new())
         .await
         .unwrap();
@@ -93,7 +96,11 @@ async fn the_agent_sees_neither_the_git_token_nor_the_payload() {
     let mut log = EventLog::open_append(paths.events()).unwrap();
 
     let job = runner
-        .launch(&h.payload_for("x").await, &token())
+        .launch(
+            &h.payload_for("x").await,
+            &token(),
+            &CancellationToken::new(),
+        )
         .await
         .unwrap();
     collect(job, &mut log, &paths.log(), 1, CancellationToken::new())
@@ -120,7 +127,11 @@ async fn a_collector_that_cannot_write_removes_the_container_before_giving_up() 
     let unwritable = fakes.join("no-such-directory").join("job.log");
 
     let job = runner
-        .launch(&h.payload_for("x").await, &token())
+        .launch(
+            &h.payload_for("x").await,
+            &token(),
+            &CancellationToken::new(),
+        )
         .await
         .unwrap();
     let collected = collect(job, &mut log, &unwritable, 1, CancellationToken::new()).await;
@@ -163,7 +174,11 @@ async fn cancelling_stops_the_container_so_job_exec_reports_the_round() {
     });
 
     let job = runner
-        .launch(&h.payload_for("x").await, &token())
+        .launch(
+            &h.payload_for("x").await,
+            &token(),
+            &CancellationToken::new(),
+        )
         .await
         .unwrap();
     let outcome = collect(job, &mut log, &paths.log(), 1, cancel)
@@ -237,7 +252,11 @@ async fn cancelling_a_container_that_prints_as_it_stops_still_ends_the_round() {
     });
 
     let job = runner
-        .launch(&h.payload_for("x").await, &token())
+        .launch(
+            &h.payload_for("x").await,
+            &token(),
+            &CancellationToken::new(),
+        )
         .await
         .unwrap();
     let collected = tokio::time::timeout(
@@ -263,7 +282,11 @@ async fn an_oom_killed_container_is_reported_by_its_reason() {
         image: "img:1".into(),
     };
     let mut job = runner
-        .launch(&h.payload_for("x").await, &token())
+        .launch(
+            &h.payload_for("x").await,
+            &token(),
+            &CancellationToken::new(),
+        )
         .await
         .unwrap();
 

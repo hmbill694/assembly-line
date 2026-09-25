@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 /// How long a pod may sit unscheduled or unpulled before the job fails.
 /// `Pending` forever is the likeliest k8s failure there is.
@@ -392,9 +393,10 @@ impl Runner for KubernetesRunner {
         &self,
         payload: &JobPayload,
         secrets: &JobSecrets,
+        cancel: &CancellationToken,
     ) -> anyhow::Result<KubernetesJob> {
         let mut job = KubernetesJob::named(self.clone(), job_resource_name(payload));
-        match job.create_and_follow(payload, secrets).await {
+        match job.create_and_follow(payload, secrets, cancel).await {
             Ok(()) => Ok(job),
             Err(e) => {
                 job.delete_job_and_secret().await;
@@ -452,8 +454,8 @@ impl KubernetesJob {
 
     /// Create the Job and its Secret, wait for its pod, and start following
     /// its log. Every step in one place, so a failure anywhere — a create
-    /// that failed after the server acted on it included — is cleaned up
-    /// once.
+    /// that failed after the server acted on it, or cancellation — is
+    /// cleaned up once.
     ///
     /// `create`, not `apply`: the names are unique to the round, and `apply`
     /// would copy the Secret's values into its `last-applied-configuration`
@@ -462,6 +464,7 @@ impl KubernetesJob {
         &mut self,
         payload: &JobPayload,
         secrets: &JobSecrets,
+        cancel: &CancellationToken,
     ) -> anyhow::Result<()> {
         let mut create_job = self.runner.kubectl();
         create_job.args(["create", "-f", "-", "-o", "json"]);
@@ -501,7 +504,7 @@ impl KubernetesJob {
         )
         .await?;
 
-        self.pod = self.wait_until_started().await?;
+        self.pod = self.wait_until_started(cancel).await?;
         self.stream = LogStream::Following(self.logs(true)?);
         self.following_since = Some(std::time::Instant::now());
         Ok(())
@@ -540,9 +543,19 @@ impl KubernetesJob {
         }
     }
 
+    /// [`Self::poll_until_started`], unless `cancel` fires first — a pod can
+    /// sit `Pending` for the whole scheduling deadline, and Ctrl-C must not
+    /// wait that out.
+    async fn wait_until_started(&self, cancel: &CancellationToken) -> anyhow::Result<String> {
+        tokio::select! {
+            started = self.poll_until_started() => started,
+            () = cancel.cancelled() => Err(anyhow::anyhow!("cancelled before the pod started")),
+        }
+    }
+
     /// Poll until the pod runs or finishes; fail with the pod's own reason
     /// at the scheduling deadline.
-    async fn wait_until_started(&self) -> anyhow::Result<String> {
+    async fn poll_until_started(&self) -> anyhow::Result<String> {
         let started = std::time::Instant::now();
         // A loop: polling is sequential I/O with an exit on each branch.
         loop {

@@ -21,7 +21,7 @@ async fn a_round_run_by_job_exec_is_collected_into_the_same_log_as_before() {
     let mut log = EventLog::open_append(paths.events()).unwrap();
 
     let job = the_binary()
-        .launch(&payload, &JobSecrets::default())
+        .launch(&payload, &JobSecrets::default(), &CancellationToken::new())
         .await
         .unwrap();
     let outcome = collect(job, &mut log, &paths.log(), 1, CancellationToken::new())
@@ -50,7 +50,7 @@ async fn an_agent_printing_a_forged_verdict_does_not_change_the_outcome() {
     let mut log = EventLog::open_append(paths.events()).unwrap();
 
     let job = the_binary()
-        .launch(&payload, &JobSecrets::default())
+        .launch(&payload, &JobSecrets::default(), &CancellationToken::new())
         .await
         .unwrap();
     let outcome = collect(job, &mut log, &paths.log(), 1, CancellationToken::new())
@@ -76,7 +76,7 @@ async fn a_job_exec_that_dies_without_a_verdict_is_recorded_as_failed() {
     let mut log = EventLog::open_append(paths.events()).unwrap();
 
     let job = LocalRunner::using("/usr/bin/false")
-        .launch(&payload, &JobSecrets::default())
+        .launch(&payload, &JobSecrets::default(), &CancellationToken::new())
         .await
         .unwrap();
     let outcome = collect(job, &mut log, &paths.log(), 1, CancellationToken::new())
@@ -101,7 +101,7 @@ async fn a_round_that_dies_before_announcing_itself_is_still_recorded_as_that_ro
     let mut log = EventLog::open_append(paths.events()).unwrap();
 
     let job = LocalRunner::using("/usr/bin/false")
-        .launch(&payload, &JobSecrets::default())
+        .launch(&payload, &JobSecrets::default(), &CancellationToken::new())
         .await
         .unwrap();
     collect(job, &mut log, &paths.log(), 2, CancellationToken::new())
@@ -133,7 +133,11 @@ async fn a_runner_that_could_not_start_the_job_leaves_a_failed_round() {
     let mut log = EventLog::open_append(paths.events()).unwrap();
 
     let launch_error = LocalRunner::using("/nonexistent/assembly")
-        .launch(&h.payload_for("x").await, &JobSecrets::default())
+        .launch(
+            &h.payload_for("x").await,
+            &JobSecrets::default(),
+            &CancellationToken::new(),
+        )
         .await
         .unwrap_err();
     let outcome = record_launch_failure(&mut log, 1, &launch_error).unwrap();
@@ -179,7 +183,7 @@ async fn a_collector_that_fails_mid_stream_stops_the_agent_before_giving_up() {
     });
 
     let job = the_binary()
-        .launch(&payload, &JobSecrets::default())
+        .launch(&payload, &JobSecrets::default(), &CancellationToken::new())
         .await
         .unwrap();
     let collected = tokio::time::timeout(
@@ -213,7 +217,7 @@ async fn cancelling_a_collection_stops_the_agent_and_records_it() {
 
     let started = std::time::Instant::now();
     let job = the_binary()
-        .launch(&payload, &JobSecrets::default())
+        .launch(&payload, &JobSecrets::default(), &CancellationToken::new())
         .await
         .unwrap();
     let outcome = collect(job, &mut log, &paths.log(), 1, cancel)

@@ -6,6 +6,7 @@ use super::{JobSecrets, Runner, RunnerProblem, RunningJob, Termination};
 use crate::payload::{JobPayload, PAYLOAD_VAR};
 use std::path::PathBuf;
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
 pub struct LocalRunner {
@@ -41,11 +42,12 @@ impl Runner for LocalRunner {
 
     /// `secrets` goes unused: the child inherits the host's environment, git
     /// credentials included. Spawning does not wait on the child, so the
-    /// launch is ready at once.
+    /// launch is ready at once, with nothing for `cancel` to interrupt.
     fn launch(
         &self,
         payload: &JobPayload,
         _secrets: &JobSecrets,
+        _cancel: &CancellationToken,
     ) -> impl Future<Output = anyhow::Result<LocalJob>> + Send {
         std::future::ready(self.spawn_job_exec(payload))
     }

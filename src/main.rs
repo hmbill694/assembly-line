@@ -271,7 +271,8 @@ fn payload_for_runner<R: Runner>(
 
 /// Launch the round and collect it. A launch failure is a failed round, not
 /// a usage error: the job directory already exists and must say what
-/// became of it.
+/// became of it. `cancel` reaches the launch too, so Ctrl-C while a job is
+/// still starting stops it rather than waiting for it to start.
 async fn collect_round<R: Runner>(
     runner: &R,
     payload: &JobPayload,
@@ -280,7 +281,7 @@ async fn collect_round<R: Runner>(
     output_log: &Path,
     cancel: CancellationToken,
 ) -> anyhow::Result<JobOutcome> {
-    match runner.launch(payload, secrets).await {
+    match runner.launch(payload, secrets, &cancel).await {
         Ok(job) => collect(job, log, output_log, payload.round, cancel).await,
         Err(e) => record_launch_failure(log, payload.round, &e),
     }
