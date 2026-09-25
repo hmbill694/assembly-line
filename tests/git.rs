@@ -143,7 +143,7 @@ async fn seeded_files_stay_on_disk_but_out_of_the_commit() {
     std::fs::write(node.join(".env"), "API_KEY=hunter2\n").unwrap();
     std::fs::write(node.join("code.txt"), "real work\n").unwrap();
 
-    commit_all_except(&node, "work", &[".env".to_string()])
+    commit_all_except(&node, "work", &[".env".to_string()], &fx.base().await)
         .await
         .unwrap()
         .expect("a commit");
@@ -171,7 +171,7 @@ async fn a_commit_containing_only_seeded_files_is_no_commit_at_all() {
     std::fs::write(node.join(".env"), "API_KEY=hunter2\n").unwrap();
 
     assert!(
-        commit_all_except(&node, "work", &[".env".to_string()])
+        commit_all_except(&node, "work", &[".env".to_string()], &fx.base().await)
             .await
             .unwrap()
             .is_none(),
@@ -195,7 +195,198 @@ async fn a_secret_committed_by_the_agent_fails_the_job() {
         .unwrap();
 
     std::fs::write(node.join("more.txt"), "later work\n").unwrap();
-    let err = commit_all_except(&node, "work", &[".env".to_string()])
+    let err = commit_all_except(&node, "work", &[".env".to_string()], &fx.base().await)
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains(".env"), "{err}");
+}
+
+/// A secret the agent committed and then untracked again is no longer in the
+/// index, but it is still in history — which is what reaches the remote.
+#[tokio::test]
+async fn a_secret_the_agent_committed_and_then_removed_still_fails_the_job() {
+    let fx = Fixture::new().await;
+    let node = fx.clone_on_branch("agent-hides", "al/job-6").await;
+
+    std::fs::write(node.join(".env"), "API_KEY=hunter2\n").unwrap();
+    for args in [
+        ["add", ".env"].as_slice(),
+        &["commit", "--no-verify", "-m", "leak"],
+        &["rm", "--cached", "--quiet", ".env"],
+        &["commit", "--no-verify", "-m", "hide"],
+    ] {
+        git::run_allowing_failure(&node, args).await.unwrap();
+    }
+
+    std::fs::write(node.join("more.txt"), "later work\n").unwrap();
+    let err = commit_all_except(&node, "work", &[".env".to_string()], &fx.base().await)
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains(".env"), "{err}");
+}
+
+/// A side branch that adds the secret and deletes it again changes nothing
+/// about the path once merged — but the merge carries the side branch's
+/// commits, secret included, to the remote.
+#[tokio::test]
+async fn a_secret_committed_on_a_merged_side_branch_still_fails_the_job() {
+    let fx = Fixture::new().await;
+    let node = fx.clone_on_branch("agent-merges", "al/job-7").await;
+
+    std::fs::write(node.join(".env"), "API_KEY=hunter2\n").unwrap();
+    std::fs::write(node.join("mainline.txt"), "mainline work\n").unwrap();
+    for args in [
+        ["checkout", "--quiet", "-b", "side"].as_slice(),
+        &["add", ".env"],
+        &["commit", "--no-verify", "-m", "leak"],
+        &["rm", "--cached", "--quiet", ".env"],
+        &["commit", "--no-verify", "-m", "hide"],
+        &["checkout", "--quiet", "al/job-7"],
+        &["add", "mainline.txt"],
+        &["commit", "--no-verify", "-m", "mainline"],
+        &["merge", "--no-ff", "-m", "merge", "side"],
+    ] {
+        git::run_allowing_failure(&node, args).await.unwrap();
+    }
+
+    std::fs::write(node.join("more.txt"), "later work\n").unwrap();
+    let err = commit_all_except(&node, "work", &[".env".to_string()], &fx.base().await)
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains(".env"), "{err}");
+}
+
+/// A merge commit can introduce a file neither parent has, and a log shows no
+/// diff for a merge unless asked to.
+#[tokio::test]
+async fn a_secret_introduced_by_a_merge_commit_itself_fails_the_job() {
+    let fx = Fixture::new().await;
+    let node = fx.clone_on_branch("agent-evil-merge", "al/job-8").await;
+
+    std::fs::write(node.join("side.txt"), "side work\n").unwrap();
+    for args in [
+        ["checkout", "--quiet", "-b", "side"].as_slice(),
+        &["add", "side.txt"],
+        &["commit", "--no-verify", "-m", "side"],
+        &["checkout", "--quiet", "al/job-8"],
+        &["merge", "--quiet", "--no-ff", "--no-commit", "side"],
+    ] {
+        git::run_allowing_failure(&node, args).await.unwrap();
+    }
+    std::fs::write(node.join(".env"), "API_KEY=hunter2\n").unwrap();
+    for args in [
+        ["add", ".env"].as_slice(),
+        &["commit", "--no-verify", "-m", "merge"],
+    ] {
+        git::run_allowing_failure(&node, args).await.unwrap();
+    }
+
+    std::fs::write(node.join("more.txt"), "later work\n").unwrap();
+    let err = commit_all_except(&node, "work", &[".env".to_string()], &fx.base().await)
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains(".env"), "{err}");
+}
+
+/// A replace ref changes what the clone shows for a commit, not what a push
+/// sends — so a leaking commit dressed up as a clean one still leaks.
+#[tokio::test]
+async fn a_secret_behind_a_replace_ref_still_fails_the_job() {
+    let fx = Fixture::new().await;
+    let base = fx.base().await;
+    let node = fx.clone_on_branch("agent-replaces", "al/job-9").await;
+
+    std::fs::write(node.join(".env"), "API_KEY=hunter2\n").unwrap();
+    for args in [
+        ["add", ".env"].as_slice(),
+        &["commit", "--no-verify", "-m", "leak"],
+        &["rm", "--cached", "--quiet", ".env"],
+        &["commit", "--no-verify", "-m", "hide"],
+    ] {
+        git::run_allowing_failure(&node, args).await.unwrap();
+    }
+    let disguise = git::run_allowing_failure(
+        &node,
+        &["commit-tree", "-p", &base, "-m", "leak", "HEAD^{tree}"],
+    )
+    .await
+    .unwrap();
+    assert!(disguise.succeeded(), "{}", disguise.stderr);
+    git::run_allowing_failure(&node, &["replace", "HEAD~1", disguise.stdout.trim()])
+        .await
+        .unwrap();
+
+    let err = commit_all_except(&node, "work", &[".env".to_string()], &base)
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains(".env"), "{err}");
+}
+
+/// The clone's config is the agent's to write, and `log.diffMerges=off`
+/// would hide a merge that adds the secret and another that removes it.
+#[tokio::test]
+async fn a_secret_merged_in_and_out_under_the_agents_config_still_fails_the_job() {
+    let fx = Fixture::new().await;
+    let node = fx.clone_on_branch("agent-configures", "al/job-10").await;
+
+    for args in [
+        ["config", "log.diffMerges", "off"].as_slice(),
+        &["checkout", "--quiet", "-b", "in"],
+        &["commit", "--no-verify", "--allow-empty", "-m", "in"],
+        &["checkout", "--quiet", "-b", "out"],
+        &["commit", "--no-verify", "--allow-empty", "-m", "out"],
+        &["checkout", "--quiet", "al/job-10"],
+        &["merge", "--quiet", "--no-ff", "--no-commit", "in"],
+    ] {
+        git::run_allowing_failure(&node, args).await.unwrap();
+    }
+    std::fs::write(node.join(".env"), "API_KEY=hunter2\n").unwrap();
+    for args in [
+        ["add", ".env"].as_slice(),
+        &["commit", "--no-verify", "-m", "merge in"],
+        &["merge", "--quiet", "--no-ff", "--no-commit", "out"],
+        &["rm", "--cached", "--quiet", ".env"],
+        &["commit", "--no-verify", "-m", "merge out"],
+    ] {
+        git::run_allowing_failure(&node, args).await.unwrap();
+    }
+
+    let err = commit_all_except(&node, "work", &[".env".to_string()], &fx.base().await)
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains(".env"), "{err}");
+}
+
+/// A root commit has no parent to differ from, and `log.showRoot=false` would
+/// show it as touching nothing.
+#[tokio::test]
+async fn a_secret_in_an_orphan_root_commit_still_fails_the_job() {
+    let fx = Fixture::new().await;
+    let node = fx.clone_on_branch("agent-orphans", "al/job-11").await;
+
+    std::fs::write(node.join(".env"), "API_KEY=hunter2\n").unwrap();
+    for args in [
+        ["config", "log.showRoot", "false"].as_slice(),
+        &["checkout", "--quiet", "--orphan", "rootless"],
+        &["add", ".env"],
+        &["commit", "--no-verify", "-m", "root"],
+    ] {
+        git::run_allowing_failure(&node, args).await.unwrap();
+    }
+
+    let err = commit_all_except(&node, "work", &[".env".to_string()], &fx.base().await)
         .await
         .unwrap_err()
         .to_string();
@@ -251,7 +442,9 @@ async fn pushing_a_branch_puts_it_on_the_remote() {
     write_and_commit(&node, "work.txt", "done\n", "node work").await;
 
     assert!(!remote_carries(&origin, "al/job-1").await);
-    git::push_branch(&node, "origin", "al/job-1").await.unwrap();
+    git::push_head_as(&node, "origin", "al/job-1")
+        .await
+        .unwrap();
     assert!(remote_carries(&origin, "al/job-1").await);
 }
 
@@ -266,10 +459,14 @@ async fn pushing_a_branch_again_after_another_commit_fast_forwards() {
     let node = clone_checked_out(&origin, &fx.clones, "node", "al/job-1", &base).await;
 
     write_and_commit(&node, "work.txt", "round one\n", "round 1").await;
-    git::push_branch(&node, "origin", "al/job-1").await.unwrap();
+    git::push_head_as(&node, "origin", "al/job-1")
+        .await
+        .unwrap();
 
     let second = write_and_commit(&node, "work.txt", "round two\n", "round 2").await;
-    git::push_branch(&node, "origin", "al/job-1").await.unwrap();
+    git::push_head_as(&node, "origin", "al/job-1")
+        .await
+        .unwrap();
 
     let on_remote = git::run_allowing_failure(&origin, &["rev-parse", "al/job-1"])
         .await
@@ -284,7 +481,9 @@ async fn a_remotes_branches_are_listed_by_pattern_without_their_prefix() {
     support::publish_main(&fx.repo).await;
     let base = fx.base().await;
     let node = clone_checked_out(&origin, &fx.clones, "node", "al/job-3", &base).await;
-    git::push_branch(&node, "origin", "al/job-3").await.unwrap();
+    git::push_head_as(&node, "origin", "al/job-3")
+        .await
+        .unwrap();
 
     let jobs = git::remote_branches_matching(&fx.repo, "origin", "al/job-*")
         .await
@@ -305,7 +504,7 @@ async fn pushing_to_a_remote_that_does_not_exist_names_it() {
         .await
         .unwrap();
 
-    let err = git::push_branch(&fx.repo, "origin", "al/job-1")
+    let err = git::push_head_as(&fx.repo, "origin", "al/job-1")
         .await
         .unwrap_err()
         .to_string();

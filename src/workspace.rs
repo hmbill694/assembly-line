@@ -14,6 +14,9 @@ pub struct JobWorkspace {
     pub branch: String,
     /// Relative paths copied in, which must never reach a commit.
     seeded: Vec<String>,
+    /// The commit the branch was checked out at — every commit since is
+    /// this round's.
+    started_at: String,
 }
 
 impl JobWorkspace {
@@ -94,6 +97,7 @@ pub async fn create(
         dir,
         branch: branch.to_string(),
         seeded: copy_paths.to_vec(),
+        started_at: start.sha.clone(),
     })
 }
 
@@ -116,13 +120,20 @@ fn seed_files(into: &Path, seed_from: &Path, copy_paths: &[String]) -> anyhow::R
     })
 }
 
-/// `None` means the agent changed nothing.
+/// Commit what the agent left uncommitted, and return the commit the round
+/// ends on. `None` means the round made nothing: the agent changed nothing
+/// and committed nothing. An agent that committed its own work and left the
+/// tree clean still has work to publish.
 ///
 /// # Errors
 ///
 /// See [`git::commit_all_except`].
 pub async fn commit(ws: &JobWorkspace, message: &str) -> anyhow::Result<Option<String>> {
-    git::commit_all_except(ws.path(), message, &ws.seeded).await
+    git::commit_all_except(ws.path(), message, &ws.seeded, &ws.started_at).await?;
+    match git::head_is_ahead_of(ws.path(), &ws.started_at).await? {
+        true => git::head_sha(ws.path()).await.map(Some),
+        false => Ok(None),
+    }
 }
 
 /// Waits before each push attempt. A transient network failure is worth
@@ -133,7 +144,8 @@ const PUSH_BACKOFF: [Duration; 3] = [
     Duration::from_secs(2),
 ];
 
-/// Push the job's branch to the clone's `origin`.
+/// Push the commit the clone ends on to the clone's `origin`, as the job's
+/// branch.
 ///
 /// A loop rather than a combinator: each attempt is sequential I/O, and the
 /// first success ends it.
@@ -147,7 +159,7 @@ pub async fn publish(ws: &JobWorkspace) -> anyhow::Result<()> {
     let mut last_failure = None;
     for wait in PUSH_BACKOFF {
         tokio::time::sleep(wait).await;
-        match git::push_branch(ws.path(), CLONE_REMOTE, &ws.branch).await {
+        match git::push_head_as(ws.path(), CLONE_REMOTE, &ws.branch).await {
             Ok(()) => return Ok(()),
             Err(e) => last_failure = Some(e),
         }

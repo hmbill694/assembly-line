@@ -90,7 +90,7 @@ pub async fn add_origin(repo: &Path, origin: &Path) {
 
 /// Push `main` to `origin`, so the remote has something a job can start from.
 pub async fn publish_main(repo: &Path) {
-    git::push_branch(repo, "origin", "main").await.unwrap();
+    git::push_head_as(repo, "origin", "main").await.unwrap();
 }
 
 /// A bare repository with one commit, and nothing else. The tempdir *is* the

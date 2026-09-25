@@ -379,6 +379,57 @@ async fn an_agent_that_changes_nothing_succeeds_without_committing() {
     assert!(!outcome.has(|k| matches!(k, EventKind::JobCommitted { .. })));
 }
 
+/// A clean tree is not proof of an idle agent: one that commits its own work
+/// leaves nothing to stage, and the scratch clone holding those commits is
+/// about to be deleted.
+#[tokio::test]
+async fn an_agent_that_commits_its_own_work_has_it_published() {
+    let h = Harness::with_config(&config_running("committing-agent.sh")).await;
+
+    let outcome = h.run_job("self-committed").await;
+
+    assert!(outcome.succeeded);
+    assert!(outcome.has(|k| matches!(k, EventKind::JobCommitted { .. })));
+    assert_eq!(
+        h.file_on_remote_branch(&job_branch_name(outcome.job_id), "agent-output.txt")
+            .await
+            .as_deref(),
+        Some("self-committed\n")
+    );
+}
+
+/// What reaches the remote is the commit the round inspected — the one
+/// checked out — not whatever the job's local branch was left pointing at.
+#[tokio::test]
+async fn an_agent_that_switches_branches_publishes_what_it_left_checked_out() {
+    let h = Harness::with_config(&format!(
+        "provider = \"fake\"\ncopy = [\".env\"]\n{}",
+        provider_block("branch-switching-agent.sh", "a")
+    ))
+    .await;
+    std::fs::write(h.repo.join(".env"), "API_KEY=hunter2\n").unwrap();
+
+    let outcome = h.run_job("switched").await;
+    assert!(outcome.succeeded);
+
+    let branch = job_branch_name(outcome.job_id);
+    assert_eq!(
+        h.file_on_remote_branch(&branch, "agent-output.txt")
+            .await
+            .as_deref(),
+        Some("switched\n")
+    );
+    let history =
+        git::run_allowing_failure(&h.origin, &["log", "--format=", "--name-only", &branch])
+            .await
+            .unwrap()
+            .stdout;
+    assert!(
+        !history.contains(".env"),
+        "the seeded secret reached the remote: {history}"
+    );
+}
+
 #[tokio::test]
 async fn seeded_files_reach_the_agent_but_never_the_branch() {
     let h = Harness::with_config(&format!(

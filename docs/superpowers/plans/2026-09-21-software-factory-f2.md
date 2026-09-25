@@ -21,7 +21,8 @@ Stale in ways that would reopen a hole if copied back:
   refuses the names assembly-line reserves.
 - `Runner::launch` takes a `CancellationToken`, so cancelling reaches a
   runner that is still launching.
-- The job's push runs with `-c core.hooksPath=/dev/null`.
+- The job's push runs with `-c core.hooksPath=/dev/null`, from `HEAD`
+  (`git::push_head_as`), not `push_branch`.
 - There is no `assembly-mise-cache` volume: a cache every job could write
   would run one job's code in the next. Container rounds provision cold.
 - A clone commits as assembly-line (`git::commit_as_assembly_line`), never

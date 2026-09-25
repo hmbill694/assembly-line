@@ -15,7 +15,8 @@ pub enum EventKind {
     JobStarted {
         round: u32,
     },
-    /// The checkout had changes, now recorded on the job's branch.
+    /// The round made commits — the agent's own, or assembly-line's of what
+    /// it left uncommitted — and `sha` is the one the job's branch ends on.
     JobCommitted {
         sha: String,
         files: usize,

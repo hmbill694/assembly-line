@@ -508,9 +508,11 @@ with a deletion.
    Mitigated by per-job secrets destroyed with the job — short-lived only
    once F4 mints them — and by the assumption that the factory runs against
    non-sensitive development repositories.
-6. **Copied files are git-safe, not log-safe.** Carried over unchanged:
-   nothing prevents an agent from printing a copied file's contents to stdout,
-   which now lands in a stream the daemon collects.
+6. **Copied files are kept out of commits by accident, not against intent,
+   and are not log-safe.** No commit a round pushes carries one, but an
+   agent that means to can copy their contents into another file, or push
+   them itself; and nothing prevents it from printing them to stdout, which
+   now lands in a stream the daemon collects.
 7. **Concurrent jobs on the same repo will conflict**, by design. The tester
    loop absorbs it. If a repo's issues routinely overlap, the loop pays for it
    in rounds, and the answer is fewer concurrent slots for that repo rather
