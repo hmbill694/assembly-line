@@ -121,6 +121,47 @@ async fn run_exits_one_when_the_agent_fails_but_still_leaves_the_branch() {
     discard_origin(&tmp);
 }
 
+/// End to end, for the rule `paths::job_id_past` owns.
+#[tokio::test]
+async fn a_job_id_already_taken_on_the_remote_is_skipped() {
+    let tmp = repo_running("fake-agent.sh").await;
+    // Pushed from elsewhere, and not a commit this job would fast-forward:
+    // nothing about it exists under `.assembly/jobs`.
+    let elsewhere = git(
+        &tmp,
+        &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "theirs"],
+    );
+    git(
+        &tmp,
+        &[
+            "push",
+            "--quiet",
+            "origin",
+            &format!("{elsewhere}:refs/heads/al/job-1"),
+        ],
+    );
+    let theirs = git_on_origin(&tmp, &["rev-parse", "al/job-1"]);
+
+    assembly(&tmp)
+        .args(["run", "--prompt", "x"])
+        .assert()
+        .success()
+        .stdout(contains("job 2: succeeded"));
+
+    assert_eq!(
+        git_on_origin(&tmp, &["rev-parse", "al/job-1"]),
+        theirs,
+        "somebody else's job branch moved"
+    );
+    assert_eq!(
+        git_on_origin(&tmp, &["rev-parse", "--verify", "-q", "al/job-2"]).len(),
+        40
+    );
+    assert!(tmp.path().join(".assembly/jobs/2/events.jsonl").is_file());
+
+    discard_origin(&tmp);
+}
+
 #[tokio::test]
 async fn a_repository_that_has_not_opted_in_is_told_which_file_to_write() {
     let tmp = support::repo_with_initial_commit().await;

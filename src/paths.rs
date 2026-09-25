@@ -9,6 +9,7 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+use crate::workspace::job_id_from_branch_name;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -38,10 +39,46 @@ fn existing_job_ids(jobs_root: &Path) -> io::Result<Vec<u64>> {
     }
 }
 
-/// The id a new job should claim. A missing jobs directory is not an error —
-/// it means this is the first job.
-pub fn next_job_id(jobs_root: &Path) -> io::Result<u64> {
-    existing_job_ids(jobs_root).map(|ids| ids.into_iter().max().unwrap_or(0) + 1)
+/// The id a new job should claim: one past every id already taken, whether
+/// by a job directory here or by a job branch on the remote.
+///
+/// The remote counts because job branches are shared there — a second clone,
+/// a teammate, or a deleted `.assembly/jobs` would otherwise restart at 1 and
+/// push onto somebody else's branch. Branches that are not a job's are
+/// ignored. `None` when a branch has already taken the last id there is.
+#[must_use]
+pub fn job_id_past(
+    local_ids: impl IntoIterator<Item = u64>,
+    remote_branches: &[String],
+) -> Option<u64> {
+    local_ids
+        .into_iter()
+        .chain(
+            remote_branches
+                .iter()
+                .filter_map(|branch| job_id_from_branch_name(branch)),
+        )
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+}
+
+/// [`job_id_past`] the job directories under `jobs_root` and
+/// `remote_branches`. A missing jobs directory is not an error — it means
+/// this is the first job here.
+///
+/// # Errors
+///
+/// Also fails when a job branch has taken the last id there is.
+pub fn next_job_id(jobs_root: &Path, remote_branches: &[String]) -> io::Result<u64> {
+    existing_job_ids(jobs_root).and_then(|ids| {
+        job_id_past(ids, remote_branches).ok_or_else(|| {
+            io::Error::other(format!(
+                "a job branch has taken the last job id — delete {} from the remote",
+                crate::workspace::job_branch_name(u64::MAX)
+            ))
+        })
+    })
 }
 
 /// The most recent job, or `None` when there have been none.

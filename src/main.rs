@@ -13,7 +13,7 @@ use assembly_line::runner::local::LocalRunner;
 use assembly_line::runner::{
     self, JobSecrets, Runner, RunnerProblem, reasons_a_container_cannot_run,
 };
-use assembly_line::workspace::{DEFAULT_REMOTE, job_branch_name};
+use assembly_line::workspace::{DEFAULT_REMOTE, JOB_BRANCH_PATTERN, job_branch_name};
 use assembly_line::{config, delivery, git, paths};
 use clap::Parser;
 use std::path::{Path, PathBuf};
@@ -417,6 +417,7 @@ async fn start_new_job<R: Runner>(
         prompt,
         provider,
         config,
+        remote_job_branches,
     } = prepare_job(prompt, prompt_file, repo, base_ref, provider).await?;
     let secrets = runnable_secrets(runner, &config, pass_env).await?;
 
@@ -426,7 +427,7 @@ async fn start_new_job<R: Runner>(
         prompt: prompt.clone(),
         provider: provider.clone(),
     };
-    let (paths, mut log) = allocate_job(&meta)?;
+    let (paths, mut log) = allocate_job(&meta, &remote_job_branches)?;
 
     let payload = payload_for_runner::<R>(
         &config,
@@ -473,11 +474,15 @@ async fn start_new_job<R: Runner>(
 /// A new job's directory, its `meta.json` and its open event log.
 ///
 /// Allocated only once the config is known good, so a repository that has not
-/// opted in leaves no litter.
-fn allocate_job(meta: &JobMeta) -> Result<(JobPaths, EventLog), String> {
+/// opted in leaves no litter. Its id is past every job branch the remote
+/// already carries, as well as every job directory here.
+fn allocate_job(
+    meta: &JobMeta,
+    remote_job_branches: &[String],
+) -> Result<(JobPaths, EventLog), String> {
     let jobs_root = paths::jobs_root(&meta.repo);
 
-    let paths = paths::next_job_id(&jobs_root)
+    let paths = paths::next_job_id(&jobs_root, remote_job_branches)
         .and_then(|id| paths::create_job(&jobs_root, id))
         .map_err(|e| format!("preparing the job directory: {e}"))?;
 
@@ -528,6 +533,9 @@ struct PreparedJob {
     prompt: String,
     provider: String,
     config: RepoConfig,
+    /// The job branches the remote already carries — ids a new job must not
+    /// reuse, whoever's they are.
+    remote_job_branches: Vec<String>,
 }
 
 async fn prepare_job(
@@ -558,6 +566,10 @@ async fn prepare_job(
         .await
         .map_err(|e| e.to_string())?;
     let (config, provider) = runnable_config_and_provider(declared, provider)?;
+    let remote_job_branches =
+        git::remote_branches_matching(&repo, DEFAULT_REMOTE, JOB_BRANCH_PATTERN)
+            .await
+            .map_err(|e| e.to_string())?;
 
     Ok(PreparedJob {
         repo,
@@ -567,6 +579,7 @@ async fn prepare_job(
         prompt,
         provider,
         config,
+        remote_job_branches,
     })
 }
 

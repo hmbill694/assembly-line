@@ -278,6 +278,26 @@ async fn pushing_a_branch_again_after_another_commit_fast_forwards() {
 }
 
 #[tokio::test]
+async fn a_remotes_branches_are_listed_by_pattern_without_their_prefix() {
+    let fx = Fixture::new().await;
+    let origin = fx.with_origin().await;
+    support::publish_main(&fx.repo).await;
+    let base = fx.base().await;
+    let node = clone_checked_out(&origin, &fx.clones, "node", "al/job-3", &base).await;
+    git::push_branch(&node, "origin", "al/job-3").await.unwrap();
+
+    let jobs = git::remote_branches_matching(&fx.repo, "origin", "al/job-*")
+        .await
+        .unwrap();
+    assert_eq!(jobs, ["al/job-3"]);
+
+    let unmatched = git::remote_branches_matching(&fx.repo, "origin", "nothing-*")
+        .await
+        .unwrap();
+    assert!(unmatched.is_empty(), "{unmatched:?}");
+}
+
+#[tokio::test]
 async fn pushing_to_a_remote_that_does_not_exist_names_it() {
     let fx = Fixture::new().await;
     let base = fx.base().await;

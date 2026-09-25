@@ -58,6 +58,19 @@ fn a_branch_name_identifies_the_job_that_produced_it() {
     );
 }
 
+#[test]
+fn a_jobs_branch_name_gives_back_its_id_and_no_other_branch_does() {
+    assert_eq!(
+        workspace::job_id_from_branch_name(&job_branch_name(42)),
+        Some(42)
+    );
+    assert_eq!(workspace::job_id_from_branch_name("main"), None);
+    assert_eq!(workspace::job_id_from_branch_name("al/job-"), None);
+    assert_eq!(workspace::job_id_from_branch_name("al/job-7x"), None);
+    assert_eq!(workspace::job_id_from_branch_name("al/job-007"), None);
+    assert_eq!(workspace::job_id_from_branch_name("al/job-+7"), None);
+}
+
 #[tokio::test]
 async fn creating_a_workspace_checks_out_the_pinned_commit_on_the_jobs_branch() {
     let fx = Fixture::new().await;

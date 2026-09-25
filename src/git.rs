@@ -281,6 +281,32 @@ pub async fn remote_lacks_ref(
     Ok(listed.exit_code == 2)
 }
 
+/// The branches `remote` carries whose names match `pattern` — a glob such
+/// as `al/job-*` — without their `refs/heads/` prefix.
+pub async fn remote_branches_matching(
+    repo: impl AsRef<Path>,
+    remote: &str,
+    pattern: &str,
+) -> anyhow::Result<Vec<String>> {
+    let listed = run_expecting_success(
+        repo,
+        &[
+            "ls-remote",
+            "--heads",
+            remote,
+            &format!("refs/heads/{pattern}"),
+        ],
+        &format!("ls-remote {remote}"),
+    )
+    .await?;
+    // "<sha>\trefs/heads/<branch>" per line.
+    Ok(listed
+        .lines()
+        .filter_map(|line| line.split_once("\trefs/heads/"))
+        .map(|(_, branch)| branch.to_string())
+        .collect())
+}
+
 /// `git_ref` as `remote` has it, pinned to one commit.
 ///
 /// # Errors
