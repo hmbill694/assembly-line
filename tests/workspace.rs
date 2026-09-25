@@ -223,6 +223,36 @@ async fn continuing_a_branch_restores_the_previous_rounds_work() {
     );
 }
 
+/// The clone is the agent's to write, hooks included, and the push runs
+/// with the git token in its environment — so the push runs no hook the
+/// clone carries.
+#[tokio::test]
+async fn publishing_runs_no_hook_from_the_clone() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = Fixture::new().await;
+    let ws = fx.workspace(&[]).await.unwrap();
+    let marker = fx.tmp.path().join("pre-push-ran");
+    let hook = ws.path().join(".git/hooks/pre-push");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(
+        &hook,
+        format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(ws.path().join("work.txt"), "done\n").unwrap();
+    let sha = workspace::commit(&ws, "work").await.unwrap().unwrap();
+
+    workspace::publish(&ws).await.unwrap();
+
+    assert!(!marker.exists(), "the clone's pre-push hook ran");
+    let on_remote = git::run_allowing_failure(&fx.origin, &["rev-parse", "al/job-1"])
+        .await
+        .unwrap();
+    assert_eq!(on_remote.stdout.trim(), sha);
+}
+
 #[tokio::test]
 async fn a_refused_publish_names_the_branch_and_what_was_lost() {
     let fx = Fixture::new().await;

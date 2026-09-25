@@ -411,10 +411,19 @@ pub async fn current_branch(repo: impl AsRef<Path>) -> anyhow::Result<Option<Str
 /// Deliberately without `--set-upstream`: that would write `branch.*.remote`
 /// into the repository's config. A later round pushes the same branch name
 /// again and fast-forwards without it.
+///
+/// Runs no hooks: a job's clone is the agent's to write, `.git/hooks` and
+/// `core.hooksPath` included, and the push runs with the git token in its
+/// environment. A `-c` on the command line outranks anything the clone's
+/// own config says. This is the push's guarantee, not the round's: the
+/// `commit --no-verify` before it still runs `prepare-commit-msg`,
+/// `post-commit` and `reference-transaction`, and every git command in the
+/// clone reads its config — which matters only as much as the token is
+/// hidden from the agent, and the spec's accepted risks say it is not.
 pub async fn push_branch(repo: impl AsRef<Path>, remote: &str, branch: &str) -> anyhow::Result<()> {
     run_expecting_success(
         repo,
-        &["push", remote, branch],
+        &["-c", "core.hooksPath=/dev/null", "push", remote, branch],
         &format!("push {remote} {branch}"),
     )
     .await
