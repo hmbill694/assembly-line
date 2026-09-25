@@ -62,6 +62,20 @@ pub fn https_equivalent(url: &str) -> String {
     }
 }
 
+/// Whether a remote URL names a path on this machine — a plain path or
+/// `file://` — rather than a host. Anything with a scheme other than
+/// `file`, or git's scp-like `host:path`, reaches over the network.
+#[must_use]
+pub fn is_path_on_this_machine(url: &str) -> bool {
+    match url.split_once("://") {
+        Some((scheme, _)) => scheme == "file",
+        // scp-like `host:path` has a colon before any slash.
+        None => url
+            .split_once(':')
+            .is_none_or(|(authority, _)| authority.contains('/')),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobPayload {
     pub job_id: u64,

@@ -624,7 +624,48 @@ async fn docker_preflight_reports_every_problem_before_allocating() {
         .code(2)
         .stderr(contains("`docker` cannot be reached"))
         .stderr(contains("declares `copy`"))
-        .stderr(contains("$ASSEMBLY_GIT_TOKEN is not set"));
+        .stderr(contains("$ASSEMBLY_GIT_TOKEN is not set"))
+        .stderr(contains("is a path on this machine"));
+
+    assert!(!tmp.path().join(".assembly/jobs/1").exists());
+    discard_origin(&tmp);
+}
+
+/// The test origin is a directory on this machine: fine for the local
+/// runner, but no container can clone it. The docker runner says so before
+/// anything is allocated, even with a daemon and a token to hand — and
+/// refuses a `--pass-env` that would override the payload in the same
+/// breath.
+#[tokio::test]
+async fn a_remote_that_is_a_local_path_is_refused_for_a_container_runner() {
+    let tmp = repo_running("fake-agent.sh").await;
+    let fakes = tempfile::tempdir().unwrap();
+    // A docker whose daemon answers.
+    support::fake_cli(fakes.path(), "docker", "echo 27.0.0\n");
+
+    assembly(&tmp)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                fakes.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("ASSEMBLY_GIT_TOKEN", "t0ken")
+        .args([
+            "run",
+            "--prompt",
+            "x",
+            "--runner",
+            "docker",
+            "--pass-env",
+            "ASSEMBLY_JOB",
+        ])
+        .assert()
+        .code(2)
+        .stderr(contains("is a path on this machine").and(contains("--runner local")))
+        .stderr(contains("--pass-env ASSEMBLY_JOB").and(contains("drop it")));
 
     assert!(!tmp.path().join(".assembly/jobs/1").exists());
     discard_origin(&tmp);

@@ -220,6 +220,7 @@ async fn run_work<R: Runner>(
 async fn runnable_secrets<R: Runner>(
     runner: &R,
     config: &RepoConfig,
+    remote_url: &str,
     pass_env: &[String],
 ) -> Result<JobSecrets, String> {
     let (secrets, missing) = match R::RUNS_IN_A_CONTAINER {
@@ -227,7 +228,7 @@ async fn runnable_secrets<R: Runner>(
         false => (JobSecrets::default(), Vec::new()),
     };
     let container = match R::RUNS_IN_A_CONTAINER {
-        true => reasons_a_container_cannot_run(&config.copy),
+        true => reasons_a_container_cannot_run(&config.copy, remote_url),
         false => Vec::new(),
     };
     let problems: Vec<RunnerProblem> = runner
@@ -420,7 +421,7 @@ async fn start_new_job<R: Runner>(
         config,
         remote_job_branches,
     } = prepare_job(prompt, prompt_file, repo, base_ref, provider).await?;
-    let secrets = runnable_secrets(runner, &config, pass_env).await?;
+    let secrets = runnable_secrets(runner, &config, &remote_url, pass_env).await?;
 
     let meta = JobMeta {
         repo: repo.clone(),
@@ -733,7 +734,7 @@ async fn revise_existing_job<R: Runner>(
         .await
         .map_err(|e| e.to_string())?;
     let (config, _) = runnable_config_and_provider(declared, Some(meta.provider.clone()))?;
-    let secrets = runnable_secrets(runner, &config, pass_env).await?;
+    let secrets = runnable_secrets(runner, &config, &remote_url, pass_env).await?;
 
     let mut log =
         EventLog::open_append(paths.events()).map_err(|e| format!("opening the event log: {e}"))?;

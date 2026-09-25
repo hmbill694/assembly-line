@@ -5,7 +5,7 @@ pub mod docker;
 pub mod kubernetes;
 pub mod local;
 
-use crate::payload::{GIT_TOKEN_VAR, JobPayload};
+use crate::payload::{GIT_TOKEN_VAR, JobPayload, PAYLOAD_VAR, is_path_on_this_machine};
 use std::collections::{BTreeMap, BTreeSet};
 use tokio_util::sync::CancellationToken;
 
@@ -102,6 +102,12 @@ pub enum RunnerProblem {
     },
     CopyNeedsLocalRunner,
     MissingEnvironment(String),
+    /// `--pass-env` named a variable assembly-line sets for the job itself.
+    ReservedEnvironment(String),
+    /// The remote is a path on this machine, which a container cannot see.
+    RemoteIsLocalPath {
+        url: String,
+    },
 }
 
 impl std::fmt::Display for RunnerProblem {
@@ -130,27 +136,59 @@ impl std::fmt::Display for RunnerProblem {
                 "${name} is not set — export it, since the job's container receives it from \
                  your environment"
             ),
+            Self::ReservedEnvironment(name) => write!(
+                f,
+                "--pass-env {name} names a variable assembly-line sets for the job itself — \
+                 drop it from --pass-env"
+            ),
+            Self::RemoteIsLocalPath { url } => write!(
+                f,
+                "the remote '{url}' is a path on this machine, which a container cannot clone \
+                 — use --runner local, or point the remote at a network URL"
+            ),
         }
     }
 }
 
+/// Names a container job's environment carries whatever `--pass-env` says:
+/// the payload, and the git credential that is always sent.
+const RESERVED_ENVIRONMENT: [&str; 2] = [PAYLOAD_VAR, GIT_TOKEN_VAR];
+
 /// Environment a container job receives, by name. Read from the host once,
 /// here, and only for names the host chose.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct JobSecrets {
     vars: BTreeMap<String, String>,
 }
 
+/// Names only: the values are credentials, and a `{:?}` in a log line or a
+/// panic message must never print one.
+impl std::fmt::Debug for JobSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobSecrets")
+            .field("names", &self.vars.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
 impl JobSecrets {
     /// The git credential, always, plus each name in `pass_env`, looked up
-    /// with `lookup`. Every name that has no value is a problem.
+    /// with `lookup`. Every name that has no value is a problem, and so is
+    /// every name assembly-line reserves — a user's `ASSEMBLY_JOB` would
+    /// override the payload itself.
     pub fn from_lookup(
         pass_env: &[String],
         lookup: impl Fn(&str) -> Option<String>,
     ) -> (JobSecrets, Vec<RunnerProblem>) {
-        let names: Vec<&str> = std::iter::once(GIT_TOKEN_VAR)
-            .chain(pass_env.iter().map(String::as_str))
-            .collect();
+        // First mentions only, in order: a name given twice is looked up —
+        // and reported — once.
+        let (reserved, chosen): (Vec<&str>, Vec<&str>) = pass_env
+            .iter()
+            .enumerate()
+            .filter(|(i, name)| !pass_env[..*i].contains(name))
+            .map(|(_, name)| name.as_str())
+            .partition(|name| RESERVED_ENVIRONMENT.contains(name));
+        let names: Vec<&str> = std::iter::once(GIT_TOKEN_VAR).chain(chosen).collect();
         let (found, missing): (Vec<_>, Vec<_>) = names
             .into_iter()
             .map(|name| (name, lookup(name)))
@@ -163,9 +201,14 @@ impl JobSecrets {
                     .filter_map(|(name, value)| Some((name.to_string(), value?)))
                     .collect(),
             },
-            missing
+            reserved
                 .into_iter()
-                .map(|(name, _)| RunnerProblem::MissingEnvironment(name.to_string()))
+                .map(|name| RunnerProblem::ReservedEnvironment(name.to_string()))
+                .chain(
+                    missing
+                        .into_iter()
+                        .map(|(name, _)| RunnerProblem::MissingEnvironment(name.to_string())),
+                )
                 .collect(),
         )
     }
@@ -186,11 +229,17 @@ impl JobSecrets {
     }
 }
 
-/// What a repository asks for that no container can give it.
+/// What a repository asks for that no container can give it: files from
+/// the host's checkout, or a remote that is only a path on the host.
 #[must_use]
-pub fn reasons_a_container_cannot_run(copy: &[String]) -> Vec<RunnerProblem> {
-    (!copy.is_empty())
-        .then_some(RunnerProblem::CopyNeedsLocalRunner)
-        .into_iter()
-        .collect()
+pub fn reasons_a_container_cannot_run(copy: &[String], remote_url: &str) -> Vec<RunnerProblem> {
+    [
+        (!copy.is_empty()).then_some(RunnerProblem::CopyNeedsLocalRunner),
+        is_path_on_this_machine(remote_url).then(|| RunnerProblem::RemoteIsLocalPath {
+            url: remote_url.to_string(),
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }

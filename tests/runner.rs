@@ -1,4 +1,6 @@
-use assembly_line::payload::{GIT_TOKEN_VAR, https_equivalent};
+use assembly_line::payload::{
+    GIT_TOKEN_VAR, PAYLOAD_VAR, https_equivalent, is_path_on_this_machine,
+};
 use assembly_line::runner::docker::docker_run_args;
 use assembly_line::runner::{JobSecrets, RunnerProblem, reasons_a_container_cannot_run};
 
@@ -83,12 +85,100 @@ fn every_missing_variable_is_reported_at_once() {
 }
 
 #[test]
+fn a_secrets_debug_output_names_each_variable_and_shows_no_value() {
+    let (secrets, _) = JobSecrets::from_lookup(&[], |_| Some("t0ken-value".to_string()));
+    let printed = format!("{secrets:?}");
+
+    assert!(printed.contains(GIT_TOKEN_VAR), "{printed}");
+    assert!(
+        !printed.contains("t0ken-value"),
+        "a secret leaked: {printed}"
+    );
+}
+
+#[test]
+fn a_name_passed_twice_is_one_problem_not_two() {
+    let (_, problems) = JobSecrets::from_lookup(
+        &[
+            "X".into(),
+            "X".into(),
+            PAYLOAD_VAR.into(),
+            PAYLOAD_VAR.into(),
+        ],
+        |name| (name == GIT_TOKEN_VAR).then(|| "t".to_string()),
+    );
+
+    assert_eq!(
+        problems,
+        [
+            RunnerProblem::ReservedEnvironment(PAYLOAD_VAR.into()),
+            RunnerProblem::MissingEnvironment("X".into()),
+        ]
+    );
+}
+
+/// `ASSEMBLY_JOB` would override the payload itself; the git token is sent
+/// whatever `--pass-env` says.
+#[test]
+fn passing_a_variable_assembly_line_sets_itself_is_refused() {
+    let (secrets, problems) = JobSecrets::from_lookup(
+        &[PAYLOAD_VAR.into(), GIT_TOKEN_VAR.into(), "EXTRA".into()],
+        |name| Some(format!("value of {name}")),
+    );
+
+    assert_eq!(
+        problems,
+        [
+            RunnerProblem::ReservedEnvironment(PAYLOAD_VAR.into()),
+            RunnerProblem::ReservedEnvironment(GIT_TOKEN_VAR.into()),
+        ]
+    );
+    assert_eq!(
+        secrets.names().into_iter().collect::<Vec<_>>(),
+        [GIT_TOKEN_VAR, "EXTRA"]
+    );
+}
+
+const NETWORK_REMOTE: &str = "https://github.com/o/r.git";
+
+#[test]
 fn a_repository_that_declares_copy_cannot_run_in_a_container() {
     assert_eq!(
-        reasons_a_container_cannot_run(&[".env".into()]),
+        reasons_a_container_cannot_run(&[".env".into()], NETWORK_REMOTE),
         [RunnerProblem::CopyNeedsLocalRunner]
     );
-    assert!(reasons_a_container_cannot_run(&[]).is_empty());
+    assert!(reasons_a_container_cannot_run(&[], NETWORK_REMOTE).is_empty());
+}
+
+#[test]
+fn a_remote_that_is_a_path_on_this_machine_cannot_run_in_a_container() {
+    for url in ["/tmp/origin.git", "../origin", "file:///tmp/origin.git"] {
+        assert_eq!(
+            reasons_a_container_cannot_run(&[], url),
+            [RunnerProblem::RemoteIsLocalPath { url: url.into() }],
+            "{url}"
+        );
+    }
+    for url in [
+        NETWORK_REMOTE,
+        "git@github.com:o/r.git",
+        "ssh://git@github.com/o/r.git",
+    ] {
+        assert!(!is_path_on_this_machine(url), "{url}");
+    }
+}
+
+#[test]
+fn every_container_problem_is_reported_at_once() {
+    assert_eq!(
+        reasons_a_container_cannot_run(&[".env".into()], "/tmp/origin.git"),
+        [
+            RunnerProblem::CopyNeedsLocalRunner,
+            RunnerProblem::RemoteIsLocalPath {
+                url: "/tmp/origin.git".into()
+            },
+        ]
+    );
 }
 
 #[test]
@@ -105,6 +195,10 @@ fn every_runner_problem_says_what_to_do_about_it() {
         },
         RunnerProblem::CopyNeedsLocalRunner,
         RunnerProblem::MissingEnvironment("X".into()),
+        RunnerProblem::ReservedEnvironment("ASSEMBLY_JOB".into()),
+        RunnerProblem::RemoteIsLocalPath {
+            url: "/tmp/origin.git".into(),
+        },
     ];
     for problem in problems {
         let message = problem.to_string();
