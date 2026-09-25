@@ -1,6 +1,34 @@
 # Software Factory F2 Implementation Plan — the runner seam
 
-**Status:** planned 2026-09-21
+**Status:** planned 2026-09-21; implemented. The code and its commit messages
+are the record now — where they and this plan disagree, they win. Known
+places this plan is stale, so that nobody copies them back in:
+
+- Rust is pinned to 1.98.1, not 1.97.1, in `rust-toolchain.toml` and the
+  Dockerfile's builder image.
+- The pinned Codex download URL below
+  (`releases/${CODEX_VERSION}/download/...`) 404s; the Dockerfile uses
+  `releases/download/${CODEX_VERSION}/...`.
+- The k8s runner creates its Job and Secret with `kubectl create`, never
+  `apply` — `apply` copies the Secret's values into an annotation.
+- Docker cancels with `docker stop`, not `rm -f`, so `job-exec` can report
+  the round; the container is removed afterwards.
+- `job_plan`, `inspect_oom` and `logs_of` do not exist under those names.
+
+Stale in ways that would reopen a hole if copied back:
+
+- `JobSecrets` does not derive `Debug` — its `Debug` shows names only — and
+  refuses the names assembly-line reserves.
+- `Runner::launch` takes a `CancellationToken`, so cancelling reaches a
+  runner that is still launching.
+- The job's push runs with `-c core.hooksPath=/dev/null`.
+- There is no `assembly-mise-cache` volume: a cache every job could write
+  would run one job's code in the next. Container rounds provision cold.
+- A clone commits as assembly-line (`git::commit_as_assembly_line`), never
+  as whatever identity the environment has.
+- The k8s preflight asks about every permission a round uses, not only
+  `create`, and a job's pod gets no service-account token.
+- `branch_exists` and `remote_exists` are gone.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

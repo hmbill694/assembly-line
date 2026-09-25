@@ -9,7 +9,8 @@
 //! can arrive as an `event` frame: an agent echoing `{"t":"job_finished"}`
 //! lands in the log as text, not in the event stream as a verdict. That is
 //! the whole guarantee — an agent running as the job's own user can still
-//! write to the job's stdout directly.
+//! write to the job's stdout directly, which the spec lists as an accepted
+//! risk.
 
 use crate::event::{Event, EventKind};
 use chrono::Utc;

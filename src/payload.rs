@@ -1,9 +1,9 @@
 //! Everything a round needs to run, resolved by the host before it starts.
 //!
-//! The payload is the whole plan. `job-exec` runs the round, wherever its
-//! runner puts it, and executes exactly what it says, reading no
-//! configuration of its own, so nothing inside the boundary can influence
-//! the settings that govern it.
+//! The payload is the whole plan. `job-exec` runs the round — as a child of
+//! the host, in a docker container, or in a k8s pod — and executes exactly
+//! what it says, reading no configuration of its own, so nothing inside the
+//! boundary can influence the settings that govern it.
 
 use crate::config::{ConfigError, RepoConfig, parse_duration};
 use crate::git::{self, PinnedRef};

@@ -205,8 +205,10 @@ The runner emits assembly-line's own event schema — the schema in
     {"seq":2,"output":"fake-agent: writing the file"}
 
 `job-exec` pipes the agent's and `verify`'s output to itself and re-emits
-each line as an `output` frame, so nothing an agent prints can arrive as an
-`event`. Lines that are not frames — `job-exec`'s own stderr, merged in by
+each line as an `output` frame, so nothing an agent *prints* can arrive as
+an `event`. That is all it promises: an agent running as `job-exec`'s own
+user can still write to `job-exec`'s stdout directly (Accepted risk 11).
+Lines that are not frames — `job-exec`'s own stderr, merged in by
 k8s — go to the log. `seq` numbers every frame, so a collector that resumes a
 dropped stream drops what it already has. A stream that ends without a
 verdict gets one from the collector: `JobFailed` naming why the runner
@@ -521,10 +523,23 @@ with a deletion.
    mise-nix backend. A repository that needs one runs on the local runner.
 10. **Container jobs provision their toolchain cold**, costing minutes per
     job, until F3 configures a cache.
-11. **A container job's agent runs as the same user as `job-exec`**, so it
-    can read the git token from `job-exec`'s process environment (`/proc`).
-    Isolating it needs the agent under its own uid — a later milestone's
-    image change.
+11. **A container job's agent runs as the same user as `job-exec`**, so
+    through `/proc` it can read the git token from `job-exec`'s process
+    environment — or reach it by writing the clone's git config and hooks,
+    which the git commands the round runs after the agent then execute with
+    the token in their environment; only the push is kept from running
+    hooks. It can also write to `job-exec`'s stdout via
+    `/proc/<pid>/fd/1` and so forge a frame — a verdict included. Isolating
+    it needs the agent under its own uid — a later
+    milestone's image change. Separately, a docker job's environment — the
+    payload and the git token — can be read with `docker inspect` by anyone
+    with access to the docker daemon until the container is removed at the
+    end of the round.
+12. **A docker job cancelled while its image is still pulling runs anyway.**
+    `docker stop` finds no container yet. Ctrl-C, F2's only cancel, reaches
+    the `docker run` client directly and aborts it; the daemon's cancel (F3)
+    has no terminal behind it and needs the container created before the
+    round is handed back.
 
 ## Deferred, knowingly
 

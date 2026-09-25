@@ -9,7 +9,7 @@ when it did.
 
 ## Toolchain
 
-Edition 2024, pinned to stable 1.97.1 via `rust-toolchain.toml`. Do not
+Edition 2024, pinned to stable 1.98.1 via `rust-toolchain.toml`. Do not
 downgrade the edition to work around a compile error — fix the code.
 
 ```
@@ -156,17 +156,20 @@ would. `git::commit_all_except` unstages each `never_commit` path this way
 (`src/git.rs`) — a genuine loop, not a map in disguise.
 
 When you do write one, it should be because the alternative is worse, and
-that should be obvious to the next reader. F1 runs exactly one job at a time,
-so there is no scheduler loop any more to hold up as the headline case — if a
-later milestone's daemon brings one back, it belongs here.
+that should be obvious to the next reader. `assembly` runs exactly one job at
+a time, so there is no scheduler loop any more to hold up as the headline
+case — if a later milestone's daemon brings one back, it belongs here.
 
 ### Cost
 
 The unit of work is one job, and the collections around it — a repository's
-declared providers, its `copy` list, the frames one job prints — are a
-handful of items, not millions. Favor clarity: with a handful of items a scan
-is clearer than an index, and the difference in cost does not exist. There
-is no graph left to traverse — no DFS, no Kahn's-style peeling;
+declared providers, its `copy` list, the job branches `git ls-remote` lists,
+the frames one job prints — are a handful of items, not millions. Favor
+clarity: `git::remote_branches_matching` hands back the remote's job
+branches as a plain `Vec`, and `paths::job_id_past` scans it for the highest
+id rather than indexing it first (`src/git.rs`, `src/paths.rs`); with a
+handful of branches the scan is clearer and the difference in cost does not
+exist. There is no graph left to traverse — no DFS, no Kahn's-style peeling;
 a job either runs or it doesn't. If a later milestone's daemon runs many jobs
 at once, the cost question becomes scheduling contention, not walking a data
 structure — revisit this section when that lands.
@@ -238,11 +241,12 @@ Where a type owns a sink or source, make it generic with a sensible default
   test may touch the network or require credentials.
 - Prove concurrency with observable evidence — a wall-clock bound, or a probe
   that records how many copies of a command were live at once — not by
-  inspecting internal state. This is forward-looking, not descriptive of F1's
-  own tests: F1 runs exactly one job at a time, so there is nothing concurrent
-  to observe today, and the DAG scheduler's wall-clock probes were deleted
-  with it. Apply this rule when a later milestone's daemon actually runs jobs
-  concurrently — don't go looking for the tests it describes before then.
+  inspecting internal state. This is forward-looking, not descriptive of
+  today's tests: `assembly` runs exactly one job at a time, so there is
+  nothing concurrent to observe today, and the DAG scheduler's wall-clock
+  probes were deleted with it. Apply this rule when a later milestone's
+  daemon actually runs jobs concurrently — don't go looking for the tests it
+  describes before then.
 
 ## Invariants
 
