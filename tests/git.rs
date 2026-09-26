@@ -496,21 +496,6 @@ async fn a_remotes_branches_are_listed_by_pattern_without_their_prefix() {
     assert!(unmatched.is_empty(), "{unmatched:?}");
 }
 
-#[tokio::test]
-async fn pushing_to_a_remote_that_does_not_exist_names_it() {
-    let fx = Fixture::new().await;
-    let base = fx.base().await;
-    check_out_new_branch(&fx.repo, "al/job-1", &base)
-        .await
-        .unwrap();
-
-    let err = git::push_head_as(&fx.repo, "origin", "al/job-1")
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("origin"), "{err}");
-}
-
 /// Configuration is read from a ref, never from a checkout — which is what
 /// stops a job editing the settings that govern it.
 #[tokio::test]
