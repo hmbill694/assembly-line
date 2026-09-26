@@ -1,10 +1,10 @@
 use assembly_line::config::REPO_CONFIG_PATH;
 use assembly_line::event::EventKind;
-use assembly_line::git::{self, commit_all, head_sha};
+use assembly_line::git::{self, head_sha};
 use assembly_line::payload;
 use assembly_line::state::JobState;
 use assembly_line::workspace::job_branch_name;
-use support::{Harness, config_running, provider_block};
+use support::{Harness, commit_all, config_running, provider_block};
 
 mod support;
 
@@ -124,7 +124,11 @@ async fn a_job_leaves_the_target_repositorys_working_tree_untouched() {
         Some("main")
     );
     assert!(!h.repo.join("agent-output.txt").exists());
-    assert!(!git::is_dirty(&h.repo).await.unwrap());
+    let status = git::run_allowing_failure(&h.repo, &["status", "--porcelain"])
+        .await
+        .unwrap()
+        .stdout;
+    assert!(status.is_empty(), "{status}");
 
     let listed = h
         .files_on_remote_branch(&job_branch_name(outcome.job_id))

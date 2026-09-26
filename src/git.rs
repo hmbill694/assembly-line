@@ -441,12 +441,6 @@ pub async fn push_head_as(
     .map(|_| ())
 }
 
-/// Stage everything and commit. `None` means the tree was clean — a normal
-/// outcome, since an agent may correctly conclude no change is needed.
-pub async fn commit_all(clone: impl AsRef<Path>, message: &str) -> anyhow::Result<Option<String>> {
-    commit_all_except(clone, message, &[], "HEAD").await
-}
-
 /// Commit everything except `never_commit`, which stay on disk for the agent
 /// to read but are kept out of every commit since `since`.
 ///
@@ -566,12 +560,6 @@ async fn ensure_never_committed_since(
         }
     }
     Ok(())
-}
-
-/// Whether a clone has uncommitted changes, tracked or otherwise.
-pub async fn is_dirty(clone: impl AsRef<Path>) -> anyhow::Result<bool> {
-    let status = run_expecting_success(clone, &["status", "--porcelain"], "status").await?;
-    Ok(!status.is_empty())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

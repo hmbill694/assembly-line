@@ -1,8 +1,8 @@
 use assembly_line::config::REPO_CONFIG_PATH;
-use assembly_line::git::commit_all;
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
+use support::commit_all;
 
 mod support;
 

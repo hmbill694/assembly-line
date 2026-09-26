@@ -1,8 +1,9 @@
 use assembly_line::git::{
-    self, DiffStat, check_out_new_branch, clone_into, commit_all, commit_all_except,
-    commit_as_assembly_line, diff_stat_against, head_sha, is_dirty,
+    self, DiffStat, check_out_new_branch, clone_into, commit_all_except, commit_as_assembly_line,
+    diff_stat_against, head_sha,
 };
 use std::path::{Path, PathBuf};
+use support::commit_all;
 
 mod support;
 
@@ -83,26 +84,6 @@ async fn reports_head_and_current_branch() {
         git::current_branch(&fx.repo).await.unwrap().as_deref(),
         Some("main")
     );
-}
-
-#[tokio::test]
-async fn commit_all_returns_none_when_the_tree_is_clean() {
-    let fx = Fixture::new().await;
-    assert!(
-        commit_all(&fx.repo, "nothing to do")
-            .await
-            .unwrap()
-            .is_none()
-    );
-}
-
-#[tokio::test]
-async fn is_dirty_tracks_uncommitted_work() {
-    let fx = Fixture::new().await;
-    assert!(!is_dirty(&fx.repo).await.unwrap());
-
-    std::fs::write(fx.repo.join("scratch.txt"), "wip").unwrap();
-    assert!(is_dirty(&fx.repo).await.unwrap());
 }
 
 #[tokio::test]

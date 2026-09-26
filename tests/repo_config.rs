@@ -23,7 +23,7 @@ args = ["-p", "{prompt}"]
 "#,
     )
     .unwrap();
-    assembly_line::git::commit_all(repo.path(), "add config")
+    support::commit_all(repo.path(), "add config")
         .await
         .unwrap();
 
@@ -60,7 +60,7 @@ async fn the_working_tree_cannot_change_the_settings_that_govern_a_job() {
         "provider = \"declared\"\n[providers.declared]\ncmd = \"true\"\n",
     )
     .unwrap();
-    assembly_line::git::commit_all(repo.path(), "add config")
+    support::commit_all(repo.path(), "add config")
         .await
         .unwrap();
 
@@ -81,7 +81,7 @@ async fn a_malformed_config_names_the_file_it_could_not_parse() {
     let repo = support::repo_with_initial_commit().await;
     std::fs::create_dir_all(repo.path().join(".assembly")).unwrap();
     std::fs::write(repo.path().join(".assembly/config.toml"), "provider = [\n").unwrap();
-    assembly_line::git::commit_all(repo.path(), "add config")
+    support::commit_all(repo.path(), "add config")
         .await
         .unwrap();
 

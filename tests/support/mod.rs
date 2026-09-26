@@ -8,7 +8,7 @@
 use assembly_line::config::RepoConfig;
 use assembly_line::event::{EventKind, EventLog};
 use assembly_line::frame::{FrameWriter, Routed, StreamPosition};
-use assembly_line::git::{self, commit_all};
+use assembly_line::git;
 use assembly_line::job::run_round;
 use assembly_line::paths::{self, JobPaths};
 use assembly_line::payload::{self, JobPayload, RoundRequest};
@@ -55,6 +55,11 @@ pub fn provider_block(script: &str, extra_arg: &str) -> String {
 /// A repository config naming `fake` and pointing it at `script`.
 pub fn config_running(script: &str) -> String {
     format!("provider = \"fake\"\n{}", provider_block(script, "a"))
+}
+
+/// Stage everything in `repo` and commit it. `None` means the tree was clean.
+pub async fn commit_all(repo: &Path, message: &str) -> anyhow::Result<Option<String>> {
+    git::commit_all_except(repo, message, &[], "HEAD").await
 }
 
 /// Turn `at` into a git repository with one commit, so a job has somewhere to

@@ -1,10 +1,11 @@
 use assembly_line::config::{Delivery, DeliveryMode, RepoConfig};
 use assembly_line::delivery::{Delivered, PullRequestText, deliver};
-use assembly_line::git::{self, commit_all};
+use assembly_line::git;
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use std::path::PathBuf;
+use support::commit_all;
 
 mod support;
 
