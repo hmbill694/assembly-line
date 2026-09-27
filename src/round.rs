@@ -12,7 +12,7 @@ use crate::frame::FrameWriter;
 use crate::git;
 use crate::payload::{GIT_TOKEN_VAR, RoundPayload};
 use crate::provider::CommandSpec;
-use crate::workspace::{self, JobWorkspace};
+use crate::workspace::{self, RoundWorkspace};
 use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -317,7 +317,7 @@ fn agent_failure_reason(outcome: anyhow::Result<ShellOutcome>) -> Option<String>
 
 async fn agent_work_on_branch(
     payload: &RoundPayload,
-    ws: &JobWorkspace,
+    ws: &RoundWorkspace,
 ) -> anyhow::Result<Option<AgentWork>> {
     let Some(sha) = workspace::commit(ws, &payload.commit_message).await? else {
         return Ok(None);

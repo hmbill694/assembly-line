@@ -34,7 +34,7 @@ impl Fixture {
         git::pinned(&self.repo, "origin", "main").await.unwrap()
     }
 
-    async fn workspace(&self, copy: &[String]) -> anyhow::Result<workspace::JobWorkspace> {
+    async fn workspace(&self, copy: &[String]) -> anyhow::Result<workspace::RoundWorkspace> {
         workspace::create(
             self.url(),
             &self.main().await,

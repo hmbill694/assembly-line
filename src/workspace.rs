@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::Duration;
 
 #[derive(Debug)]
-pub struct JobWorkspace {
+pub struct RoundWorkspace {
     /// Deleted when the workspace is dropped, which is what makes the
     /// checkout scratch whatever becomes of the round.
     dir: tempfile::TempDir,
@@ -19,7 +19,7 @@ pub struct JobWorkspace {
     started_at: String,
 }
 
-impl JobWorkspace {
+impl RoundWorkspace {
     #[must_use]
     pub fn path(&self) -> &Path {
         self.dir.path()
@@ -70,7 +70,7 @@ pub async fn create(
     copy_paths: &[String],
     scratch_root: impl AsRef<Path>,
     credential_helper: Option<&str>,
-) -> anyhow::Result<JobWorkspace> {
+) -> anyhow::Result<RoundWorkspace> {
     let seed_from = seed_from.as_ref();
 
     if let Some(missing) = missing_seed_path(seed_from, copy_paths) {
@@ -93,7 +93,7 @@ pub async fn create(
     git::commit_as_assembly_line(dir.path()).await?;
     seed_files(dir.path(), seed_from, copy_paths)?;
 
-    Ok(JobWorkspace {
+    Ok(RoundWorkspace {
         dir,
         branch: branch.to_string(),
         seeded: copy_paths.to_vec(),
@@ -128,7 +128,7 @@ fn seed_files(into: &Path, seed_from: &Path, copy_paths: &[String]) -> anyhow::R
 /// # Errors
 ///
 /// See [`git::commit_all_except`].
-pub async fn commit(ws: &JobWorkspace, message: &str) -> anyhow::Result<Option<String>> {
+pub async fn commit(ws: &RoundWorkspace, message: &str) -> anyhow::Result<Option<String>> {
     git::commit_all_except(ws.path(), message, &ws.seeded, &ws.started_at).await?;
     match git::head_is_ahead_of(ws.path(), &ws.started_at).await? {
         true => git::head_sha(ws.path()).await.map(Some),
@@ -155,7 +155,7 @@ const PUSH_BACKOFF: [Duration; 3] = [
 /// When every attempt fails, an error carrying git's last complaint and
 /// saying what that costs: the branch exists only in this scratch clone, so
 /// the work goes with it.
-pub async fn publish(ws: &JobWorkspace) -> anyhow::Result<()> {
+pub async fn publish(ws: &RoundWorkspace) -> anyhow::Result<()> {
     let mut last_failure = None;
     for wait in PUSH_BACKOFF {
         tokio::time::sleep(wait).await;
@@ -181,7 +181,7 @@ pub async fn publish(ws: &JobWorkspace) -> anyhow::Result<()> {
 /// # Errors
 ///
 /// Returns an error if the directory cannot be removed.
-pub fn discard(ws: JobWorkspace) -> std::io::Result<()> {
+pub fn discard(ws: RoundWorkspace) -> std::io::Result<()> {
     restore_owner_permissions(ws.path())?;
     ws.dir.close()
 }
