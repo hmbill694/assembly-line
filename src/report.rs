@@ -165,4 +165,18 @@ impl JobReport {
         self.duration
             .map(|d| format!("took {:.1}s", d.as_secs_f64()))
     }
+
+    /// Everything `status` prints: the summary, how long the last round
+    /// took once it has ended, and the branch once there is one.
+    #[must_use]
+    pub fn to_status_lines(&self) -> Vec<String> {
+        std::iter::once(self.to_summary_line())
+            .chain(self.to_duration_line())
+            .chain(
+                self.branch
+                    .as_ref()
+                    .map(|branch| format!("branch: {branch}")),
+            )
+            .collect()
+    }
 }

@@ -2,7 +2,9 @@ use assembly_line::config::Warning;
 use assembly_line::git;
 use assembly_line::lifecycle::{
     Note, Prepared, Refusal, RevisionRequest, StartRequest, prepare_revision, prepare_start,
+    report_for_job,
 };
+use assembly_line::paths::{self, JobMeta};
 use assembly_line::runner::local::LocalRunner;
 use support::{Harness, commit_all, config_running};
 
@@ -104,6 +106,38 @@ async fn a_repository_with_no_remote_cannot_be_prepared() {
         "{refusal}"
     );
     assert!(refusal.itemized_reasons().is_empty());
+}
+
+#[tokio::test]
+async fn status_without_a_job_id_reports_the_latest_job() {
+    let h = Harness::new().await;
+    let jobs_root = paths::jobs_root(&h.repo);
+    [3, 12].iter().for_each(|&id| {
+        let job = paths::create_job(&jobs_root, id).unwrap();
+        paths::write_meta(
+            &job,
+            &JobMeta {
+                repo: h.repo.clone(),
+                base_ref: "main".into(),
+                prompt: "x".into(),
+                provider: "fake".into(),
+            },
+        )
+        .unwrap();
+    });
+
+    let report = report_for_job(None, Some(h.repo.clone())).unwrap();
+
+    assert_eq!(report.id, 12);
+}
+
+#[tokio::test]
+async fn status_in_a_repository_with_no_jobs_says_so() {
+    let h = Harness::new().await;
+
+    let err = report_for_job(None, Some(h.repo.clone())).unwrap_err();
+
+    assert_eq!(err.to_string(), "no jobs yet");
 }
 
 #[tokio::test]

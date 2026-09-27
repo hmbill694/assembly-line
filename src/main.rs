@@ -2,10 +2,9 @@ use assembly_line::cli::{Cli, Command, RunnerArgs, RunnerKind};
 use assembly_line::frame::FrameWriter;
 use assembly_line::job::{JobOutcome, run_round};
 use assembly_line::lifecycle::{
-    self, Note, Prepared, Refusal, RevisionRequest, StartRequest, events_of, locate_job,
+    self, Note, Prepared, Refusal, RevisionRequest, StartRequest, locate_job,
 };
 use assembly_line::payload::JobPayload;
-use assembly_line::report::JobReport;
 use assembly_line::runner::docker::DockerRunner;
 use assembly_line::runner::kubernetes::KubernetesRunner;
 use assembly_line::runner::local::LocalRunner;
@@ -232,19 +231,12 @@ fn exit_code_for(outcome: JobOutcome) -> ExitCode {
 }
 
 fn print_job_status(job_id: Option<u64>, repo: Option<PathBuf>) -> ExitCode {
-    let lines = locate_job(job_id, repo).and_then(|(paths, _)| {
-        events_of(&paths).map(|events| JobReport::from_events(paths.id, &events))
-    });
-
-    match lines {
+    match lifecycle::report_for_job(job_id, repo) {
         Ok(report) => {
-            println!("{}", report.to_summary_line());
-            if let Some(took) = report.to_duration_line() {
-                println!("{took}");
-            }
-            if let Some(branch) = &report.branch {
-                println!("branch: {branch}");
-            }
+            report
+                .to_status_lines()
+                .iter()
+                .for_each(|line| println!("{line}"));
             ExitCode::SUCCESS
         }
         Err(e) => fail_with_usage_error(e),

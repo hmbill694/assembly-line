@@ -445,10 +445,18 @@ pub fn locate_job(
     Ok((paths, meta))
 }
 
+/// The report on the job `job_id` names in `repo`, or on the latest one there
+/// when it names none.
+///
 /// # Errors
 ///
-/// When the job's event log cannot be read.
-pub fn events_of(paths: &JobPaths) -> anyhow::Result<Vec<Event>> {
+/// When the job cannot be found, or its event log cannot be read.
+pub fn report_for_job(job_id: Option<u64>, repo: Option<PathBuf>) -> anyhow::Result<JobReport> {
+    let (paths, _) = locate_job(job_id, repo)?;
+    events_of(&paths).map(|events| JobReport::from_events(paths.id, &events))
+}
+
+fn events_of(paths: &JobPaths) -> anyhow::Result<Vec<Event>> {
     EventLog::read(paths.events()).map_err(|e| anyhow!("reading the event log: {e}"))
 }
 

@@ -172,6 +172,39 @@ fn the_summary_line_of_an_untouched_job_says_pending() {
 }
 
 #[test]
+fn status_of_a_finished_job_names_its_timing_and_branch() {
+    let events = timeline(vec![
+        (0, EventKind::JobStarted { round: 1 }),
+        (1, committed(1, 1, 0)),
+        (
+            1,
+            EventKind::JobBranchPublished {
+                branch: "al/job-4".into(),
+                pushed_to: Some("origin".into()),
+            },
+        ),
+        (3, EventKind::JobFinished { exit_code: 0 }),
+    ]);
+
+    assert_eq!(
+        JobReport::from_events(4, &events).to_status_lines(),
+        [
+            "job 4: succeeded (round 1, 1 file +1/-0)",
+            "took 3.0s",
+            "branch: al/job-4",
+        ]
+    );
+}
+
+#[test]
+fn status_of_an_untouched_job_is_its_summary_alone() {
+    assert_eq!(
+        JobReport::from_events(1, &[]).to_status_lines(),
+        ["job 1: pending (round 1)"]
+    );
+}
+
+#[test]
 fn timing_is_reported_only_once_a_round_has_ended() {
     let running = timeline(vec![(0, EventKind::JobStarted { round: 1 })]);
     assert!(
