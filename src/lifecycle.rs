@@ -8,7 +8,7 @@
 use crate::collect::{collect, record_launch_failure};
 use crate::config::{self, ConfigError, RepoConfig, Warning};
 use crate::delivery::{self, Delivered, PullRequestText};
-use crate::event::{Event, EventKind, EventLog};
+use crate::event::{Event, EventLog};
 use crate::git::{self, PinnedRef};
 use crate::paths::{self, JobMeta, JobPaths};
 use crate::payload::{self, RoundPayload, RoundRequest};
@@ -327,7 +327,7 @@ pub async fn prepare_revision<'r, R: Runner>(
             );
         }
     };
-    let round = rounds_so_far(&located.events) + 1;
+    let round = JobReport::from_events(located.paths.id, &located.events).rounds + 1;
     let round_prompt = payload::revised_prompt(&located.meta.prompt, &request.feedback);
 
     Prepared {
@@ -727,17 +727,6 @@ async fn hand_off(
             }
         }
     }
-}
-
-/// How many rounds this job has already had, so the next one is numbered.
-fn rounds_so_far(events: &[Event]) -> u32 {
-    u32::try_from(
-        events
-            .iter()
-            .filter(|e| matches!(e.kind, EventKind::RoundStarted { .. }))
-            .count(),
-    )
-    .unwrap_or(u32::MAX)
 }
 
 /// Where a revise round starts: the remote's copy of the job's branch.
