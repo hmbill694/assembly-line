@@ -38,7 +38,7 @@ ENV MISE_DATA_DIR=/mise \
 
 # Pinned, and bumped by renovate. Declared just before its use, so a bump
 # rebuilds only the layers after it.
-ARG MISE_VERSION=v2026.9.0
+ARG MISE_VERSION=v2026.9.15
 RUN curl -fsSL https://mise.run | MISE_INSTALL_PATH=/usr/local/bin/mise MISE_VERSION=${MISE_VERSION} sh
 
 COPY --from=build /src/target/release/assembly /usr/local/bin/assembly
