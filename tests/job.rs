@@ -1,6 +1,7 @@
-use assembly_line::config::REPO_CONFIG_PATH;
+use assembly_line::config::{ConfigError, REPO_CONFIG_PATH};
 use assembly_line::event::EventKind;
 use assembly_line::git::{self, head_sha};
+use assembly_line::lifecycle::Refusal;
 use assembly_line::payload;
 use assembly_line::state::JobState;
 use assembly_line::workspace::job_branch_name;
@@ -300,9 +301,11 @@ async fn a_hangup_cancels_the_round_rather_than_orphaning_the_agent() {
 #[tokio::test]
 async fn a_refused_push_fails_the_job_and_says_the_work_is_lost() {
     let h = Harness::new().await;
+    let prepared = h.prepare_job("write a file").await;
 
-    // The remote already carries an unrelated `al/job-1`, so the job's push is
-    // a non-fast-forward and git refuses it.
+    // Someone else publishes an unrelated `al/job-1` after this job looked at
+    // the remote's branches but before it pushes, so its push is a
+    // non-fast-forward and git refuses it.
     let base = head_sha(&h.repo).await.unwrap();
     let tree = git::run_allowing_failure(&h.repo, &["rev-parse", &format!("{base}^{{tree}}")])
         .await
@@ -328,7 +331,7 @@ async fn a_refused_push_fails_the_job_and_says_the_work_is_lost() {
     .unwrap();
     assert!(pushed.succeeded(), "{}", pushed.stderr);
 
-    let outcome = h.run_job("write a file").await;
+    let outcome = h.run(prepared).await;
 
     assert!(!outcome.succeeded);
     assert!(
@@ -483,14 +486,17 @@ async fn a_missing_provider_binary_fails_the_job_with_a_useful_message() {
 async fn a_provider_the_repository_never_declared_stops_the_job_before_it_starts() {
     let h = Harness::new().await;
 
-    let err = h
-        .attempt_round("x", Some("ghost"), None, 1)
-        .await
-        .expect_err("an undeclared provider is not a job that failed")
-        .to_string();
+    let refusal = h.refusal_to_start("x", Some("ghost")).await;
 
-    assert!(err.contains("ghost"), "{err}");
-    assert!(err.contains("add a block for it"), "{err}");
+    assert!(
+        matches!(
+            &refusal,
+            Refusal::ConfigNotRunnable(errors)
+                if errors == &[ConfigError::UnknownProvider("ghost".into())]
+        ),
+        "{refusal:?}"
+    );
+    assert!(!h.repo.join(".assembly/jobs").exists());
 }
 
 #[tokio::test]
@@ -501,13 +507,16 @@ async fn an_unparseable_max_duration_stops_the_job_before_it_starts() {
     ))
     .await;
 
-    let err = h
-        .attempt_round("x", None, None, 1)
-        .await
-        .expect_err("an unparseable cap is not a job that failed")
-        .to_string();
+    let refusal = h.refusal_to_start("x", None).await;
 
-    assert!(err.contains("soon"), "{err}");
+    assert!(
+        matches!(
+            &refusal,
+            Refusal::ConfigNotRunnable(errors)
+                if errors == &[ConfigError::UnparseableMaxDuration("soon".into())]
+        ),
+        "{refusal:?}"
+    );
 }
 
 /// The heart of the stateless design: a revise round is a new job that sees
@@ -520,7 +529,7 @@ async fn a_revise_round_continues_the_branch_instead_of_starting_over() {
     let first = h.run_job("hi").await;
     assert!(first.succeeded);
 
-    let second = h.revise_job("add error handling", 2).await;
+    let second = h.revise_job(first.job_id, "add error handling").await;
     assert!(second.succeeded);
 
     let branch = job_branch_name(second.job_id);

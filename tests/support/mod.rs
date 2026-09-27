@@ -7,19 +7,20 @@
 
 use assembly_line::config::RepoConfig;
 use assembly_line::event::{EventKind, EventLog};
-use assembly_line::frame::{FrameWriter, Routed, StreamPosition};
 use assembly_line::git;
-use assembly_line::job::run_round;
+use assembly_line::lifecycle::{
+    self, Prepared, Refusal, RevisionRequest, StartRequest, prepare_revision, prepare_start,
+};
 use assembly_line::paths::{self, JobPaths};
-use assembly_line::payload::{self, JobPayload, RoundRequest};
+use assembly_line::payload::{JobPayload, RoundRequest};
+use assembly_line::runner::local::LocalRunner;
 use assembly_line::state::JobState;
-use assembly_line::workspace;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
-/// The job id every harness uses. One repository per test, so there is never
-/// a second job to collide with.
+/// The job id of [`Harness::payload_for`] and [`Harness::job_paths`]. A job
+/// run through the lifecycle gets whatever id the lifecycle allocates.
 const THE_JOB: u64 = 1;
 
 /// Path to one of the fake-agent scripts under `tests/fixtures`.
@@ -117,7 +118,7 @@ pub async fn repo_with_initial_commit() -> tempfile::TempDir {
     tmp
 }
 
-/// A repository that has opted in, plus somewhere outside it for job state.
+/// A repository that has opted in, and the runner its jobs run on.
 pub struct Harness {
     tmp: tempfile::TempDir,
     /// The repository a job runs against.
@@ -125,6 +126,7 @@ pub struct Harness {
     /// The bare remote the repository's `main` is published to, which every
     /// job clones from and pushes its branch back to.
     pub origin: PathBuf,
+    runner: LocalRunner,
 }
 
 impl Harness {
@@ -135,23 +137,42 @@ impl Harness {
 
     /// A repository whose `.assembly/config.toml` is `body`, committed so it
     /// can be read from a ref — which is the only way a job ever reads it.
+    ///
+    /// Delivery is turned off: these jobs are about what a round does, and
+    /// `tests/cli.rs` and `tests/delivery.rs` cover what happens to its branch.
     pub async fn with_config(body: &str) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         init_git_repo(&repo).await;
 
         std::fs::create_dir_all(repo.join(".assembly")).unwrap();
-        std::fs::write(repo.join(assembly_line::config::REPO_CONFIG_PATH), body).unwrap();
+        std::fs::write(
+            repo.join(assembly_line::config::REPO_CONFIG_PATH),
+            format!("{body}\n[delivery]\nmode = \"none\"\n"),
+        )
+        .unwrap();
         commit_all(&repo, "opt in to assembly-line")
             .await
             .unwrap()
             .unwrap();
+        // Job state lives in the repository, and a test asserts its working
+        // tree stays clean, the way an opted-in repository's own ignore does.
+        std::fs::write(repo.join(".git/info/exclude"), ".assembly/jobs/\n").unwrap();
 
         let origin = tmp.path().join("origin.git");
         add_origin(&repo, &origin).await;
         publish_main(&repo).await;
 
-        Harness { tmp, repo, origin }
+        let runner = assembly_with_scratch_under(
+            &tmp.path().join("scratch"),
+            &tmp.path().join("assembly-bin"),
+        );
+        Harness {
+            tmp,
+            repo,
+            origin,
+            runner,
+        }
     }
 
     /// Where this harness's jobs make their scratch clones.
@@ -177,143 +198,119 @@ impl Harness {
             .stdout
     }
 
-    /// Job state lives outside the repository, so nothing a test does dirties
-    /// the working tree it is asserting about.
+    /// A job directory outside the repository, for tests that drive a runner
+    /// or `job-exec` directly rather than through the lifecycle.
     pub fn job_paths(&self) -> JobPaths {
         paths::create_job(&paths::jobs_root(self.tmp.path()), THE_JOB).unwrap()
     }
 
     /// Run one job against this repository, with `prompt`, from `main`.
     pub async fn run_job(&self, prompt: &str) -> Outcome {
-        self.attempt_round(prompt, None, None, 1).await.unwrap()
+        self.run(self.prepare_job(prompt).await).await
+    }
+
+    /// A new job with `prompt`, checked but not yet run, so a test can change
+    /// the world between the two.
+    pub async fn prepare_job(&self, prompt: &str) -> Prepared<'_, LocalRunner> {
+        prepare_start(&self.runner, &[], self.start(prompt, None, None)).await
     }
 
     /// Run one job cut from a named ref rather than `main`.
     pub async fn run_job_from(&self, prompt: &str, base_ref: &str) -> Outcome {
-        self.attempt_round(prompt, None, Some(base_ref), 1)
+        self.run(prepare_start(&self.runner, &[], self.start(prompt, None, Some(base_ref))).await)
             .await
-            .unwrap()
     }
 
-    /// Another round on the same job, continuing its branch.
-    pub async fn revise_job(&self, prompt: &str, round: u32) -> Outcome {
-        self.attempt_round(prompt, None, None, round).await.unwrap()
-    }
-
-    /// Run a job that may not be administrable at all — an undeclared
-    /// provider, or an unparseable `max_duration`. Those are errors rather
-    /// than failed jobs, and this is how a test sees the difference.
-    ///
-    /// `provider` and `base_ref` default to what the repository declares and
-    /// to `main`; the wrappers above cover the ordinary cases. The start is
-    /// pinned the way `main.rs` pins it: round 1 from the remote's copy of
-    /// the base, a revise round from the remote's copy of the job's branch.
-    pub async fn attempt_round(
-        &self,
-        prompt: &str,
-        provider: Option<&str>,
-        base_ref: Option<&str>,
-        round: u32,
-    ) -> anyhow::Result<Outcome> {
-        let start = match round {
-            1 => git::pinned(&self.repo, "origin", base_ref.unwrap_or("main")).await?,
-            _ => git::pinned(&self.repo, "origin", &workspace::job_branch_name(THE_JOB)).await?,
+    /// Another round on job `job_id`, continuing its branch.
+    pub async fn revise_job(&self, job_id: u64, feedback: &str) -> Outcome {
+        let request = RevisionRequest {
+            job_id,
+            feedback: feedback.to_string(),
+            repo: Some(self.repo.clone()),
         };
-        self.round_from(&start, prompt, provider, round).await
+        self.run(prepare_revision(&self.runner, &[], request).await)
+            .await
     }
 
-    /// The payload the host would build for round 1 of this job.
+    /// Why a job with `provider` would not start: the refusals that stop a
+    /// job before it has a directory, as distinct from a job that failed.
+    pub async fn refusal_to_start(&self, prompt: &str, provider: Option<&str>) -> Refusal {
+        let prepared = prepare_start(&self.runner, &[], self.start(prompt, provider, None)).await;
+        match prepared.round {
+            Ok(_) => panic!("the job was ready to run, not refused"),
+            Err(refusal) => refusal,
+        }
+    }
+
+    /// A realistic round-1 payload for this repository, for tests that hand
+    /// one to a runner or to `job-exec` directly.
     pub async fn payload_for(&self, prompt: &str) -> JobPayload {
         let start = git::pinned(&self.repo, "origin", "main").await.unwrap();
-        self.payload_from(&start, prompt, None, 1).await.unwrap()
-    }
-
-    /// Resolve a round's payload the way `main.rs` does.
-    ///
-    /// An undeclared provider or an unparseable `max_duration` is refused by
-    /// [`JobPayload::for_round`], and propagates as the error.
-    async fn payload_from(
-        &self,
-        start: &git::PinnedRef,
-        prompt: &str,
-        provider: Option<&str>,
-        round: u32,
-    ) -> anyhow::Result<JobPayload> {
-        let config = RepoConfig::from_ref(&self.repo, &start.sha).await?;
-        let provider = provider
-            .map(str::to_string)
-            .or_else(|| config.provider.clone())
-            .unwrap_or_default();
+        let config = RepoConfig::from_ref(&self.repo, &start.sha).await.unwrap();
 
         JobPayload::for_round(
             &config,
             RoundRequest {
                 job_id: THE_JOB,
-                round,
+                round: 1,
                 prompt,
-                provider: &provider,
-                start: start.clone(),
-                remote_name: workspace::DEFAULT_REMOTE,
-                remote_url: payload::remote_to_clone(&self.repo, workspace::DEFAULT_REMOTE).await?,
+                provider: config.provider.as_deref().unwrap_or_default(),
+                start,
+                remote_name: "origin",
+                remote_url: self.origin.to_string_lossy().into_owned(),
                 seed_from: &self.repo,
             },
         )
+        .unwrap()
     }
 
-    /// Everything a round does once its start is pinned: resolve a payload,
-    /// run it in-process against an in-memory frame stream, and route the
-    /// frames into the job's event log. A lighter collector than the host's
-    /// `collect`: an in-memory stream never replays, so there is no position
-    /// to carry, and a round that ends without a verdict is left without one.
-    async fn round_from(
-        &self,
-        start: &git::PinnedRef,
-        prompt: &str,
-        provider: Option<&str>,
-        round: u32,
-    ) -> anyhow::Result<Outcome> {
-        let payload = self.payload_from(start, prompt, provider, round).await?;
-        let paths = self.job_paths();
-        let mut log = EventLog::open_append(paths.events()).unwrap();
+    fn start(&self, prompt: &str, provider: Option<&str>, base_ref: Option<&str>) -> StartRequest {
+        StartRequest {
+            prompt: Some(prompt.to_string()),
+            prompt_file: None,
+            repo: Some(self.repo.clone()),
+            base_ref: base_ref.map(str::to_string),
+            provider: provider.map(str::to_string),
+        }
+    }
 
-        let frames = FrameWriter::new(Vec::new());
-        let outcome = run_round(
-            &payload,
-            &frames,
-            &self.scratch_root(),
-            CancellationToken::new(),
-        )
-        .await?;
-        let routed: Vec<Routed> = String::from_utf8(frames.copy_of_sink())
-            .unwrap()
-            .lines()
-            .map(|line| StreamPosition::default().route(line).1)
-            .collect();
-        let output: String = routed
-            .iter()
-            .filter_map(|r| match r {
-                Routed::Output(text) => Some(format!("{text}\n")),
-                _ => None,
-            })
-            .collect();
-        routed
-            .into_iter()
-            .filter_map(|r| match r {
-                Routed::Event { event, .. } => Some(event),
-                _ => None,
-            })
-            .try_for_each(|event| log.append_collected(&event))
+    /// Run a prepared job, which must have been ready rather than refused.
+    pub async fn run(&self, prepared: Prepared<'_, LocalRunner>) -> Outcome {
+        let ready = match prepared.round {
+            Ok(ready) => ready,
+            Err(refusal) => panic!(
+                "the job was refused: {refusal} {:?}",
+                refusal.itemized_reasons()
+            ),
+        };
+        let conclusion = lifecycle::run(ready, CancellationToken::new())
+            .await
             .unwrap();
-        let events = EventLog::read(paths.events()).unwrap();
+        let events = EventLog::read(conclusion.job.events()).unwrap();
 
-        Ok(Outcome {
-            succeeded: outcome.passed(),
-            job_id: paths.id,
+        Outcome {
+            succeeded: conclusion.outcome.passed(),
+            job_id: conclusion.job.id,
             state: JobState::replay(&events),
             events: events.into_iter().map(|e| e.kind).collect(),
-            output,
-        })
+            output: std::fs::read_to_string(conclusion.job.log()).unwrap_or_default(),
+        }
     }
+}
+
+/// The `assembly` binary cargo built, making its scratch clones under
+/// `scratch_root`, so a test can see whether a round left one behind.
+fn assembly_with_scratch_under(scratch_root: &Path, bin_dir: &Path) -> LocalRunner {
+    std::fs::create_dir_all(scratch_root).unwrap();
+    LocalRunner::using(fake_cli(
+        bin_dir,
+        "assembly",
+        &format!(
+            "TMPDIR='{}' exec '{}' \"$@\"\n",
+            scratch_root.display(),
+            env!("CARGO_BIN_EXE_assembly")
+        ),
+    ))
 }
 
 /// What a finished job left in its event log.
@@ -323,7 +320,7 @@ pub struct Outcome {
     pub job_id: u64,
     pub state: JobState,
     pub events: Vec<EventKind>,
-    /// What the round's commands printed, one line per output frame.
+    /// Everything the job's output log captured.
     pub output: String,
 }
 
