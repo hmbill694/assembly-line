@@ -50,8 +50,8 @@ pub struct JobReport {
 struct JobProgress {
     state: JobState,
     rounds: u32,
-    attempt_started_at: Option<DateTime<Utc>>,
-    last_attempt_duration: Option<Duration>,
+    round_started_at: Option<DateTime<Utc>>,
+    last_round_duration: Option<Duration>,
     committed_diff: Option<DiffSummary>,
     detail: Option<String>,
     branch: Option<String>,
@@ -65,7 +65,7 @@ impl JobProgress {
             EventKind::RoundStarted { round } => JobProgress {
                 state: JobState::Running,
                 rounds: (*round).max(self.rounds + 1),
-                attempt_started_at: Some(event.at),
+                round_started_at: Some(event.at),
                 committed_diff: None,
                 detail: None,
                 ..self
@@ -95,12 +95,12 @@ impl JobProgress {
             },
             EventKind::RoundPassed => JobProgress {
                 state: JobState::Passed,
-                last_attempt_duration: self.time_spent_until(event.at),
+                last_round_duration: self.time_spent_until(event.at),
                 ..self
             },
             EventKind::RoundFailed { reason } => JobProgress {
                 state: JobState::Failed,
-                last_attempt_duration: self.time_spent_until(event.at),
+                last_round_duration: self.time_spent_until(event.at),
                 detail: Some(reason.clone()),
                 ..self
             },
@@ -108,7 +108,7 @@ impl JobProgress {
     }
 
     fn time_spent_until(&self, end: DateTime<Utc>) -> Option<Duration> {
-        self.attempt_started_at
+        self.round_started_at
             .and_then(|start| (end - start).to_std().ok())
     }
 }
@@ -127,7 +127,7 @@ impl JobReport {
             id,
             state: progress.state,
             rounds: progress.rounds.max(1),
-            duration: progress.last_attempt_duration,
+            duration: progress.last_round_duration,
             diff: progress.committed_diff,
             detail: progress.detail,
             branch: progress.branch,

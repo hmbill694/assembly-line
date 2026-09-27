@@ -189,8 +189,8 @@ bare nouns (`data`, `info`, `result`, `entry`) fail that test.
 - **Mutators name the transition, including its scope:** `EventLog::append`,
   not `write` — the log is append-only, so the half of the name that rules out
   rewriting is the half that earns its place (`src/event.rs`).
-- **Fields carry their unit or role:** `attempt_started_at`,
-  `last_attempt_duration`, `committed_diff` — not `started`, `duration`,
+- **Fields carry their unit or role:** `round_started_at`,
+  `last_round_duration`, `committed_diff` — not `started`, `duration`,
   `diff` (`JobProgress` in `src/report.rs`).
 - **Constructors say where the value came from:** `JobReport::from_events`,
   not `summarize`.
