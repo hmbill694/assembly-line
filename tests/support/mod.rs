@@ -13,6 +13,7 @@ use assembly_line::lifecycle::{
 };
 use assembly_line::paths::{self, JobPaths};
 use assembly_line::payload::{RoundPayload, RoundRequest};
+use assembly_line::report::JobReport;
 use assembly_line::runner::local::LocalRunner;
 use assembly_line::state::JobState;
 use std::os::unix::fs::PermissionsExt;
@@ -291,7 +292,7 @@ impl Harness {
         Outcome {
             passed: conclusion.verdict.passed(),
             job_id: conclusion.job.id,
-            state: JobState::replay(&events),
+            state: JobReport::from_events(conclusion.job.id, &events).state,
             events: events.into_iter().map(|e| e.kind).collect(),
             output: std::fs::read_to_string(conclusion.job.log()).unwrap_or_default(),
         }

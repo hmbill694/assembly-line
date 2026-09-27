@@ -24,6 +24,100 @@ fn committed(files: usize, insertions: usize, deletions: usize) -> EventKind {
     }
 }
 
+fn state_after(kinds: Vec<EventKind>) -> JobState {
+    let events = timeline(kinds.into_iter().map(|kind| (0, kind)).collect());
+    JobReport::from_events(1, &events).state
+}
+
+fn pushed() -> EventKind {
+    EventKind::BranchPushed {
+        branch: "al/job-1".into(),
+        pushed_to: "origin".into(),
+    }
+}
+
+#[test]
+fn a_job_state_starts_pending() {
+    assert_eq!(JobState::default(), JobState::Pending);
+}
+
+#[test]
+fn starting_and_passing_moves_a_job_through_running_to_passed() {
+    let started = vec![EventKind::RoundStarted { round: 1 }];
+    assert_eq!(state_after(started.clone()), JobState::Running);
+
+    let finished = [started, vec![EventKind::RoundPassed]].concat();
+    assert_eq!(state_after(finished), JobState::Passed);
+}
+
+#[test]
+fn a_failed_job_is_recorded_as_failed() {
+    let st = state_after(vec![EventKind::RoundFailed {
+        reason: "exit 1".into(),
+    }]);
+
+    assert_eq!(st, JobState::Failed);
+}
+
+#[test]
+fn a_commit_is_progress_not_completion() {
+    let through_commit = vec![EventKind::RoundStarted { round: 1 }, committed(2, 10, 1)];
+    assert_eq!(
+        state_after(through_commit.clone()),
+        JobState::Running,
+        "a commit is not completion"
+    );
+
+    let finished = [through_commit, vec![EventKind::RoundPassed]].concat();
+    assert_eq!(state_after(finished), JobState::Passed);
+}
+
+/// A round's branch is pushed before its verdict is reached, so pushing must
+/// not decide the verdict either way.
+#[test]
+fn pushing_a_branch_does_not_decide_the_verdict() {
+    let st = state_after(vec![
+        EventKind::RoundStarted { round: 1 },
+        pushed(),
+        EventKind::RoundFailed {
+            reason: "exit 3".into(),
+        },
+    ]);
+
+    assert_eq!(st, JobState::Failed);
+}
+
+#[test]
+fn a_revise_round_puts_a_finished_job_back_into_running() {
+    let st = state_after(vec![
+        EventKind::RoundStarted { round: 1 },
+        EventKind::RoundPassed,
+        EventKind::RoundStarted { round: 2 },
+    ]);
+
+    assert_eq!(st, JobState::Running);
+}
+
+#[test]
+fn the_final_state_is_reconstructed_from_the_log_alone() {
+    let st = state_after(vec![
+        EventKind::RoundStarted { round: 1 },
+        committed(1, 1, 0),
+        pushed(),
+        EventKind::RoundPassed,
+    ]);
+
+    assert_eq!(st, JobState::Passed);
+}
+
+#[test]
+fn every_state_has_a_label() {
+    assert_eq!(JobState::Pending.label(), "pending");
+    assert_eq!(JobState::Running.label(), "running");
+    assert_eq!(JobState::Passed.label(), "passed");
+    assert_eq!(JobState::Failed.label(), "failed");
+}
+
 #[test]
 fn summarizes_state_rounds_duration_and_detail() {
     let events = timeline(vec![
@@ -71,6 +165,29 @@ fn a_revised_job_reports_its_last_round() {
     assert_eq!(report.duration.unwrap().as_secs(), 3);
 }
 
+/// A torn line is skipped when the log is read, so a round's start can be
+/// missing; the rounds after it keep their numbers.
+#[test]
+fn a_missing_round_start_does_not_lower_the_round_count() {
+    let events = timeline(vec![
+        (0, EventKind::RoundStarted { round: 1 }),
+        (1, EventKind::RoundPassed),
+        (2, EventKind::RoundStarted { round: 3 }),
+    ]);
+
+    assert_eq!(JobReport::from_events(1, &events).rounds, 3);
+}
+
+#[test]
+fn a_round_started_twice_is_counted_once() {
+    let events = timeline(vec![
+        (0, EventKind::RoundStarted { round: 2 }),
+        (1, EventKind::RoundStarted { round: 2 }),
+    ]);
+
+    assert_eq!(JobReport::from_events(1, &events).rounds, 2);
+}
+
 #[test]
 fn a_new_round_clears_the_previous_rounds_failure_reason() {
     let events = timeline(vec![
@@ -90,6 +207,39 @@ fn a_new_round_clears_the_previous_rounds_failure_reason() {
     assert_eq!(report.state, JobState::Passed);
     assert!(report.detail.is_none(), "stale reason survived");
     assert!(report.diff.is_none(), "stale diff survived");
+}
+
+/// `verify`'s ruling is not the round's verdict: the reason a rejected round
+/// reports is the one its `RoundFailed` records.
+#[test]
+fn a_rejected_rounds_reason_comes_from_its_verdict_alone() {
+    let ruled = timeline(vec![
+        (0, EventKind::RoundStarted { round: 1 }),
+        (
+            1,
+            EventKind::VerifyRejected {
+                reason: "tests failed".into(),
+            },
+        ),
+    ]);
+    let report = JobReport::from_events(1, &ruled);
+    assert_eq!(report.state, JobState::Running);
+    assert!(report.detail.is_none(), "{:?}", report.detail);
+
+    let failed = [
+        ruled,
+        timeline(vec![(
+            2,
+            EventKind::RoundFailed {
+                reason: "verify rejected the work: tests failed".into(),
+            },
+        )]),
+    ]
+    .concat();
+    assert_eq!(
+        JobReport::from_events(1, &failed).detail.as_deref(),
+        Some("verify rejected the work: tests failed")
+    );
 }
 
 #[test]

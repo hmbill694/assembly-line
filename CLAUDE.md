@@ -250,10 +250,9 @@ Where a type owns a sink or source, make it generic with a sensible default
   exception: a `#[cfg(test)]` unit test in `src/` is acceptable only where
   the behaviour is unreachable through the public API in reasonable time —
   today that is `src/round.rs`'s provisioning deadline.
-- Test through the public API. `JobState::replay` and `JobReport::from_events`
-  are both pure folds over an event stream, so most behavior can be asserted
-  by feeding them events, with no processes involved (`src/state.rs`,
-  `src/report.rs`).
+- Test through the public API. `JobReport::from_events` is a pure fold over
+  an event stream, so most behavior can be asserted by feeding it events,
+  with no processes involved (`src/report.rs`).
 - Agent execution is tested with **shell-script fakes**, never a real API. No
   test may touch the network or require credentials.
 - Prove concurrency with observable evidence — a wall-clock bound, or a probe
@@ -268,9 +267,9 @@ Where a type owns a sink or source, make it generic with a sensible default
 ## Invariants
 
 - The event log is **append-only**. Never rewrite or truncate it.
-- `JobState::replay` must stay a pure fold over the event stream — as must
-  `JobReport::from_events`. Anything that cannot be reconstructed from
-  `events.jsonl` does not belong in `JobState` or `JobReport`.
+- `JobReport::from_events` is the only fold over a job's events, and it must
+  stay pure. Anything that cannot be reconstructed from `events.jsonl` does
+  not belong in `JobState` or `JobReport`.
 - Job ids are never user input, so there is nothing to validate. A job's id is
   a `u64` that `paths::next_job_id` allocates one past the max of both the
   existing job directories and the remote's `al/job-*` branches — job

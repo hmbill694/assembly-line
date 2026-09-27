@@ -1,5 +1,6 @@
 use assembly_line::collect::{collect, record_launch_failure};
 use assembly_line::event::{EventKind, EventLog};
+use assembly_line::report::JobReport;
 use assembly_line::runner::local::LocalRunner;
 use assembly_line::runner::{JobSecrets, Runner};
 use assembly_line::state::JobState;
@@ -30,7 +31,10 @@ async fn a_round_run_by_job_exec_is_collected_into_the_same_log_as_before() {
 
     assert!(verdict.passed());
     let events = EventLog::read(paths.events()).unwrap();
-    assert_eq!(JobState::replay(&events), JobState::Passed);
+    assert_eq!(
+        JobReport::from_events(paths.id, &events).state,
+        JobState::Passed
+    );
     assert!(
         events
             .iter()

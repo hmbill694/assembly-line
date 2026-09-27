@@ -1,4 +1,5 @@
 use assembly_line::config::Warning;
+use assembly_line::event::{EventKind, EventLog};
 use assembly_line::git;
 use assembly_line::lifecycle::{
     Note, Prepared, Refusal, RevisionRequest, StartRequest, output_log_of, prepare_revision,
@@ -182,4 +183,37 @@ async fn revising_a_job_that_does_not_exist_cannot_be_prepared() {
 
     let refusal = refusal_of(prepared);
     assert!(refusal.to_string().contains("no such job: 9"), "{refusal}");
+}
+
+/// Counting the `RoundStarted` lines that survive a torn log would hand the
+/// next round a number the job already used.
+#[tokio::test]
+async fn a_revise_is_numbered_past_the_highest_round_recorded() {
+    let h = Harness::new().await;
+    let first = h.run_job("x").await;
+    assert!(first.passed);
+    let job = paths::open_job(&paths::jobs_root(&h.repo), first.job_id).unwrap();
+    let mut log = EventLog::open_append(job.events()).unwrap();
+    log.append(EventKind::RoundStarted { round: 3 }).unwrap();
+    log.append(EventKind::RoundPassed).unwrap();
+    let runner = the_binary();
+
+    let prepared = prepare_revision(
+        &runner,
+        &[],
+        RevisionRequest {
+            job_id: first.job_id,
+            feedback: "more".into(),
+            repo: Some(h.repo.clone()),
+        },
+    )
+    .await;
+
+    let Ok(ready) = prepared.round else {
+        panic!("the revise was refused");
+    };
+    assert_eq!(
+        ready.to_announcement_line().as_deref(),
+        Some("revising job 1 (round 4)")
+    );
 }
