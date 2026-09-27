@@ -22,19 +22,6 @@ pub const PAYLOAD_VAR: &str = "ASSEMBLY_JOB";
 /// environment; the spec lists that as an accepted risk.
 pub const GIT_TOKEN_VAR: &str = "ASSEMBLY_GIT_TOKEN";
 
-/// `s` split at the colon that ends a host: the first one outside a
-/// bracketed IPv6 literal, whose own colons end nothing.
-fn split_at_host_colon(s: &str) -> Option<(&str, &str)> {
-    let searched_from = match (s.find('['), s.find(':')) {
-        (Some(open), Some(colon)) if open < colon => {
-            s[open..].find(']').map_or(open, |close| open + close)
-        }
-        _ => 0,
-    };
-    let colon = searched_from + s[searched_from..].find(':')?;
-    Some((&s[..colon], &s[colon + 1..]))
-}
-
 /// The HTTPS form of an SSH remote URL, which is what a token can
 /// authenticate. Anything else — HTTPS already, a local path, `file://` —
 /// comes back unchanged.
@@ -42,18 +29,13 @@ fn split_at_host_colon(s: &str) -> Option<(&str, &str)> {
 pub fn https_equivalent(url: &str) -> String {
     let authority_and_path = match url.strip_prefix("ssh://") {
         Some(rest) => rest.split_once('/'),
-        // scp-like `host:path`, which git recognises by a colon before any
-        // slash. A local path has no such colon.
-        None if !url.contains("://") => {
-            split_at_host_colon(url).filter(|(authority, _)| !authority.contains('/'))
-        }
-        None => None,
+        None => git::scp_like_parts(url),
     };
 
     match authority_and_path {
         Some((authority, path)) => {
             let host = authority.rsplit('@').next().unwrap_or(authority);
-            let host = split_at_host_colon(host).map_or(host, |(host, _port)| host);
+            let host = git::split_at_host_colon(host).map_or(host, |(host, _port)| host);
             // scp-like `host:/srv/r.git` names an absolute path, which a URL
             // carries with a single slash.
             format!("https://{host}/{}", path.trim_start_matches('/'))
@@ -69,10 +51,7 @@ pub fn https_equivalent(url: &str) -> String {
 pub fn is_path_on_this_machine(url: &str) -> bool {
     match url.split_once("://") {
         Some((scheme, _)) => scheme == "file",
-        // scp-like `host:path` has a colon before any slash.
-        None => url
-            .split_once(':')
-            .is_none_or(|(authority, _)| authority.contains('/')),
+        None => git::scp_like_parts(url).is_none(),
     }
 }
 

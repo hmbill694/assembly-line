@@ -233,15 +233,35 @@ pub async fn remote_url(repo: impl AsRef<Path>, remote: &str) -> anyhow::Result<
 /// directory: a relative path joined onto the repository, anything else as
 /// it is.
 fn reachable_from_anywhere(repo: &Path, url: &str) -> String {
-    // `host:path` is ssh's scp-like form — and a `scheme://` URL has a colon
-    // before any slash too — unless a slash comes first, making it a path.
-    let names_a_host = url
-        .split_once(':')
-        .is_some_and(|(before, _)| !before.contains('/'));
+    let names_a_host = url.contains("://") || scp_like_parts(url).is_some();
     match names_a_host || Path::new(url).is_absolute() {
         true => url.to_string(),
         false => repo.join(url).to_string_lossy().into_owned(),
     }
+}
+
+/// git's scp-like `[user@]host:path`, split at the colon that ends the host,
+/// or `None` for anything else. git recognises it by a colon before any
+/// slash; a URL with a scheme is never one, and a local path has no such
+/// colon.
+pub(crate) fn scp_like_parts(url: &str) -> Option<(&str, &str)> {
+    (!url.contains("://"))
+        .then(|| split_at_host_colon(url))
+        .flatten()
+        .filter(|(authority, _)| !authority.contains('/'))
+}
+
+/// `s` split at the colon that ends a host: the first one outside a
+/// bracketed IPv6 literal, whose own colons end nothing.
+pub(crate) fn split_at_host_colon(s: &str) -> Option<(&str, &str)> {
+    let searched_from = match (s.find('['), s.find(':')) {
+        (Some(open), Some(colon)) if open < colon => {
+            s[open..].find(']').map_or(open, |close| open + close)
+        }
+        _ => 0,
+    };
+    let colon = searched_from + s[searched_from..].find(':')?;
+    Some((&s[..colon], &s[colon + 1..]))
 }
 
 /// Fetch `git_ref` from `remote` and return the commit it names *there*.
