@@ -6,7 +6,7 @@
 //! [`Event`]s, or one line of what its commands printed.
 //!
 //! The job wraps its commands' output itself, so nothing an agent *prints*
-//! can arrive as an `event` frame: an agent echoing `{"t":"job_finished"}`
+//! can arrive as an `event` frame: an agent echoing `{"t":"round_passed"}`
 //! lands in the log as text, not in the event stream as a verdict. That is
 //! the whole guarantee — an agent running as the job's own user can still
 //! write to the job's stdout directly, which the spec lists as an accepted
@@ -172,11 +172,11 @@ pub fn verdict_missing_from(collected: &[Event], ended_because: &str) -> Option<
     let reported = collected.iter().any(|e| {
         matches!(
             e.kind,
-            EventKind::JobFinished { .. } | EventKind::JobFailed { .. }
+            EventKind::RoundPassed | EventKind::RoundFailed { .. }
         )
     });
 
-    (!reported).then(|| EventKind::JobFailed {
+    (!reported).then(|| EventKind::RoundFailed {
         reason: format!("the job ended without reporting a verdict: {ended_because}"),
     })
 }

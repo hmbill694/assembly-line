@@ -11,13 +11,13 @@ use std::path::Path;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum EventKind {
-    /// A round began. Round 1 is the first attempt; higher rounds are revises.
-    JobStarted {
+    /// A round began. Round 1 is the job's `run`; each revise adds one.
+    RoundStarted {
         round: u32,
     },
     /// The round made commits — the agent's own, or assembly-line's of what
     /// it left uncommitted — and `sha` is the one the job's branch ends on.
-    JobCommitted {
+    RoundCommitted {
         sha: String,
         files: usize,
         insertions: usize,
@@ -25,34 +25,26 @@ pub enum EventKind {
     },
     /// The branch reached the remote. `pushed_to` names it.
     ///
-    /// `pushed_to` is an `Option` only so logs written before F2 still
-    /// parse: those recorded `None` for a branch that stayed a local ref.
-    /// Since F2 a job's only local ref is in a scratch clone deleted with
-    /// it, so a branch that cannot be pushed fails the round instead, and
-    /// every new log carries `Some`.
-    ///
-    /// Emitted for failed jobs too. A job leaves nothing but its branch, so
+    /// Emitted for failed rounds too. A job leaves nothing but its branch, so
     /// this is what makes the work findable at all.
-    JobBranchPublished {
+    BranchPushed {
         branch: String,
-        pushed_to: Option<String>,
+        pushed_to: String,
     },
     /// `verify` ran to completion and rejected the work. Recorded before
-    /// [`EventKind::JobFailed`], so a reader can tell a rejected job from one
-    /// whose agent crashed.
+    /// [`EventKind::RoundFailed`], so a reader can tell a rejected round from
+    /// one whose agent crashed.
     ///
     /// `reason` is how `verify` failed — `exit 1` — not what it printed; the
     /// command's output is in the job's log. Written only for a verdict
     /// `verify` actually reached: a run that was cancelled or cut off at
     /// `max_duration` judged nothing, and this event would claim otherwise in
     /// a log that can never be corrected.
-    JobVerifyFailed {
+    VerifyRejected {
         reason: String,
     },
-    JobFinished {
-        exit_code: i32,
-    },
-    JobFailed {
+    RoundPassed,
+    RoundFailed {
         reason: String,
     },
 }

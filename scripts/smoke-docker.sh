@@ -38,6 +38,6 @@ out=$(docker run --rm -e ASSEMBLY_JOB="$payload" \
 echo "$out"
 [ "$status" -eq 0 ] || { echo "smoke: job-exec exited $status" >&2; exit 1; }
 
-grep -q '"t":"job_finished"' <<<"$out" || { echo "smoke: no job_finished frame" >&2; exit 1; }
+grep -q '"t":"round_passed"' <<<"$out" || { echo "smoke: no round_passed frame" >&2; exit 1; }
 grep -q smoke <<<"$(git -C "$work/origin.git" show al/job-1:smoke.txt)" || { echo "smoke: branch not pushed" >&2; exit 1; }
 echo "smoke: ok"

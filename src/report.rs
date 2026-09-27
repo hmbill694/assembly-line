@@ -62,7 +62,7 @@ impl JobProgress {
         match &event.kind {
             // A new round restarts the clock and clears the previous round's
             // reason and diff, so a revised job reports its final round.
-            EventKind::JobStarted { round } => JobProgress {
+            EventKind::RoundStarted { round } => JobProgress {
                 state: JobState::Running,
                 rounds: (*round).max(self.rounds + 1),
                 attempt_started_at: Some(event.at),
@@ -70,7 +70,7 @@ impl JobProgress {
                 detail: None,
                 ..self
             },
-            EventKind::JobCommitted {
+            EventKind::RoundCommitted {
                 files,
                 insertions,
                 deletions,
@@ -83,22 +83,22 @@ impl JobProgress {
                 }),
                 ..self
             },
-            EventKind::JobBranchPublished { branch, .. } => JobProgress {
+            EventKind::BranchPushed { branch, .. } => JobProgress {
                 branch: Some(branch.clone()),
                 ..self
             },
-            // `detail` here only matters if the `JobFailed` that always
+            // `detail` here only matters if the `RoundFailed` that always
             // follows is ever missing; when it is not, its reason overwrites.
-            EventKind::JobVerifyFailed { reason } => JobProgress {
+            EventKind::VerifyRejected { reason } => JobProgress {
                 detail: Some(format!("verify rejected the work: {reason}")),
                 ..self
             },
-            EventKind::JobFinished { .. } => JobProgress {
+            EventKind::RoundPassed => JobProgress {
                 state: JobState::Succeeded,
                 last_attempt_duration: self.time_spent_until(event.at),
                 ..self
             },
-            EventKind::JobFailed { reason, .. } => JobProgress {
+            EventKind::RoundFailed { reason } => JobProgress {
                 state: JobState::Failed,
                 last_attempt_duration: self.time_spent_until(event.at),
                 detail: Some(reason.clone()),

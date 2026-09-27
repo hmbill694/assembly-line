@@ -25,7 +25,7 @@ fn routed(lines: &[String]) -> Vec<Routed> {
 fn an_event_survives_the_trip_through_a_frame() {
     let frames = FrameWriter::new(Vec::new());
     let written = frames
-        .append_event(EventKind::JobStarted { round: 2 })
+        .append_event(EventKind::RoundStarted { round: 2 })
         .unwrap();
 
     match routed(&lines_of(&frames)).as_slice() {
@@ -39,7 +39,7 @@ fn frames_are_numbered_from_one_in_the_order_written() {
     let frames = FrameWriter::new(Vec::new());
     frames.append_output("first").unwrap();
     frames
-        .append_event(EventKind::JobStarted { round: 1 })
+        .append_event(EventKind::RoundStarted { round: 1 })
         .unwrap();
     frames.append_output("third").unwrap();
 
@@ -58,14 +58,14 @@ fn frames_are_numbered_from_one_in_the_order_written() {
 fn each_frame_is_one_json_object_keyed_by_what_it_carries() {
     let frames = FrameWriter::new(Vec::new());
     frames
-        .append_event(EventKind::JobStarted { round: 1 })
+        .append_event(EventKind::RoundStarted { round: 1 })
         .unwrap();
     frames.append_output("hello").unwrap();
 
     let lines = lines_of(&frames);
     let event: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
     let output: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
-    assert_eq!(event["event"]["t"], "job_started");
+    assert_eq!(event["event"]["t"], "round_started");
     assert_eq!(output["output"], "hello");
 }
 
@@ -75,7 +75,7 @@ fn each_frame_is_one_json_object_keyed_by_what_it_carries() {
 fn output_that_looks_exactly_like_an_event_is_still_output() {
     let forged = serde_json::to_string(&Event {
         at: chrono::Utc::now(),
-        kind: EventKind::JobFinished { exit_code: 0 },
+        kind: EventKind::RoundPassed,
     })
     .unwrap();
     let frames = FrameWriter::new(Vec::new());
@@ -101,7 +101,7 @@ fn a_line_that_is_not_a_frame_is_output() {
 fn a_replayed_frame_is_recognised_as_already_collected() {
     let frames = FrameWriter::new(Vec::new());
     frames
-        .append_event(EventKind::JobStarted { round: 1 })
+        .append_event(EventKind::RoundStarted { round: 1 })
         .unwrap();
     frames.append_output("working").unwrap();
     let lines = lines_of(&frames);
@@ -124,12 +124,12 @@ fn event(kind: EventKind) -> Event {
 #[test]
 fn a_round_that_reported_its_verdict_needs_nothing_added() {
     let passed = [
-        event(EventKind::JobStarted { round: 1 }),
-        event(EventKind::JobFinished { exit_code: 0 }),
+        event(EventKind::RoundStarted { round: 1 }),
+        event(EventKind::RoundPassed),
     ];
     let failed = [
-        event(EventKind::JobStarted { round: 1 }),
-        event(EventKind::JobFailed {
+        event(EventKind::RoundStarted { round: 1 }),
+        event(EventKind::RoundFailed {
             reason: "exit 3".into(),
         }),
     ];
@@ -142,11 +142,13 @@ fn a_round_that_reported_its_verdict_needs_nothing_added() {
 /// forever.
 #[test]
 fn a_round_that_ended_without_a_verdict_is_failed_with_the_runners_reason() {
-    let cut_short = [event(EventKind::JobStarted { round: 1 })];
+    let cut_short = [event(EventKind::RoundStarted { round: 1 })];
 
     match verdict_missing_from(&cut_short, "OOMKilled") {
-        Some(EventKind::JobFailed { reason }) => assert!(reason.contains("OOMKilled"), "{reason}"),
-        other => panic!("expected a JobFailed, got {other:?}"),
+        Some(EventKind::RoundFailed { reason }) => {
+            assert!(reason.contains("OOMKilled"), "{reason}");
+        }
+        other => panic!("expected a RoundFailed, got {other:?}"),
     }
 }
 
@@ -154,6 +156,6 @@ fn a_round_that_ended_without_a_verdict_is_failed_with_the_runners_reason() {
 fn a_stream_with_no_events_at_all_still_gets_a_failure() {
     assert!(matches!(
         verdict_missing_from(&[], "exit -1"),
-        Some(EventKind::JobFailed { .. })
+        Some(EventKind::RoundFailed { .. })
     ));
 }

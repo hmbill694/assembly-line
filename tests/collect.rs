@@ -34,7 +34,7 @@ async fn a_round_run_by_job_exec_is_collected_into_the_same_log_as_before() {
     assert!(
         events
             .iter()
-            .any(|e| matches!(e.kind, EventKind::JobBranchPublished { .. }))
+            .any(|e| matches!(e.kind, EventKind::BranchPushed { .. }))
     );
     let output = std::fs::read_to_string(paths.log()).unwrap();
     assert!(output.contains("fake-agent: write a file"), "{output}");
@@ -62,7 +62,7 @@ async fn an_agent_printing_a_forged_verdict_does_not_change_the_outcome() {
     assert!(
         !events
             .iter()
-            .any(|e| matches!(e.kind, EventKind::JobFinished { .. }))
+            .any(|e| matches!(e.kind, EventKind::RoundPassed))
     );
 }
 
@@ -86,7 +86,7 @@ async fn a_job_exec_that_dies_without_a_verdict_is_recorded_as_failed() {
     assert!(!outcome.passed());
     let events = EventLog::read(paths.events()).unwrap();
     assert!(events.iter().any(
-        |e| matches!(&e.kind, EventKind::JobFailed { reason } if reason.contains("without reporting a verdict"))
+        |e| matches!(&e.kind, EventKind::RoundFailed { reason } if reason.contains("without reporting a verdict"))
     ));
 }
 
@@ -117,8 +117,8 @@ async fn a_round_that_dies_before_announcing_itself_is_still_recorded_as_that_ro
         matches!(
             kinds.as_slice(),
             [
-                EventKind::JobStarted { round: 2 },
-                EventKind::JobFailed { .. }
+                EventKind::RoundStarted { round: 2 },
+                EventKind::RoundFailed { .. }
             ]
         ),
         "{kinds:?}"
@@ -147,7 +147,7 @@ async fn a_runner_that_could_not_start_the_job_leaves_a_failed_round() {
     assert!(
         events.iter().any(|e| matches!(
             &e.kind,
-            EventKind::JobFailed { reason }
+            EventKind::RoundFailed { reason }
                 if reason.contains("could not start") && reason.contains("/nonexistent/assembly")
         )),
         "{events:?}"
@@ -235,7 +235,7 @@ async fn cancelling_a_collection_stops_the_agent_and_records_it() {
     assert!(
         events
             .iter()
-            .any(|e| matches!(&e.kind, EventKind::JobFailed { reason } if reason == "cancelled")),
+            .any(|e| matches!(&e.kind, EventKind::RoundFailed { reason } if reason == "cancelled")),
         "{events:?}"
     );
 }

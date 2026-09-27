@@ -190,7 +190,7 @@ async fn cancelling_stops_the_container_so_job_exec_reports_the_round() {
     assert!(
         events
             .iter()
-            .any(|e| matches!(&e.kind, EventKind::JobFailed { reason } if reason == "cancelled")),
+            .any(|e| matches!(&e.kind, EventKind::RoundFailed { reason } if reason == "cancelled")),
         "{events:?}"
     );
     let calls = std::fs::read_to_string(&argv).unwrap();

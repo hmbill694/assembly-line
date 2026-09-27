@@ -734,7 +734,7 @@ fn rounds_so_far(events: &[Event]) -> u32 {
     u32::try_from(
         events
             .iter()
-            .filter(|e| matches!(e.kind, EventKind::JobStarted { .. }))
+            .filter(|e| matches!(e.kind, EventKind::RoundStarted { .. }))
             .count(),
     )
     .unwrap_or(u32::MAX)

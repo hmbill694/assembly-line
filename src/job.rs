@@ -89,7 +89,7 @@ pub async fn run_round<W: Write + Send + 'static>(
 ) -> anyhow::Result<JobOutcome> {
     let timeout = payload.command_limit_secs.map(Duration::from_secs);
 
-    frames.append_event(EventKind::JobStarted {
+    frames.append_event(EventKind::RoundStarted {
         round: payload.round,
     })?;
 
@@ -348,15 +348,15 @@ fn record_completion<W: Write>(
 fn work_recorded(work: Option<&AgentWork>) -> Vec<EventKind> {
     work.map(|w| {
         vec![
-            EventKind::JobCommitted {
+            EventKind::RoundCommitted {
                 sha: w.sha.clone(),
                 files: w.stat.files,
                 insertions: w.stat.insertions,
                 deletions: w.stat.deletions,
             },
-            EventKind::JobBranchPublished {
+            EventKind::BranchPushed {
                 branch: w.branch.clone(),
-                pushed_to: Some(w.pushed_to.clone()),
+                pushed_to: w.pushed_to.clone(),
             },
         ]
     })
@@ -369,14 +369,12 @@ fn work_recorded(work: Option<&AgentWork>) -> Vec<EventKind> {
 /// Pure, so the ordering that makes replay correct can be asserted without
 /// running anything. Work is recorded before the verdict that judges it.
 fn events_for_completion(result: RoundResult) -> (Vec<EventKind>, JobOutcome) {
-    let finished = EventKind::JobFinished { exit_code: 0 };
-
     match result {
-        RoundResult::Succeeded => (vec![finished], JobOutcome::Passed),
+        RoundResult::Succeeded => (vec![EventKind::RoundPassed], JobOutcome::Passed),
         RoundResult::Failed { reason, work } => (
             work_recorded(work.as_ref())
                 .into_iter()
-                .chain([EventKind::JobFailed { reason }])
+                .chain([EventKind::RoundFailed { reason }])
                 .collect(),
             JobOutcome::Failed,
         ),
@@ -384,10 +382,10 @@ fn events_for_completion(result: RoundResult) -> (Vec<EventKind>, JobOutcome) {
             work_recorded(work.as_ref())
                 .into_iter()
                 .chain([
-                    EventKind::JobVerifyFailed {
+                    EventKind::VerifyRejected {
                         reason: reason.clone(),
                     },
-                    EventKind::JobFailed {
+                    EventKind::RoundFailed {
                         reason: format!("verify rejected the work: {reason}"),
                     },
                 ])
@@ -397,7 +395,7 @@ fn events_for_completion(result: RoundResult) -> (Vec<EventKind>, JobOutcome) {
         RoundResult::Committed { work } => (
             work_recorded(Some(&work))
                 .into_iter()
-                .chain([finished])
+                .chain([EventKind::RoundPassed])
                 .collect(),
             JobOutcome::Passed,
         ),

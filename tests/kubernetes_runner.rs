@@ -223,12 +223,10 @@ fn a_second_line_with_the_same_timestamp_is_new_but_replaying_it_is_not() {
 fn timestamped_round() -> String {
     let frames = FrameWriter::new(Vec::new());
     frames
-        .append_event(EventKind::JobStarted { round: 1 })
+        .append_event(EventKind::RoundStarted { round: 1 })
         .unwrap();
     frames.append_output("agent working").unwrap();
-    frames
-        .append_event(EventKind::JobFinished { exit_code: 0 })
-        .unwrap();
+    frames.append_event(EventKind::RoundPassed).unwrap();
     String::from_utf8(frames.copy_of_sink())
         .unwrap()
         .lines()
@@ -264,7 +262,7 @@ async fn a_dropped_log_stream_is_resumed_without_duplicating_events() {
     assert!(passed, "{events:?}");
     let started = events
         .iter()
-        .filter(|e| matches!(e.kind, EventKind::JobStarted { .. }))
+        .filter(|e| matches!(e.kind, EventKind::RoundStarted { .. }))
         .count();
     assert_eq!(
         started, 1,
@@ -556,7 +554,7 @@ async fn a_stream_dropped_as_the_pod_finishes_is_drained() {
     assert!(
         events
             .iter()
-            .any(|e| matches!(e.kind, EventKind::JobFinished { .. })),
+            .any(|e| matches!(e.kind, EventKind::RoundPassed)),
         "{events:?}"
     );
     assert!(passed, "{events:?}");
@@ -588,7 +586,7 @@ async fn a_log_stream_that_never_yields_ends_the_round_with_kubectls_complaint()
     assert!(
         events.iter().any(|e| matches!(
             &e.kind,
-            EventKind::JobFailed { reason } if reason.contains("Forbidden")
+            EventKind::RoundFailed { reason } if reason.contains("Forbidden")
         )),
         "{events:?}"
     );
@@ -616,7 +614,7 @@ async fn a_log_stream_that_only_replays_ends_the_round_and_logs_the_line_once() 
     assert!(
         events.iter().any(|e| matches!(
             &e.kind,
-            EventKind::JobFailed { reason } if reason.contains("kept ending with no output")
+            EventKind::RoundFailed { reason } if reason.contains("kept ending with no output")
         )),
         "{events:?}"
     );

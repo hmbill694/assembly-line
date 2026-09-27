@@ -76,6 +76,6 @@ async fn a_failed_install_fails_the_round_before_the_agent_runs() {
         "the agent ran on a toolchain that failed to install"
     );
     assert!(routed.iter().any(|r| matches!(r,
-        Routed::Event { event, .. } if matches!(&event.kind, EventKind::JobFailed { reason } if reason.contains("provisioning"))
+        Routed::Event { event, .. } if matches!(&event.kind, EventKind::RoundFailed { reason } if reason.contains("provisioning"))
     )));
 }

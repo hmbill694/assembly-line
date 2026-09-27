@@ -20,7 +20,7 @@ async fn a_job_leaves_one_branch_carrying_its_work() {
     assert!(outcome.succeeded);
     assert_eq!(outcome.state, JobState::Succeeded);
     assert!(
-        outcome.has(|e| matches!(e, EventKind::JobCommitted { .. })),
+        outcome.has(|e| matches!(e, EventKind::RoundCommitted { .. })),
         "the agent's work should be committed"
     );
     assert!(
@@ -164,14 +164,15 @@ async fn a_failing_agent_preserves_its_work_on_a_branch_and_leaves_no_checkout()
     assert!(!outcome.succeeded);
     assert_eq!(outcome.state, JobState::Failed);
     assert!(
-        outcome.has(|k| matches!(k, EventKind::JobFailed { reason } if reason.contains("exit 3")))
+        outcome
+            .has(|k| matches!(k, EventKind::RoundFailed { reason } if reason.contains("exit 3")))
     );
-    assert!(outcome.has(|k| matches!(k, EventKind::JobCommitted { .. })));
+    assert!(outcome.has(|k| matches!(k, EventKind::RoundCommitted { .. })));
 
     let branch = job_branch_name(outcome.job_id);
     assert!(
         outcome
-            .has(|k| matches!(k, EventKind::JobBranchPublished { branch: b, pushed_to } if *b == branch && pushed_to.as_deref() == Some("origin")))
+            .has(|k| matches!(k, EventKind::BranchPushed { branch: b, pushed_to } if *b == branch && pushed_to == "origin"))
     );
     assert!(
         h.scratch_is_empty(),
@@ -196,7 +197,7 @@ async fn a_checkout_the_agent_write_protected_is_still_discarded_and_its_work_ke
     let outcome = h.run_job("x").await;
 
     assert!(outcome.succeeded, "{:?}", outcome.state);
-    assert!(outcome.has(|k| matches!(k, EventKind::JobCommitted { .. })));
+    assert!(outcome.has(|k| matches!(k, EventKind::RoundCommitted { .. })));
     assert!(
         h.files_on_remote_branch(&job_branch_name(outcome.job_id))
             .await
@@ -248,7 +249,7 @@ async fn a_verify_that_cannot_start_still_records_the_pushed_branch() {
 
     let frames = String::from_utf8_lossy(&output.stdout);
     assert!(
-        frames.contains("\"t\":\"job_branch_published\""),
+        frames.contains("\"t\":\"branch_pushed\""),
         "the pushed branch went unrecorded: {frames}\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -335,15 +336,13 @@ async fn a_refused_push_fails_the_job_and_says_the_work_is_lost() {
 
     assert!(!outcome.succeeded);
     assert!(
-        !outcome.has(|k| matches!(k, EventKind::JobBranchPublished { .. })),
+        !outcome.has(|k| matches!(k, EventKind::BranchPushed { .. })),
         "a branch that never left the clone was recorded as published: {:?}",
         outcome.events
     );
-    assert!(
-        outcome.has(
-            |k| matches!(k, EventKind::JobFailed { reason } if reason.contains("work is lost"))
-        )
-    );
+    assert!(outcome.has(
+        |k| matches!(k, EventKind::RoundFailed { reason } if reason.contains("work is lost"))
+    ));
     assert!(
         h.scratch_is_empty(),
         "the checkout leaked when the push failed"
@@ -383,7 +382,7 @@ async fn an_agent_that_changes_nothing_succeeds_without_committing() {
 
     assert!(outcome.succeeded);
     assert_eq!(outcome.state, JobState::Succeeded);
-    assert!(!outcome.has(|k| matches!(k, EventKind::JobCommitted { .. })));
+    assert!(!outcome.has(|k| matches!(k, EventKind::RoundCommitted { .. })));
 }
 
 /// A clean tree is not proof of an idle agent: one that commits its own work
@@ -396,7 +395,7 @@ async fn an_agent_that_commits_its_own_work_has_it_published() {
     let outcome = h.run_job("self-committed").await;
 
     assert!(outcome.succeeded);
-    assert!(outcome.has(|k| matches!(k, EventKind::JobCommitted { .. })));
+    assert!(outcome.has(|k| matches!(k, EventKind::RoundCommitted { .. })));
     assert_eq!(
         h.file_on_remote_branch(&job_branch_name(outcome.job_id), "agent-output.txt")
             .await
@@ -471,7 +470,7 @@ async fn a_missing_provider_binary_fails_the_job_with_a_useful_message() {
     assert!(!outcome.succeeded);
     assert!(
         outcome.has(
-            |k| matches!(k, EventKind::JobFailed { reason } if reason.contains("definitely-not-real-xyz"))
+            |k| matches!(k, EventKind::RoundFailed { reason } if reason.contains("definitely-not-real-xyz"))
         ),
         "{:?}",
         outcome.events

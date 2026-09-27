@@ -17,19 +17,19 @@ fn a_job_starts_pending() {
 
 #[test]
 fn starting_and_finishing_moves_a_job_through_running_to_succeeded() {
-    let started = vec![EventKind::JobStarted { round: 1 }];
+    let started = vec![EventKind::RoundStarted { round: 1 }];
     assert_eq!(
         JobState::replay(&stream(started.clone())),
         JobState::Running
     );
 
-    let finished = [started, vec![EventKind::JobFinished { exit_code: 0 }]].concat();
+    let finished = [started, vec![EventKind::RoundPassed]].concat();
     assert_eq!(JobState::replay(&stream(finished)), JobState::Succeeded);
 }
 
 #[test]
 fn a_failed_job_is_recorded_as_failed() {
-    let events = stream(vec![EventKind::JobFailed {
+    let events = stream(vec![EventKind::RoundFailed {
         reason: "exit 1".into(),
     }]);
 
@@ -39,8 +39,8 @@ fn a_failed_job_is_recorded_as_failed() {
 #[test]
 fn a_commit_is_progress_not_completion() {
     let through_commit = vec![
-        EventKind::JobStarted { round: 1 },
-        EventKind::JobCommitted {
+        EventKind::RoundStarted { round: 1 },
+        EventKind::RoundCommitted {
             sha: "abc".into(),
             files: 2,
             insertions: 10,
@@ -53,25 +53,21 @@ fn a_commit_is_progress_not_completion() {
         "a commit is not completion"
     );
 
-    let finished = [
-        through_commit,
-        vec![EventKind::JobFinished { exit_code: 0 }],
-    ]
-    .concat();
+    let finished = [through_commit, vec![EventKind::RoundPassed]].concat();
     assert_eq!(JobState::replay(&stream(finished)), JobState::Succeeded);
 }
 
-/// A job's branch is published before its success is judged, so publishing
-/// must not decide the outcome either way.
+/// A round's branch is pushed before its verdict is reached, so pushing must
+/// not decide the verdict either way.
 #[test]
-fn publishing_a_branch_does_not_decide_the_outcome() {
+fn pushing_a_branch_does_not_decide_the_verdict() {
     let failed = JobState::replay(&stream(vec![
-        EventKind::JobStarted { round: 1 },
-        EventKind::JobBranchPublished {
+        EventKind::RoundStarted { round: 1 },
+        EventKind::BranchPushed {
             branch: "al/job-1".into(),
-            pushed_to: None,
+            pushed_to: "origin".into(),
         },
-        EventKind::JobFailed {
+        EventKind::RoundFailed {
             reason: "exit 3".into(),
         },
     ]));
@@ -82,9 +78,9 @@ fn publishing_a_branch_does_not_decide_the_outcome() {
 #[test]
 fn a_revise_round_puts_a_finished_job_back_into_running() {
     let st = JobState::replay(&stream(vec![
-        EventKind::JobStarted { round: 1 },
-        EventKind::JobFinished { exit_code: 0 },
-        EventKind::JobStarted { round: 2 },
+        EventKind::RoundStarted { round: 1 },
+        EventKind::RoundPassed,
+        EventKind::RoundStarted { round: 2 },
     ]));
 
     assert_eq!(st, JobState::Running);
@@ -93,18 +89,18 @@ fn a_revise_round_puts_a_finished_job_back_into_running() {
 #[test]
 fn replay_reconstructs_the_final_state_from_the_log_alone() {
     let st = JobState::replay(&stream(vec![
-        EventKind::JobStarted { round: 1 },
-        EventKind::JobCommitted {
+        EventKind::RoundStarted { round: 1 },
+        EventKind::RoundCommitted {
             sha: "abc".into(),
             files: 1,
             insertions: 1,
             deletions: 0,
         },
-        EventKind::JobBranchPublished {
+        EventKind::BranchPushed {
             branch: "al/job-1".into(),
-            pushed_to: Some("origin".into()),
+            pushed_to: "origin".into(),
         },
-        EventKind::JobFinished { exit_code: 0 },
+        EventKind::RoundPassed,
     ]));
 
     assert_eq!(st, JobState::Succeeded);

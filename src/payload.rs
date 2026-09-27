@@ -61,7 +61,7 @@ pub struct JobPayload {
     pub round: u32,
     /// Where the round clones from and pushes to.
     pub remote_url: String,
-    /// The host's name for that remote, which `JobBranchPublished` records.
+    /// The host's name for that remote, which `BranchPushed` records.
     pub remote_name: String,
     /// The commit the round starts from — the base for round 1, the job's
     /// branch tip for a revise.

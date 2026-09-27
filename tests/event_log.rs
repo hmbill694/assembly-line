@@ -7,21 +7,21 @@ fn appends_and_reads_back_in_order() {
 
     {
         let mut log = EventLog::open_append(&path).unwrap();
-        log.append(EventKind::JobStarted { round: 1 }).unwrap();
-        log.append(EventKind::JobCommitted {
+        log.append(EventKind::RoundStarted { round: 1 }).unwrap();
+        log.append(EventKind::RoundCommitted {
             sha: "abc".into(),
             files: 1,
             insertions: 2,
             deletions: 0,
         })
         .unwrap();
-        log.append(EventKind::JobFinished { exit_code: 0 }).unwrap();
+        log.append(EventKind::RoundPassed).unwrap();
     }
 
     let events = EventLog::read(&path).unwrap();
     assert_eq!(events.len(), 3);
-    assert_eq!(events[0].kind, EventKind::JobStarted { round: 1 });
-    assert_eq!(events[2].kind, EventKind::JobFinished { exit_code: 0 });
+    assert_eq!(events[0].kind, EventKind::RoundStarted { round: 1 });
+    assert_eq!(events[2].kind, EventKind::RoundPassed);
 }
 
 #[test]
@@ -31,11 +31,11 @@ fn reopening_appends_rather_than_truncates() {
 
     EventLog::open_append(&path)
         .unwrap()
-        .append(EventKind::JobStarted { round: 1 })
+        .append(EventKind::RoundStarted { round: 1 })
         .unwrap();
     EventLog::open_append(&path)
         .unwrap()
-        .append(EventKind::JobStarted { round: 2 })
+        .append(EventKind::RoundStarted { round: 2 })
         .unwrap();
 
     assert_eq!(EventLog::read(&path).unwrap().len(), 2);
@@ -45,7 +45,7 @@ fn reopening_appends_rather_than_truncates() {
 fn each_line_is_one_tagged_json_object() {
     // Writing into a buffer rather than a file — the sink is generic.
     let mut log = EventLog::new(Vec::new());
-    log.append(EventKind::JobFailed {
+    log.append(EventKind::RoundFailed {
         reason: "exit 1".into(),
     })
     .unwrap();
@@ -54,7 +54,7 @@ fn each_line_is_one_tagged_json_object() {
     assert_eq!(raw.lines().count(), 1);
 
     let v: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
-    assert_eq!(v["t"], "job_failed");
+    assert_eq!(v["t"], "round_failed");
     assert_eq!(v["reason"], "exit 1");
     assert!(v["at"].is_string());
 }
@@ -72,63 +72,47 @@ fn read_of_a_missing_file_is_empty() {
 #[test]
 fn a_torn_final_line_is_ignored() {
     let raw = concat!(
-        r#"{"at":"2026-08-15T00:00:00Z","t":"job_started","round":1}"#,
+        r#"{"at":"2026-08-15T00:00:00Z","t":"round_started","round":1}"#,
         "\n",
-        r#"{"t":"job_fin"#,
+        r#"{"t":"round_pa"#,
     );
     let events: Vec<Event> = read_events(raw.as_bytes()).unwrap();
     assert_eq!(events.len(), 1);
-    assert!(matches!(events[0].kind, EventKind::JobStarted { .. }));
+    assert!(matches!(events[0].kind, EventKind::RoundStarted { .. }));
 }
 
 #[test]
 fn blank_lines_are_ignored() {
     let raw = concat!(
-        r#"{"at":"2026-08-15T00:00:00Z","t":"job_started","round":1}"#,
+        r#"{"at":"2026-08-15T00:00:00Z","t":"round_started","round":1}"#,
         "\n\n\n",
-        r#"{"at":"2026-08-15T00:00:01Z","t":"job_finished","exit_code":0}"#,
+        r#"{"at":"2026-08-15T00:00:01Z","t":"round_passed"}"#,
         "\n",
     );
     assert_eq!(read_events(raw.as_bytes()).unwrap().len(), 2);
 }
 
 #[test]
-fn a_branch_published_event_round_trips_through_the_log() {
+fn a_branch_pushed_event_round_trips_through_the_log() {
     let mut log = EventLog::new(Vec::new());
-    log.append(EventKind::JobBranchPublished {
+    log.append(EventKind::BranchPushed {
         branch: "al/job-1".into(),
-        pushed_to: Some("origin".into()),
+        pushed_to: "origin".into(),
     })
     .unwrap();
 
     let raw = String::from_utf8(log.sink().clone()).unwrap();
     let v: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
-    assert_eq!(v["t"], "job_branch_published");
+    assert_eq!(v["t"], "branch_pushed");
     assert_eq!(v["branch"], "al/job-1");
     assert_eq!(v["pushed_to"], "origin");
 
     let read_back = read_events(raw.as_bytes()).unwrap();
     assert_eq!(
         read_back[0].kind,
-        EventKind::JobBranchPublished {
+        EventKind::BranchPushed {
             branch: "al/job-1".into(),
-            pushed_to: Some("origin".into()),
+            pushed_to: "origin".into(),
         }
     );
-}
-
-/// A repository with no remote keeps its branch locally. That is a complete
-/// outcome, so it is recorded rather than omitted.
-#[test]
-fn a_branch_that_stayed_local_records_no_remote() {
-    let mut log = EventLog::new(Vec::new());
-    log.append(EventKind::JobBranchPublished {
-        branch: "al/job-1".into(),
-        pushed_to: None,
-    })
-    .unwrap();
-
-    let raw = String::from_utf8(log.sink().clone()).unwrap();
-    let v: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
-    assert!(v["pushed_to"].is_null());
 }

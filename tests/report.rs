@@ -16,7 +16,7 @@ fn timeline(entries: Vec<(i64, EventKind)>) -> Vec<Event> {
 }
 
 fn committed(files: usize, insertions: usize, deletions: usize) -> EventKind {
-    EventKind::JobCommitted {
+    EventKind::RoundCommitted {
         sha: "abc".into(),
         files,
         insertions,
@@ -27,10 +27,10 @@ fn committed(files: usize, insertions: usize, deletions: usize) -> EventKind {
 #[test]
 fn summarizes_state_rounds_duration_and_detail() {
     let events = timeline(vec![
-        (0, EventKind::JobStarted { round: 1 }),
+        (0, EventKind::RoundStarted { round: 1 }),
         (
             9,
-            EventKind::JobFailed {
+            EventKind::RoundFailed {
                 reason: "exit 1".into(),
             },
         ),
@@ -59,10 +59,10 @@ fn a_job_with_no_events_is_pending() {
 #[test]
 fn a_revised_job_reports_its_last_round() {
     let events = timeline(vec![
-        (0, EventKind::JobStarted { round: 1 }),
-        (10, EventKind::JobFinished { exit_code: 0 }),
-        (10, EventKind::JobStarted { round: 2 }),
-        (13, EventKind::JobFinished { exit_code: 0 }),
+        (0, EventKind::RoundStarted { round: 1 }),
+        (10, EventKind::RoundPassed),
+        (10, EventKind::RoundStarted { round: 2 }),
+        (13, EventKind::RoundPassed),
     ]);
 
     let report = JobReport::from_events(1, &events);
@@ -74,15 +74,15 @@ fn a_revised_job_reports_its_last_round() {
 #[test]
 fn a_new_round_clears_the_previous_rounds_failure_reason() {
     let events = timeline(vec![
-        (0, EventKind::JobStarted { round: 1 }),
+        (0, EventKind::RoundStarted { round: 1 }),
         (
             1,
-            EventKind::JobFailed {
+            EventKind::RoundFailed {
                 reason: "exit 1".into(),
             },
         ),
-        (2, EventKind::JobStarted { round: 2 }),
-        (3, EventKind::JobFinished { exit_code: 0 }),
+        (2, EventKind::RoundStarted { round: 2 }),
+        (3, EventKind::RoundPassed),
     ]);
 
     let report = JobReport::from_events(1, &events);
@@ -95,9 +95,9 @@ fn a_new_round_clears_the_previous_rounds_failure_reason() {
 #[test]
 fn a_job_reports_the_diff_it_committed() {
     let events = timeline(vec![
-        (0, EventKind::JobStarted { round: 1 }),
+        (0, EventKind::RoundStarted { round: 1 }),
         (1, committed(3, 120, 4)),
-        (2, EventKind::JobFinished { exit_code: 0 }),
+        (2, EventKind::RoundPassed),
     ]);
 
     let diff = JobReport::from_events(1, &events).diff.expect("a diff");
@@ -119,18 +119,18 @@ fn one_changed_file_is_not_pluralised() {
 #[test]
 fn the_branch_is_reported_even_for_a_failed_job() {
     let events = timeline(vec![
-        (0, EventKind::JobStarted { round: 1 }),
+        (0, EventKind::RoundStarted { round: 1 }),
         (1, committed(1, 1, 0)),
         (
             1,
-            EventKind::JobBranchPublished {
+            EventKind::BranchPushed {
                 branch: "al/job-4".into(),
-                pushed_to: Some("origin".into()),
+                pushed_to: "origin".into(),
             },
         ),
         (
             2,
-            EventKind::JobFailed {
+            EventKind::RoundFailed {
                 reason: "verify failed".into(),
             },
         ),
@@ -145,13 +145,13 @@ fn the_branch_is_reported_even_for_a_failed_job() {
 #[test]
 fn the_summary_line_names_the_round_the_diff_and_the_reason() {
     let events = timeline(vec![
-        (0, EventKind::JobStarted { round: 1 }),
-        (0, EventKind::JobFinished { exit_code: 0 }),
-        (0, EventKind::JobStarted { round: 2 }),
+        (0, EventKind::RoundStarted { round: 1 }),
+        (0, EventKind::RoundPassed),
+        (0, EventKind::RoundStarted { round: 2 }),
         (1, committed(3, 40, 2)),
         (
             2,
-            EventKind::JobFailed {
+            EventKind::RoundFailed {
                 reason: "verify failed".into(),
             },
         ),
@@ -174,16 +174,16 @@ fn the_summary_line_of_an_untouched_job_says_pending() {
 #[test]
 fn status_of_a_finished_job_names_its_timing_and_branch() {
     let events = timeline(vec![
-        (0, EventKind::JobStarted { round: 1 }),
+        (0, EventKind::RoundStarted { round: 1 }),
         (1, committed(1, 1, 0)),
         (
             1,
-            EventKind::JobBranchPublished {
+            EventKind::BranchPushed {
                 branch: "al/job-4".into(),
-                pushed_to: Some("origin".into()),
+                pushed_to: "origin".into(),
             },
         ),
-        (3, EventKind::JobFinished { exit_code: 0 }),
+        (3, EventKind::RoundPassed),
     ]);
 
     assert_eq!(
@@ -206,7 +206,7 @@ fn status_of_an_untouched_job_is_its_summary_alone() {
 
 #[test]
 fn timing_is_reported_only_once_a_round_has_ended() {
-    let running = timeline(vec![(0, EventKind::JobStarted { round: 1 })]);
+    let running = timeline(vec![(0, EventKind::RoundStarted { round: 1 })]);
     assert!(
         JobReport::from_events(1, &running)
             .to_duration_line()
@@ -214,8 +214,8 @@ fn timing_is_reported_only_once_a_round_has_ended() {
     );
 
     let ended = timeline(vec![
-        (0, EventKind::JobStarted { round: 1 }),
-        (2, EventKind::JobFinished { exit_code: 0 }),
+        (0, EventKind::RoundStarted { round: 1 }),
+        (2, EventKind::RoundPassed),
     ]);
     assert_eq!(
         JobReport::from_events(1, &ended)

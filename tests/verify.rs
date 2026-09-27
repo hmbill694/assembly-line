@@ -43,11 +43,11 @@ async fn a_job_whose_verify_fails_is_a_failed_job() {
 
     assert!(!outcome.succeeded, "a failing verify fails the job");
     assert!(
-        outcome.has(|e| matches!(e, EventKind::JobVerifyFailed { .. })),
+        outcome.has(|e| matches!(e, EventKind::VerifyRejected { .. })),
         "the failure should say verify was what rejected it"
     );
     assert!(
-        outcome.has(|e| matches!(e, EventKind::JobCommitted { .. })),
+        outcome.has(|e| matches!(e, EventKind::RoundCommitted { .. })),
         "the agent's work is still committed even though verify rejected it"
     );
 
@@ -55,8 +55,8 @@ async fn a_job_whose_verify_fails_is_a_failed_job() {
     assert!(
         outcome.has(|e| matches!(
             e,
-            EventKind::JobBranchPublished { branch: b, pushed_to }
-                if *b == branch && pushed_to.as_deref() == Some("origin")
+            EventKind::BranchPushed { branch: b, pushed_to }
+                if *b == branch && pushed_to == "origin"
         )),
         "the branch survives a failed verify — that is what makes it inspectable"
     );
@@ -94,7 +94,7 @@ async fn a_job_whose_verify_passes_succeeds() {
         outcome.succeeded,
         "verify runs in the job's checkout after the commit, so it sees the work"
     );
-    assert!(!outcome.has(|e| matches!(e, EventKind::JobVerifyFailed { .. })));
+    assert!(!outcome.has(|e| matches!(e, EventKind::VerifyRejected { .. })));
     assert!(
         outcome.output.contains(VERIFY_RAN),
         "a round the agent succeeded is a round verify is asked about"
@@ -117,7 +117,7 @@ async fn a_job_with_no_verify_succeeds_on_the_agents_exit_code() {
 /// stronger claim than merely being out-voted.
 ///
 /// The event assertions alone cannot tell those apart: a verify whose answer
-/// is discarded also writes no `JobVerifyFailed`. The job log can, which is
+/// is discarded also writes no `VerifyRejected`. The job log can, which is
 /// why this `verify` announces itself before failing.
 #[tokio::test]
 async fn an_agent_failure_wins_over_verify() {
@@ -131,12 +131,12 @@ async fn an_agent_failure_wins_over_verify() {
 
     assert!(!outcome.succeeded);
     assert!(
-        outcome.has(|e| matches!(e, EventKind::JobFailed { reason } if reason == "exit 3")),
+        outcome.has(|e| matches!(e, EventKind::RoundFailed { reason } if reason == "exit 3")),
         "the job failed for the agent's reason, not verify's: {:?}",
         outcome.events
     );
     assert!(
-        !outcome.has(|e| matches!(e, EventKind::JobVerifyFailed { .. })),
+        !outcome.has(|e| matches!(e, EventKind::VerifyRejected { .. })),
         "nothing may claim verify rejected work it never looked at"
     );
     assert!(
@@ -145,7 +145,7 @@ async fn an_agent_failure_wins_over_verify() {
         outcome.output
     );
     assert!(
-        outcome.has(|e| matches!(e, EventKind::JobCommitted { .. })),
+        outcome.has(|e| matches!(e, EventKind::RoundCommitted { .. })),
         "the work the agent got as far as is still committed"
     );
 }
@@ -165,12 +165,13 @@ async fn a_verify_cut_off_by_max_duration_is_not_a_rejection() {
 
     assert!(!outcome.succeeded, "an unfinished verify still fails a job");
     assert!(
-        !outcome.has(|e| matches!(e, EventKind::JobVerifyFailed { .. })),
+        !outcome.has(|e| matches!(e, EventKind::VerifyRejected { .. })),
         "a timed-out verify reached no verdict, so it is not a rejection"
     );
     assert!(
-        outcome
-            .has(|e| matches!(e, EventKind::JobFailed { reason } if reason == "verify timed out")),
+        outcome.has(
+            |e| matches!(e, EventKind::RoundFailed { reason } if reason == "verify timed out")
+        ),
         "the failure names what actually happened: {:?}",
         outcome.events
     );

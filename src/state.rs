@@ -27,15 +27,15 @@ impl JobState {
     /// `Iterator::fold`.
     fn after_event(self, event: &Event) -> Self {
         match &event.kind {
-            EventKind::JobStarted { .. } => JobState::Running,
-            EventKind::JobFinished { .. } => JobState::Succeeded,
-            EventKind::JobFailed { .. } => JobState::Failed,
+            EventKind::RoundStarted { .. } => JobState::Running,
+            EventKind::RoundPassed => JobState::Succeeded,
+            EventKind::RoundFailed { .. } => JobState::Failed,
             // Progress markers, not transitions. Listed one by one rather
             // than behind a catch-all, so a new event kind is a compile error
             // here instead of a silent omission.
-            EventKind::JobCommitted { .. }
-            | EventKind::JobBranchPublished { .. }
-            | EventKind::JobVerifyFailed { .. } => self,
+            EventKind::RoundCommitted { .. }
+            | EventKind::BranchPushed { .. }
+            | EventKind::VerifyRejected { .. } => self,
         }
     }
 

@@ -49,8 +49,8 @@ pub async fn collect<J: RunningJob>(
 fn start_missing_from(round_events: &[Event], round: u32) -> Option<EventKind> {
     (!round_events
         .iter()
-        .any(|e| matches!(e.kind, EventKind::JobStarted { .. })))
-    .then_some(EventKind::JobStarted { round })
+        .any(|e| matches!(e.kind, EventKind::RoundStarted { .. })))
+    .then_some(EventKind::RoundStarted { round })
 }
 
 /// Route every line of the job's stream to the event log or the output log
@@ -113,8 +113,8 @@ pub fn record_launch_failure(
     round: u32,
     error: &anyhow::Error,
 ) -> anyhow::Result<JobOutcome> {
-    log.append(EventKind::JobStarted { round })?;
-    log.append(EventKind::JobFailed {
+    log.append(EventKind::RoundStarted { round })?;
+    log.append(EventKind::RoundFailed {
         reason: format!("the runner could not start the job: {error}"),
     })?;
     Ok(JobOutcome::Failed)
@@ -126,8 +126,8 @@ fn outcome_of(round: &[Event]) -> JobOutcome {
         .iter()
         .rev()
         .find_map(|e| match e.kind {
-            EventKind::JobFinished { .. } => Some(JobOutcome::Passed),
-            EventKind::JobFailed { .. } => Some(JobOutcome::Failed),
+            EventKind::RoundPassed => Some(JobOutcome::Passed),
+            EventKind::RoundFailed { .. } => Some(JobOutcome::Failed),
             _ => None,
         })
         .unwrap_or(JobOutcome::Failed)
