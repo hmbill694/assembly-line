@@ -88,12 +88,9 @@ impl JobProgress {
                 branch: Some(branch.clone()),
                 ..self
             },
-            // `detail` here only matters if the `RoundFailed` that always
-            // follows is ever missing; when it is not, its reason overwrites.
-            EventKind::VerifyRejected { reason } => JobProgress {
-                detail: Some(format!("verify rejected the work: {reason}")),
-                ..self
-            },
+            // The `RoundFailed` that follows carries the reason, worded by
+            // `round.rs`.
+            EventKind::VerifyRejected { .. } => self,
             EventKind::RoundPassed => JobProgress {
                 state: JobState::Passed,
                 last_round_duration: self.time_spent_until(event.at),

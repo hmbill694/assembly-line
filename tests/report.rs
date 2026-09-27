@@ -92,6 +92,39 @@ fn a_new_round_clears_the_previous_rounds_failure_reason() {
     assert!(report.diff.is_none(), "stale diff survived");
 }
 
+/// `verify`'s ruling is not the round's verdict: the reason a rejected round
+/// reports is the one its `RoundFailed` records.
+#[test]
+fn a_rejected_rounds_reason_comes_from_its_verdict_alone() {
+    let ruled = timeline(vec![
+        (0, EventKind::RoundStarted { round: 1 }),
+        (
+            1,
+            EventKind::VerifyRejected {
+                reason: "tests failed".into(),
+            },
+        ),
+    ]);
+    let report = JobReport::from_events(1, &ruled);
+    assert_eq!(report.state, JobState::Running);
+    assert!(report.detail.is_none(), "{:?}", report.detail);
+
+    let failed = [
+        ruled,
+        timeline(vec![(
+            2,
+            EventKind::RoundFailed {
+                reason: "verify rejected the work: tests failed".into(),
+            },
+        )]),
+    ]
+    .concat();
+    assert_eq!(
+        JobReport::from_events(1, &failed).detail.as_deref(),
+        Some("verify rejected the work: tests failed")
+    );
+}
+
 #[test]
 fn a_job_reports_the_diff_it_committed() {
     let events = timeline(vec![
