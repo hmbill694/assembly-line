@@ -1,26 +1,17 @@
 { pkgs, ... }:
 
 {
-  # `rust-toolchain.toml` stays the single source of truth for the version, so
-  # a contributor without nix, this shell, and CI can never disagree about
-  # which compiler built the code.
+  # `rust-toolchain.toml` is the single source of truth for the version and
+  # the components, so a contributor without nix, this shell, and CI can never
+  # disagree about which compiler built the code. devenv reads the file rather
+  # than taking a channel here — the shell has no rustup to honour it itself.
   languages.rust = {
     enable = true;
-    channel = "stable";
-    components = [
-      "rustc"
-      "cargo"
-      "clippy"
-      "rustfmt"
-      # rust-analyzer is part of the environment rather than a per-machine
-      # install, because it must match the pinned toolchain — a mismatched
-      # server crashes on startup rather than degrading.
-      "rust-analyzer"
-      "rust-src"
-    ];
+    toolchainFile = ./rust-toolchain.toml;
   };
 
   packages = with pkgs; [
+    cargo-audit # `just audit`, CI's advisory Audit job
     git
     jujutsu # the repo is organised as a jj stack; see CLAUDE.md
     just
