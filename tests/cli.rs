@@ -8,7 +8,8 @@ mod support;
 
 fn assembly(tmp: &tempfile::TempDir) -> Command {
     let mut cmd = Command::cargo_bin("assembly").unwrap();
-    cmd.current_dir(tmp.path());
+    cmd.current_dir(tmp.path())
+        .env("PATH", support::path_where_gh_refuses());
     cmd
 }
 

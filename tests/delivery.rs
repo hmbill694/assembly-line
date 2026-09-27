@@ -2,7 +2,6 @@ use assembly_line::config::{Delivery, DeliveryMode, RepoConfig};
 use assembly_line::delivery::{Delivered, PullRequestText, deliver};
 use assembly_line::git;
 use assert_cmd::Command;
-use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use std::path::PathBuf;
 use support::commit_all;
@@ -70,7 +69,8 @@ fn delivery_is_configurable_from_the_repositorys_own_config() {
 
 fn assembly(tmp: &tempfile::TempDir) -> Command {
     let mut cmd = Command::cargo_bin("assembly").unwrap();
-    cmd.current_dir(tmp.path());
+    cmd.current_dir(tmp.path())
+        .env("PATH", support::path_where_gh_refuses());
     cmd
 }
 
@@ -151,9 +151,9 @@ fn fake_gh_capturing_args(tmp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
 /// Delivery is gated on `verify`: a job's branch is real work either way, but
 /// a pull request for work that failed `verify` is noise. If delivery were
 /// not gated on `failed`, this job's branch would reach `deliver` in `Pr`
-/// mode; with no `gh` on the test machine, that prints "pushed ... no pull
-/// request opened", never "not delivered" — so this assertion only passes
-/// when the gate is in place.
+/// mode; the `gh` on this test's `PATH` refuses, so that prints "pushed ...
+/// no pull request opened", never "not delivered" — so this assertion only
+/// passes when the gate is in place.
 #[tokio::test]
 async fn a_failed_job_is_not_delivered() {
     let tmp = repo_running("fake-agent.sh", "exit 1").await;
@@ -172,11 +172,8 @@ async fn a_failed_job_is_not_delivered() {
 /// regression that dropped it would pass the whole suite. A passing revise
 /// round must deliver just as a passing `run` does.
 ///
-/// The assertion has to hold whether or not `gh` is installed on the test
-/// machine, so it checks what is true either way: the printed line says the
-/// branch was pushed or a pull request opened — never "not delivered", which
-/// only happens when the gate skips delivery — and the remote's branch
-/// carries both rounds.
+/// The `gh` on this test's `PATH` always refuses, so reaching delivery prints
+/// "no pull request opened"; a skipped gate would print "not delivered".
 #[tokio::test]
 async fn a_passing_revise_round_is_delivered() {
     let tmp = repo_running("revising-agent.sh", "true").await;
@@ -191,8 +188,9 @@ async fn a_passing_revise_round_is_delivered() {
         .assert()
         .success()
         .stdout(contains("round 2"))
-        .stdout(contains("pushed").or(contains("opened")))
-        .stdout(contains("not delivered").not());
+        .stdout(contains(
+            "no pull request opened: gh is not available to tests",
+        ));
 
     let rounds = git::file_at_ref(origin_for(&tmp), "al/job-1", "rounds.txt")
         .await

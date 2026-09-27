@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "gh is not available to tests" >&2
+exit 1

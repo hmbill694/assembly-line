@@ -29,6 +29,17 @@ pub fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// `PATH` with a `gh` in front that always refuses. A passing job delivers by
+/// running `gh pr create`, and a test must never reach the developer's real
+/// `gh`, which is signed in and on the network.
+pub fn path_where_gh_refuses() -> String {
+    format!(
+        "{}:{}",
+        fixture("no-gh").display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
 /// Write an executable shell script called `name` into `dir` — a stand-in
 /// for a CLI such as `docker`, so no test ever reaches the real one.
 pub fn fake_cli(dir: &Path, name: &str, body: &str) -> PathBuf {
