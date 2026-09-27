@@ -14,7 +14,9 @@ use crate::paths::{self, JobMeta, JobPaths};
 use crate::payload::{self, RoundPayload, RoundRequest};
 use crate::report::JobReport;
 use crate::round::Verdict;
-use crate::runner::{JobSecrets, Runner, RunnerProblem, reasons_a_container_cannot_run};
+use crate::runner::{
+    JobSecrets, Runner, RunnerProblem, payload_fitted_to, secrets_or_reasons_it_cannot_run,
+};
 use crate::workspace::{DEFAULT_REMOTE, JOB_BRANCH_PATTERN, job_branch_name};
 use anyhow::anyhow;
 use std::path::{Path, PathBuf};
@@ -271,9 +273,17 @@ pub async fn prepare_start<'r, R: Runner>(
         Ok(branches) => branches,
         Err(e) => return Prepared::refused(notes, Refusal::Unpreparable(e)),
     };
-    let secrets = match runnable_secrets(runner, &config, &located.remote_url, pass_env).await {
+    let secrets = match secrets_or_reasons_it_cannot_run(
+        runner,
+        &config.copy,
+        &located.remote_url,
+        pass_env,
+        |name| std::env::var(name).ok(),
+    )
+    .await
+    {
         Ok(secrets) => secrets,
-        Err(refusal) => return Prepared::refused(notes, refusal),
+        Err(problems) => return Prepared::refused(notes, Refusal::RunnerCannotRun(problems)),
     };
 
     Prepared {
@@ -314,9 +324,17 @@ pub async fn prepare_revision<'r, R: Runner>(
         Ok((config, _)) => config,
         Err(refusal) => return Prepared::refused(notes, refusal),
     };
-    let secrets = match runnable_secrets(runner, &config, &located.remote_url, pass_env).await {
+    let secrets = match secrets_or_reasons_it_cannot_run(
+        runner,
+        &config.copy,
+        &located.remote_url,
+        pass_env,
+        |name| std::env::var(name).ok(),
+    )
+    .await
+    {
         Ok(secrets) => secrets,
-        Err(refusal) => return Prepared::refused(notes, refusal),
+        Err(problems) => return Prepared::refused(notes, Refusal::RunnerCannotRun(problems)),
     };
     let log = match EventLog::open_append(located.paths.events()) {
         Ok(log) => log,
@@ -378,7 +396,7 @@ pub async fn run<R: Runner>(
         Destination::ExistingJob { paths, round, log } => (paths, log, round),
     };
 
-    let payload = payload_for_runner::<R>(
+    let payload = RoundPayload::for_round(
         &config,
         RoundRequest {
             job_id: paths.id,
@@ -392,7 +410,8 @@ pub async fn run<R: Runner>(
             // against the repository — not against wherever the user stands.
             seed_from: &meta.repo,
         },
-    )?;
+    )
+    .map(payload_fitted_to::<R>)?;
     let verdict = collect_round(runner, &payload, &secrets, &mut log, &paths.log(), cancel).await?;
 
     let report = events_of(&paths)
@@ -611,36 +630,6 @@ fn runnable_config_and_provider(
     (warnings, runnable)
 }
 
-/// The secrets the chosen runner will carry into the job, once nothing about
-/// the runner stands in the way.
-async fn runnable_secrets<R: Runner>(
-    runner: &R,
-    config: &RepoConfig,
-    remote_url: &str,
-    pass_env: &[String],
-) -> Result<JobSecrets, Refusal> {
-    let (secrets, missing) = match R::RUNS_IN_A_CONTAINER {
-        true => JobSecrets::from_host_environment(pass_env),
-        false => (JobSecrets::default(), Vec::new()),
-    };
-    let container = match R::RUNS_IN_A_CONTAINER {
-        true => reasons_a_container_cannot_run(&config.copy, remote_url),
-        false => Vec::new(),
-    };
-    let problems: Vec<RunnerProblem> = runner
-        .reasons_it_cannot_run()
-        .await
-        .into_iter()
-        .chain(container)
-        .chain(missing)
-        .collect();
-
-    match problems.is_empty() {
-        true => Ok(secrets),
-        false => Err(Refusal::RunnerCannotRun(problems)),
-    }
-}
-
 /// A new job's directory, its `meta.json` and its open event log.
 ///
 /// Called only once the round is known good, so a repository that has not
@@ -661,26 +650,6 @@ fn allocate_job(
     EventLog::open_append(paths.events())
         .map(|log| (paths, log))
         .map_err(|e| anyhow!("opening the event log: {e}"))
-}
-
-/// A round's payload, fitted to where it runs. A container has neither the
-/// host's toolchain nor its SSH keys, so it provisions the one and reaches
-/// the remote over HTTPS, with a token, in place of the other.
-fn payload_for_runner<R: Runner>(
-    config: &RepoConfig,
-    request: RoundRequest<'_>,
-) -> anyhow::Result<RoundPayload> {
-    let request = RoundRequest {
-        remote_url: match R::RUNS_IN_A_CONTAINER {
-            true => payload::https_equivalent(&request.remote_url),
-            false => request.remote_url,
-        },
-        ..request
-    };
-    RoundPayload::for_round(config, request).map(|payload| RoundPayload {
-        provision_toolchain: R::RUNS_IN_A_CONTAINER,
-        ..payload
-    })
 }
 
 /// Launch the round and collect it. A launch failure is a failed round, not
