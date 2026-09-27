@@ -3,7 +3,7 @@
 
 use crate::event::{Event, EventKind, EventLog};
 use crate::frame::{Routed, StreamPosition, verdict_missing_from};
-use crate::job::Verdict;
+use crate::round::Verdict;
 use crate::runner::RunningJob;
 use std::io::Write;
 use std::path::Path;

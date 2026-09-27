@@ -1,9 +1,9 @@
-//! Running one job: a repository, a ref and a prompt.
+//! Running one round of a job: a repository, a start commit and a prompt.
 //!
-//! A job is stateless. Its checkout is a scratch clone and is discarded
-//! whatever happened, including on failure; its branch, pushed to the
+//! A round is stateless. Its checkout is a scratch clone and is discarded
+//! whatever happened, including on failure; the job's branch, pushed to the
 //! remote, is the whole durable output — which is why work is committed and
-//! pushed *before* success is decided, and why a round that cannot push
+//! pushed *before* the verdict is reached, and why a round that cannot push
 //! fails.
 
 use crate::event::EventKind;

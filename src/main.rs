@@ -1,8 +1,8 @@
 use assembly_line::cli::{Cli, Command, RunnerArgs, RunnerKind};
 use assembly_line::frame::FrameWriter;
-use assembly_line::job::{Verdict, run_round};
 use assembly_line::lifecycle::{self, Note, Prepared, Refusal, RevisionRequest, StartRequest};
 use assembly_line::payload::JobPayload;
+use assembly_line::round::{Verdict, run_round};
 use assembly_line::runner::docker::DockerRunner;
 use assembly_line::runner::kubernetes::KubernetesRunner;
 use assembly_line::runner::local::LocalRunner;
