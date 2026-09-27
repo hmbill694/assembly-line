@@ -145,17 +145,10 @@ enum Work {
 /// The one place flags become a concrete runner; everything after it is
 /// generic over [`Runner`].
 async fn run_work_on_chosen_runner(args: RunnerArgs, work: Work) -> Result<ExitCode, String> {
+    if let Some(inapplicable) = args.inapplicable_flags() {
+        return Err(inapplicable.to_string());
+    }
     match args.runner {
-        RunnerKind::Local | RunnerKind::Docker
-            if args.namespace.is_some() || args.context.is_some() =>
-        {
-            Err("--namespace and --context apply to the k8s runner".into())
-        }
-        RunnerKind::Local if args.image.is_some() || !args.pass_env.is_empty() => Err(
-            "--image and --pass-env apply to container runners; the local runner uses your \
-             machine as it is"
-                .into(),
-        ),
         RunnerKind::Local => {
             run_work(
                 &LocalRunner::current_binary().map_err(|e| e.to_string())?,

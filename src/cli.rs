@@ -111,3 +111,40 @@ pub struct RunnerArgs {
     #[arg(long)]
     pub context: Option<String>,
 }
+
+impl RunnerArgs {
+    /// Flags given for a runner that has no use for them.
+    #[must_use]
+    pub fn inapplicable_flags(&self) -> Option<InapplicableFlags> {
+        match self.runner {
+            RunnerKind::Local | RunnerKind::Docker
+                if self.namespace.is_some() || self.context.is_some() =>
+            {
+                Some(InapplicableFlags::KubernetesOnly)
+            }
+            RunnerKind::Local if self.image.is_some() || !self.pass_env.is_empty() => {
+                Some(InapplicableFlags::ContainerOnly)
+            }
+            RunnerKind::Local | RunnerKind::Docker | RunnerKind::K8s => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InapplicableFlags {
+    KubernetesOnly,
+    ContainerOnly,
+}
+
+impl std::fmt::Display for InapplicableFlags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::KubernetesOnly => write!(f, "--namespace and --context apply to the k8s runner"),
+            Self::ContainerOnly => write!(
+                f,
+                "--image and --pass-env apply to container runners; the local runner uses your \
+                 machine as it is"
+            ),
+        }
+    }
+}

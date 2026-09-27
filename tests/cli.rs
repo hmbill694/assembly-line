@@ -1,5 +1,7 @@
+use assembly_line::cli::{Cli, Command as Subcommand, InapplicableFlags};
 use assembly_line::config::REPO_CONFIG_PATH;
 use assert_cmd::Command;
+use clap::Parser;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use support::commit_all;
@@ -700,4 +702,61 @@ async fn a_namespace_is_refused_for_runners_that_have_none() {
         .code(2)
         .stderr(contains("k8s runner"));
     discard_origin(&tmp);
+}
+
+fn inapplicable_flags_of(argv: &[&str]) -> Option<InapplicableFlags> {
+    match Cli::try_parse_from(argv).unwrap().command {
+        Subcommand::Run { runner, .. } | Subcommand::Revise { runner, .. } => {
+            runner.inapplicable_flags()
+        }
+        other => panic!("not a command that runs a job: {other:?}"),
+    }
+}
+
+#[test]
+fn a_kubectl_context_is_inapplicable_to_docker() {
+    assert_eq!(
+        inapplicable_flags_of(&[
+            "assembly",
+            "run",
+            "--prompt",
+            "x",
+            "--runner",
+            "docker",
+            "--context",
+            "c"
+        ]),
+        Some(InapplicableFlags::KubernetesOnly)
+    );
+}
+
+#[test]
+fn pass_env_is_inapplicable_to_the_local_runner() {
+    assert_eq!(
+        inapplicable_flags_of(&["assembly", "revise", "1", "fb", "--pass-env", "KEY"]),
+        Some(InapplicableFlags::ContainerOnly)
+    );
+}
+
+#[test]
+fn every_flag_applies_to_the_k8s_runner() {
+    assert_eq!(
+        inapplicable_flags_of(&[
+            "assembly",
+            "run",
+            "--prompt",
+            "x",
+            "--runner",
+            "k8s",
+            "--namespace",
+            "n",
+            "--context",
+            "c",
+            "--image",
+            "i",
+            "--pass-env",
+            "KEY",
+        ]),
+        None
+    );
 }
