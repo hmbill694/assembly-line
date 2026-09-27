@@ -1,8 +1,51 @@
 use assembly_line::payload::{
-    GIT_TOKEN_VAR, PAYLOAD_VAR, https_equivalent, is_path_on_this_machine,
+    GIT_TOKEN_VAR, PAYLOAD_VAR, RoundPayload, https_equivalent, is_path_on_this_machine,
 };
 use assembly_line::runner::docker::docker_run_args;
-use assembly_line::runner::{JobSecrets, RunnerProblem, reasons_a_container_cannot_run};
+use assembly_line::runner::local::LocalRound;
+use assembly_line::runner::{
+    JobSecrets, Runner, RunnerProblem, reasons_a_container_cannot_run,
+    secrets_or_reasons_it_cannot_run,
+};
+use tokio_util::sync::CancellationToken;
+
+/// A runner that reports `problems` and never launches, running rounds in a
+/// container or not as `IN_A_CONTAINER` says.
+struct RunnerReporting<const IN_A_CONTAINER: bool> {
+    problems: Vec<RunnerProblem>,
+}
+
+impl<const IN_A_CONTAINER: bool> Runner for RunnerReporting<IN_A_CONTAINER> {
+    type Running = LocalRound;
+    const RUNS_IN_A_CONTAINER: bool = IN_A_CONTAINER;
+
+    fn reasons_it_cannot_run(&self) -> impl Future<Output = Vec<RunnerProblem>> + Send {
+        std::future::ready(self.problems.clone())
+    }
+
+    fn launch(
+        &self,
+        _payload: &RoundPayload,
+        _secrets: &JobSecrets,
+        _cancel: &CancellationToken,
+    ) -> impl Future<Output = anyhow::Result<LocalRound>> + Send {
+        std::future::ready(Err(anyhow::anyhow!("a preflight test launches nothing")))
+    }
+}
+
+type HostRunner = RunnerReporting<false>;
+type ContainerRunner = RunnerReporting<true>;
+
+fn unreachable_runner() -> RunnerProblem {
+    RunnerProblem::Unreachable {
+        runner: "docker",
+        detail: "no daemon".into(),
+    }
+}
+
+fn host_with_only_the_git_token(name: &str) -> Option<String> {
+    (name == GIT_TOKEN_VAR).then(|| "t0ken".to_string())
+}
 
 #[test]
 fn ssh_remotes_become_the_https_url_a_token_can_authenticate() {
@@ -177,6 +220,89 @@ fn every_container_problem_is_reported_at_once() {
             RunnerProblem::RemoteIsLocalPath {
                 url: "/tmp/origin.git".into()
             },
+        ]
+    );
+}
+
+/// The host's own checkout, remote and credentials are all there for a
+/// round that runs beside them.
+#[tokio::test]
+async fn a_host_runner_carries_no_secrets_and_takes_what_a_container_cannot() {
+    let secrets = secrets_or_reasons_it_cannot_run(
+        &HostRunner {
+            problems: Vec::new(),
+        },
+        &[".env".into()],
+        "/tmp/origin.git",
+        &["ANTHROPIC_API_KEY".into()],
+        |_| None,
+    )
+    .await
+    .unwrap();
+
+    assert!(secrets.names().is_empty(), "{secrets:?}");
+}
+
+#[tokio::test]
+async fn a_host_runner_is_refused_for_its_own_problems() {
+    let problems = secrets_or_reasons_it_cannot_run(
+        &HostRunner {
+            problems: vec![unreachable_runner()],
+        },
+        &[],
+        NETWORK_REMOTE,
+        &[],
+        |_| None,
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(problems, [unreachable_runner()]);
+}
+
+#[tokio::test]
+async fn a_container_runner_carries_the_git_token_from_the_host() {
+    let secrets = secrets_or_reasons_it_cannot_run(
+        &ContainerRunner {
+            problems: Vec::new(),
+        },
+        &[],
+        NETWORK_REMOTE,
+        &[],
+        host_with_only_the_git_token,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        secrets.names().into_iter().collect::<Vec<_>>(),
+        [GIT_TOKEN_VAR]
+    );
+}
+
+#[tokio::test]
+async fn every_reason_a_container_runner_cannot_run_is_reported_at_once() {
+    let problems = secrets_or_reasons_it_cannot_run(
+        &ContainerRunner {
+            problems: vec![unreachable_runner()],
+        },
+        &[".env".into()],
+        "/tmp/origin.git",
+        &["ANTHROPIC_API_KEY".into()],
+        host_with_only_the_git_token,
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(
+        problems,
+        [
+            unreachable_runner(),
+            RunnerProblem::CopyNeedsLocalRunner,
+            RunnerProblem::RemoteIsLocalPath {
+                url: "/tmp/origin.git".into()
+            },
+            RunnerProblem::MissingEnvironment("ANTHROPIC_API_KEY".into()),
         ]
     );
 }

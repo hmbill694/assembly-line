@@ -36,9 +36,9 @@ pub trait Runner {
     type Running: RunningRound + Send;
 
     /// Whether rounds run somewhere sharing nothing with the host. Decides
-    /// whether the payload provisions a toolchain, whether the remote URL
-    /// must suit a token, whether `copy` can work, and whether the git
-    /// credential has to be sent along.
+    /// whether the payload provisions a toolchain and whether the remote URL
+    /// must suit a token; what it asks of the repository and the host is
+    /// [`secrets_or_reasons_it_cannot_run`]'s to decide.
     const RUNS_IN_A_CONTAINER: bool;
 
     /// Every reason this runner cannot launch a round right now, checked
@@ -214,11 +214,6 @@ impl JobSecrets {
     }
 
     #[must_use]
-    pub fn from_host_environment(pass_env: &[String]) -> (JobSecrets, Vec<RunnerProblem>) {
-        Self::from_lookup(pass_env, |name| std::env::var(name).ok())
-    }
-
-    #[must_use]
     pub fn names(&self) -> BTreeSet<String> {
         self.vars.keys().cloned().collect()
     }
@@ -242,4 +237,44 @@ pub fn reasons_a_container_cannot_run(copy: &[String], remote_url: &str) -> Vec<
     .into_iter()
     .flatten()
     .collect()
+}
+
+/// The secrets a round on `runner` carries, once nothing stands in the way.
+/// A runner sharing the host's environment carries none; a container carries
+/// the git credential and every `pass_env` name, read with
+/// `host_environment`, and cannot take a repository that needs the host.
+///
+/// # Errors
+///
+/// Every reason the round cannot run there: the runner's own first, then
+/// the container's, then each `pass_env` name it cannot carry.
+pub async fn secrets_or_reasons_it_cannot_run<R: Runner>(
+    runner: &R,
+    copy: &[String],
+    remote_url: &str,
+    pass_env: &[String],
+    host_environment: impl Fn(&str) -> Option<String>,
+) -> Result<JobSecrets, Vec<RunnerProblem>> {
+    let (secrets, container_problems) = match R::RUNS_IN_A_CONTAINER {
+        true => {
+            let (secrets, unsendable) = JobSecrets::from_lookup(pass_env, host_environment);
+            let problems: Vec<RunnerProblem> = reasons_a_container_cannot_run(copy, remote_url)
+                .into_iter()
+                .chain(unsendable)
+                .collect();
+            (secrets, problems)
+        }
+        false => (JobSecrets::default(), Vec::new()),
+    };
+    let problems: Vec<RunnerProblem> = runner
+        .reasons_it_cannot_run()
+        .await
+        .into_iter()
+        .chain(container_problems)
+        .collect();
+
+    match problems.is_empty() {
+        true => Ok(secrets),
+        false => Err(problems),
+    }
 }
