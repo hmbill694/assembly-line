@@ -2,7 +2,7 @@
 
 use super::child::ChildLines;
 use super::{JobSecrets, Runner, RunnerProblem, RunningRound, Termination, job_resource_name};
-use crate::payload::{JobPayload, PAYLOAD_VAR};
+use crate::payload::{PAYLOAD_VAR, RoundPayload};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -78,7 +78,7 @@ impl Runner for DockerRunner {
     /// once, with nothing for `cancel` to interrupt.
     fn launch(
         &self,
-        payload: &JobPayload,
+        payload: &RoundPayload,
         secrets: &JobSecrets,
         _cancel: &CancellationToken,
     ) -> impl Future<Output = anyhow::Result<DockerRound>> + Send {
@@ -91,7 +91,7 @@ impl DockerRunner {
     /// `secrets` in its environment.
     fn spawn_docker_run(
         &self,
-        payload: &JobPayload,
+        payload: &RoundPayload,
         secrets: &JobSecrets,
     ) -> anyhow::Result<DockerRound> {
         let container = job_resource_name(payload);

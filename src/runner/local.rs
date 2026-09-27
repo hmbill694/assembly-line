@@ -3,7 +3,7 @@
 
 use super::child::ChildLines;
 use super::{JobSecrets, Runner, RunnerProblem, RunningRound, Termination};
-use crate::payload::{JobPayload, PAYLOAD_VAR};
+use crate::payload::{PAYLOAD_VAR, RoundPayload};
 use std::path::PathBuf;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -45,7 +45,7 @@ impl Runner for LocalRunner {
     /// launch is ready at once, with nothing for `cancel` to interrupt.
     fn launch(
         &self,
-        payload: &JobPayload,
+        payload: &RoundPayload,
         _secrets: &JobSecrets,
         _cancel: &CancellationToken,
     ) -> impl Future<Output = anyhow::Result<LocalRound>> + Send {
@@ -54,7 +54,7 @@ impl Runner for LocalRunner {
 }
 
 impl LocalRunner {
-    fn spawn_job_exec(&self, payload: &JobPayload) -> anyhow::Result<LocalRound> {
+    fn spawn_job_exec(&self, payload: &RoundPayload) -> anyhow::Result<LocalRound> {
         let mut command = Command::new(&self.program);
         command
             .arg("job-exec")

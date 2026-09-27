@@ -56,7 +56,7 @@ pub fn is_path_on_this_machine(url: &str) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JobPayload {
+pub struct RoundPayload {
     pub job_id: u64,
     pub round: u32,
     /// Where the round clones from and pushes to.
@@ -96,14 +96,17 @@ pub struct RoundRequest<'a> {
     pub seed_from: &'a Path,
 }
 
-impl JobPayload {
+impl RoundPayload {
     /// Apply the repository's config to a round.
     ///
     /// # Errors
     ///
     /// A [`ConfigError`] when the repository does not declare the provider,
     /// or declares a `max_duration` that is not a duration.
-    pub fn for_round(config: &RepoConfig, request: RoundRequest<'_>) -> anyhow::Result<JobPayload> {
+    pub fn for_round(
+        config: &RepoConfig,
+        request: RoundRequest<'_>,
+    ) -> anyhow::Result<RoundPayload> {
         let provider = config
             .providers
             .get(request.provider)
@@ -115,7 +118,7 @@ impl JobPayload {
             .transpose()?
             .map(|limit| limit.as_secs());
 
-        Ok(JobPayload {
+        Ok(RoundPayload {
             job_id: request.job_id,
             round: request.round,
             remote_url: request.remote_url,
@@ -137,7 +140,7 @@ impl JobPayload {
     /// # Errors
     ///
     /// When the variable is unset or does not hold a payload.
-    pub fn from_environment() -> anyhow::Result<JobPayload> {
+    pub fn from_environment() -> anyhow::Result<RoundPayload> {
         Self::from_variable(std::env::var(PAYLOAD_VAR).ok().as_deref())
     }
 
@@ -146,7 +149,7 @@ impl JobPayload {
     /// # Errors
     ///
     /// When `value` is absent or does not hold a payload.
-    pub fn from_variable(value: Option<&str>) -> anyhow::Result<JobPayload> {
+    pub fn from_variable(value: Option<&str>) -> anyhow::Result<RoundPayload> {
         let json = value.ok_or_else(|| {
             anyhow::anyhow!("{PAYLOAD_VAR} is not set — job-exec is started by a runner")
         })?;

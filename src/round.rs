@@ -10,7 +10,7 @@ use crate::event::EventKind;
 use crate::exec::{ShellOutcome, run_command, run_shell};
 use crate::frame::FrameWriter;
 use crate::git;
-use crate::payload::{GIT_TOKEN_VAR, JobPayload};
+use crate::payload::{GIT_TOKEN_VAR, RoundPayload};
 use crate::provider::CommandSpec;
 use crate::workspace::{self, JobWorkspace};
 use std::io::Write;
@@ -84,7 +84,7 @@ enum RoundResult {
 /// cannot be written. An agent that fails, a clone that fails, and a push
 /// that fails are all [`Verdict::Failed`], reported as events.
 pub async fn run_round<W: Write + Send + 'static>(
-    payload: &JobPayload,
+    payload: &RoundPayload,
     frames: &FrameWriter<W>,
     scratch_root: &Path,
     cancel: CancellationToken,
@@ -115,7 +115,7 @@ pub async fn run_round<W: Write + Send + 'static>(
 /// an unrecorded change would be a lost change, and a failure that produced a
 /// diff is exactly the case where the diff is worth reading.
 async fn round_result<W: Write + Send + 'static>(
-    payload: &JobPayload,
+    payload: &RoundPayload,
     frames: &FrameWriter<W>,
     scratch_root: &Path,
     timeout: Option<Duration>,
@@ -217,7 +217,7 @@ async fn round_result<W: Write + Send + 'static>(
 /// step started with no budget left fails immediately as timed out without
 /// being run at all.
 async fn provision_toolchain<W: Write + Send + 'static>(
-    payload: &JobPayload,
+    payload: &RoundPayload,
     cwd: &Path,
     frames: &FrameWriter<W>,
     deadline: Instant,
@@ -316,7 +316,7 @@ fn agent_failure_reason(outcome: anyhow::Result<ShellOutcome>) -> Option<String>
 }
 
 async fn agent_work_on_branch(
-    payload: &JobPayload,
+    payload: &RoundPayload,
     ws: &JobWorkspace,
 ) -> anyhow::Result<Option<AgentWork>> {
     let Some(sha) = workspace::commit(ws, &payload.commit_message).await? else {
@@ -418,8 +418,8 @@ mod provisioning_tests {
     use crate::git::PinnedRef;
     use std::path::PathBuf;
 
-    fn payload_asking_for_provisioning() -> JobPayload {
-        JobPayload {
+    fn payload_asking_for_provisioning() -> RoundPayload {
+        RoundPayload {
             job_id: 1,
             round: 1,
             remote_url: "does-not-matter".to_string(),

@@ -230,7 +230,7 @@ async fn a_verify_that_cannot_start_still_records_the_pushed_branch() {
         program: "/bin/bash".into(),
         ..base.command.clone()
     };
-    let payload = payload::JobPayload {
+    let payload = payload::RoundPayload {
         command,
         verify: Some("true".into()),
         ..base
@@ -554,7 +554,7 @@ async fn cancelling_a_round_stops_a_clone_in_progress() {
     let h = Harness::new().await;
     let fakes = h.scratch_root().with_file_name("fakes");
     support::fake_cli(&fakes, "git-remote-hang", "sleep 60\n");
-    let payload = payload::JobPayload {
+    let payload = payload::RoundPayload {
         remote_url: "hang::nowhere".into(),
         ..h.payload_for("x").await
     };

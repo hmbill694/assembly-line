@@ -5,7 +5,7 @@ pub mod docker;
 pub mod kubernetes;
 pub mod local;
 
-use crate::payload::{GIT_TOKEN_VAR, JobPayload, PAYLOAD_VAR, is_path_on_this_machine};
+use crate::payload::{GIT_TOKEN_VAR, PAYLOAD_VAR, RoundPayload, is_path_on_this_machine};
 use std::collections::{BTreeMap, BTreeSet};
 use tokio_util::sync::CancellationToken;
 
@@ -14,7 +14,7 @@ pub const PUBLISHED_IMAGE_REPOSITORY: &str = "ghcr.io/hmbill694/assembly-line";
 
 /// A name unique to this round, for the container or Job that runs it, so
 /// two repositories' job 1 never collide.
-fn job_resource_name(payload: &JobPayload) -> String {
+fn job_resource_name(payload: &RoundPayload) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -50,7 +50,7 @@ pub trait Runner {
     /// it had already created, so Ctrl-C reaches a round still starting.
     fn launch(
         &self,
-        payload: &JobPayload,
+        payload: &RoundPayload,
         secrets: &JobSecrets,
         cancel: &CancellationToken,
     ) -> impl Future<Output = anyhow::Result<Self::Running>> + Send;

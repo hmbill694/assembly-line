@@ -11,7 +11,7 @@ use crate::delivery::{self, Delivered, PullRequestText};
 use crate::event::{Event, EventKind, EventLog};
 use crate::git::{self, PinnedRef};
 use crate::paths::{self, JobMeta, JobPaths};
-use crate::payload::{self, JobPayload, RoundRequest};
+use crate::payload::{self, RoundPayload, RoundRequest};
 use crate::report::JobReport;
 use crate::round::Verdict;
 use crate::runner::{JobSecrets, Runner, RunnerProblem, reasons_a_container_cannot_run};
@@ -669,7 +669,7 @@ fn allocate_job(
 fn payload_for_runner<R: Runner>(
     config: &RepoConfig,
     request: RoundRequest<'_>,
-) -> anyhow::Result<JobPayload> {
+) -> anyhow::Result<RoundPayload> {
     let request = RoundRequest {
         remote_url: match R::RUNS_IN_A_CONTAINER {
             true => payload::https_equivalent(&request.remote_url),
@@ -677,7 +677,7 @@ fn payload_for_runner<R: Runner>(
         },
         ..request
     };
-    JobPayload::for_round(config, request).map(|payload| JobPayload {
+    RoundPayload::for_round(config, request).map(|payload| RoundPayload {
         provision_toolchain: R::RUNS_IN_A_CONTAINER,
         ..payload
     })
@@ -689,7 +689,7 @@ fn payload_for_runner<R: Runner>(
 /// still starting stops it rather than waiting for it to start.
 async fn collect_round<R: Runner>(
     runner: &R,
-    payload: &JobPayload,
+    payload: &RoundPayload,
     secrets: &JobSecrets,
     log: &mut EventLog,
     output_log: &Path,

@@ -2,7 +2,7 @@
 
 use super::child::ChildLines;
 use super::{JobSecrets, Runner, RunnerProblem, RunningRound, Termination, job_resource_name};
-use crate::payload::{JobPayload, PAYLOAD_VAR};
+use crate::payload::{PAYLOAD_VAR, RoundPayload};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -126,7 +126,7 @@ pub fn pod_progress(pods: &Value) -> PodProgress {
 /// The Job's own deadline: a backstop behind the command limits `job-exec`
 /// enforces, for a pod that wedges beyond them.
 #[must_use]
-pub fn active_deadline_secs(payload: &JobPayload) -> Option<u64> {
+pub fn active_deadline_secs(payload: &RoundPayload) -> Option<u64> {
     payload
         .command_limit_secs
         .map(|limit| 2 * limit + BACKSTOP_ALLOWANCE_SECS)
@@ -390,7 +390,7 @@ impl Runner for KubernetesRunner {
 
     async fn launch(
         &self,
-        payload: &JobPayload,
+        payload: &RoundPayload,
         secrets: &JobSecrets,
         cancel: &CancellationToken,
     ) -> anyhow::Result<KubernetesRound> {
@@ -463,7 +463,7 @@ impl KubernetesRound {
     /// annotation.
     async fn create_and_follow(
         &mut self,
-        payload: &JobPayload,
+        payload: &RoundPayload,
         secrets: &JobSecrets,
         cancel: &CancellationToken,
     ) -> anyhow::Result<()> {

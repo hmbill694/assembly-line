@@ -1,7 +1,7 @@
 use assembly_line::cli::{Cli, Command, RunnerArgs, RunnerKind};
 use assembly_line::frame::FrameWriter;
 use assembly_line::lifecycle::{self, Note, Prepared, Refusal, RevisionRequest, StartRequest};
-use assembly_line::payload::JobPayload;
+use assembly_line::payload::RoundPayload;
 use assembly_line::round::{Verdict, run_round};
 use assembly_line::runner::docker::DockerRunner;
 use assembly_line::runner::kubernetes::KubernetesRunner;
@@ -78,7 +78,7 @@ fn install_tracing() {
 /// The exit code mirrors the round, but the collector decides from the
 /// frames — the code only matters when the frames never said.
 async fn execute_payload_from_environment() -> Result<ExitCode, String> {
-    let payload = JobPayload::from_environment().map_err(|e| e.to_string())?;
+    let payload = RoundPayload::from_environment().map_err(|e| e.to_string())?;
 
     let frames = FrameWriter::new(std::io::stdout());
     let cancel = CancellationToken::new();

@@ -9,7 +9,7 @@ mod support;
 /// Run `job-exec` on `payload` with `fakes` first on PATH; return the
 /// routed frames.
 fn job_exec(
-    payload: &assembly_line::payload::JobPayload,
+    payload: &assembly_line::payload::RoundPayload,
     fakes: &std::path::Path,
     tmp: &std::path::Path,
 ) -> Vec<Routed> {
@@ -45,7 +45,7 @@ async fn a_container_round_installs_the_toolchain_before_the_agent_runs() {
     let h = Harness::new().await;
     let fakes = h.scratch_root().with_file_name("fakes");
     fake_cli(&fakes, "mise", "echo \"mise $*\"\n");
-    let payload = assembly_line::payload::JobPayload {
+    let payload = assembly_line::payload::RoundPayload {
         provision_toolchain: true,
         ..h.payload_for("x").await
     };
@@ -64,7 +64,7 @@ async fn a_failed_install_fails_the_round_before_the_agent_runs() {
     let h = Harness::new().await;
     let fakes = h.scratch_root().with_file_name("fakes");
     fake_cli(&fakes, "mise", "case \"$1\" in install) exit 1 ;; esac\n");
-    let payload = assembly_line::payload::JobPayload {
+    let payload = assembly_line::payload::RoundPayload {
         provision_toolchain: true,
         ..h.payload_for("x").await
     };

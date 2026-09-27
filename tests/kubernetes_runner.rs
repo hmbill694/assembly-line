@@ -2,7 +2,7 @@ use assembly_line::collect::collect;
 use assembly_line::event::{Event, EventKind, EventLog};
 use assembly_line::frame::FrameWriter;
 use assembly_line::git::PinnedRef;
-use assembly_line::payload::JobPayload;
+use assembly_line::payload::RoundPayload;
 use assembly_line::provider::CommandSpec;
 use assembly_line::runner::kubernetes::{
     KubernetesRunner, LogReadPosition, PodProgress, active_deadline_secs, job_manifest,
@@ -17,8 +17,8 @@ use tokio_util::sync::CancellationToken;
 mod support;
 
 /// A payload whose only meaningful field is its command limit.
-fn payload_with_command_limit(command_limit_secs: Option<u64>) -> JobPayload {
-    JobPayload {
+fn payload_with_command_limit(command_limit_secs: Option<u64>) -> RoundPayload {
+    RoundPayload {
         job_id: 1,
         round: 1,
         remote_url: "remote-url".into(),

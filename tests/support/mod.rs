@@ -12,7 +12,7 @@ use assembly_line::lifecycle::{
     self, Prepared, Refusal, RevisionRequest, StartRequest, prepare_revision, prepare_start,
 };
 use assembly_line::paths::{self, JobPaths};
-use assembly_line::payload::{JobPayload, RoundRequest};
+use assembly_line::payload::{RoundPayload, RoundRequest};
 use assembly_line::runner::local::LocalRunner;
 use assembly_line::state::JobState;
 use std::os::unix::fs::PermissionsExt;
@@ -244,11 +244,11 @@ impl Harness {
 
     /// A realistic round-1 payload for this repository, for tests that hand
     /// one to a runner or to `job-exec` directly.
-    pub async fn payload_for(&self, prompt: &str) -> JobPayload {
+    pub async fn payload_for(&self, prompt: &str) -> RoundPayload {
         let start = git::pinned(&self.repo, "origin", "main").await.unwrap();
         let config = RepoConfig::from_ref(&self.repo, &start.sha).await.unwrap();
 
-        JobPayload::for_round(
+        RoundPayload::for_round(
             &config,
             RoundRequest {
                 job_id: THE_JOB,
