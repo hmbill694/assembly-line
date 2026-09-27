@@ -14,7 +14,9 @@ use crate::paths::{self, JobMeta, JobPaths};
 use crate::payload::{self, RoundPayload, RoundRequest};
 use crate::report::JobReport;
 use crate::round::Verdict;
-use crate::runner::{JobSecrets, Runner, RunnerProblem, secrets_or_reasons_it_cannot_run};
+use crate::runner::{
+    JobSecrets, Runner, RunnerProblem, payload_fitted_to, secrets_or_reasons_it_cannot_run,
+};
 use crate::workspace::{DEFAULT_REMOTE, JOB_BRANCH_PATTERN, job_branch_name};
 use anyhow::anyhow;
 use std::path::{Path, PathBuf};
@@ -394,7 +396,7 @@ pub async fn run<R: Runner>(
         Destination::ExistingJob { paths, round, log } => (paths, log, round),
     };
 
-    let payload = payload_for_runner::<R>(
+    let payload = RoundPayload::for_round(
         &config,
         RoundRequest {
             job_id: paths.id,
@@ -408,7 +410,8 @@ pub async fn run<R: Runner>(
             // against the repository — not against wherever the user stands.
             seed_from: &meta.repo,
         },
-    )?;
+    )
+    .map(payload_fitted_to::<R>)?;
     let verdict = collect_round(runner, &payload, &secrets, &mut log, &paths.log(), cancel).await?;
 
     let report = events_of(&paths)
@@ -647,26 +650,6 @@ fn allocate_job(
     EventLog::open_append(paths.events())
         .map(|log| (paths, log))
         .map_err(|e| anyhow!("opening the event log: {e}"))
-}
-
-/// A round's payload, fitted to where it runs. A container has neither the
-/// host's toolchain nor its SSH keys, so it provisions the one and reaches
-/// the remote over HTTPS, with a token, in place of the other.
-fn payload_for_runner<R: Runner>(
-    config: &RepoConfig,
-    request: RoundRequest<'_>,
-) -> anyhow::Result<RoundPayload> {
-    let request = RoundRequest {
-        remote_url: match R::RUNS_IN_A_CONTAINER {
-            true => payload::https_equivalent(&request.remote_url),
-            false => request.remote_url,
-        },
-        ..request
-    };
-    RoundPayload::for_round(config, request).map(|payload| RoundPayload {
-        provision_toolchain: R::RUNS_IN_A_CONTAINER,
-        ..payload
-    })
 }
 
 /// Launch the round and collect it. A launch failure is a failed round, not

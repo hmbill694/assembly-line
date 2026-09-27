@@ -1,10 +1,12 @@
+use assembly_line::git::PinnedRef;
 use assembly_line::payload::{
     GIT_TOKEN_VAR, PAYLOAD_VAR, RoundPayload, https_equivalent, is_path_on_this_machine,
 };
+use assembly_line::provider::CommandSpec;
 use assembly_line::runner::docker::docker_run_args;
 use assembly_line::runner::local::LocalRound;
 use assembly_line::runner::{
-    JobSecrets, Runner, RunnerProblem, reasons_a_container_cannot_run,
+    JobSecrets, Runner, RunnerProblem, payload_fitted_to, reasons_a_container_cannot_run,
     secrets_or_reasons_it_cannot_run,
 };
 use tokio_util::sync::CancellationToken;
@@ -305,6 +307,52 @@ async fn every_reason_a_container_runner_cannot_run_is_reported_at_once() {
             RunnerProblem::MissingEnvironment("ANTHROPIC_API_KEY".into()),
         ]
     );
+}
+
+/// A payload as the host builds it, cloning from `remote_url`.
+fn payload_cloning(remote_url: &str) -> RoundPayload {
+    RoundPayload {
+        job_id: 1,
+        round: 1,
+        remote_url: remote_url.into(),
+        remote_name: "origin".into(),
+        start: PinnedRef {
+            name: "main".into(),
+            sha: "sha".into(),
+        },
+        branch: "al/job-1".into(),
+        command: CommandSpec {
+            program: "agent".into(),
+            args: Vec::new(),
+        },
+        commit_message: "job 1: agent work".into(),
+        verify: None,
+        command_limit_secs: None,
+        copy: Vec::new(),
+        seed_from: "seed".into(),
+        provision_toolchain: false,
+    }
+}
+
+#[test]
+fn a_container_provisions_its_toolchain_and_clones_over_https() {
+    let fitted = payload_fitted_to::<ContainerRunner>(payload_cloning("git@github.com:o/r.git"));
+
+    assert_eq!(
+        fitted,
+        RoundPayload {
+            remote_url: "https://github.com/o/r.git".into(),
+            provision_toolchain: true,
+            ..payload_cloning("git@github.com:o/r.git")
+        }
+    );
+}
+
+#[test]
+fn a_host_runner_uses_the_hosts_toolchain_and_remote_as_they_are() {
+    let payload = payload_cloning("git@github.com:o/r.git");
+
+    assert_eq!(payload_fitted_to::<HostRunner>(payload.clone()), payload);
 }
 
 #[test]
