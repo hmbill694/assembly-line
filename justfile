@@ -3,13 +3,24 @@
 # Build output goes outside the repo so that per-revision verification of a jj
 # stack never snapshots `target/` into a change (see CLAUDE.md).
 
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
 export CARGO_TARGET_DIR := env_var_or_default("CARGO_TARGET_DIR", "/tmp/assembly-line-target")
 
 default:
     @just --list
 
-# Everything CI would run. The single gate before a change is considered done.
-check: fmt-check lint test
+# Exactly what CI's Check job runs, in the same order — one step per
+# dependency there, so a failure names itself. Keep the two lists identical.
+ci: fmt-check lint test
+
+# The single gate before a change is considered done.
+check: ci
+
+# Known vulnerabilities in the locked dependencies. Advisory in CI: an
+# advisory with no fix yet should not block every PR.
+audit:
+    cargo audit
 
 build:
     cargo build
@@ -117,12 +128,12 @@ demo:
 
 # Build the job image locally, for the host's platform.
 image tag="assembly-line:dev":
-    docker buildx build --load -t {{tag}} .
+    docker buildx build --load -t {{ tag }} .
 
 # Boot the built image against a scratch repository and prove job-exec runs
 # a round end to end. Needs a docker daemon; not part of `just check`.
 smoke-docker tag="assembly-line:dev": (image tag)
-    scripts/smoke-docker.sh {{tag}}
+    scripts/smoke-docker.sh {{ tag }}
 
 # Prune build artifacts and the out-of-repo target directory.
 clean:
