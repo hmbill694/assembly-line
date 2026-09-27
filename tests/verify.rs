@@ -27,10 +27,10 @@ const VERIFY_REJECTS_THE_COMMITTED_WORK: &str =
 /// presence of this line is direct evidence of execution.
 const VERIFY_RAN: &str = "verify-ran-in-this-checkout";
 
-/// The invariant the whole milestone rests on, exercised through the one path
-/// this task adds: a rejection is a judgement about delivery, not a reason to
-/// take the branch away. The branch reaches the remote, and the checkout is
-/// still scratch and still discarded.
+/// The branch-is-the-artifact invariant holds when `verify` rejects: a
+/// rejection is a judgement about delivery, not a reason to take the branch
+/// away. The branch reaches the remote, and the checkout is still scratch and
+/// still discarded.
 #[tokio::test]
 async fn a_job_whose_verify_fails_is_a_failed_job() {
     let h = Harness::with_config(&format!(

@@ -321,7 +321,6 @@ impl KubernetesRunner {
     }
 }
 
-/// Run `command`, feeding it `stdin`, and return its stdout.
 async fn output_of(mut command: Command, stdin: Option<String>) -> anyhow::Result<String> {
     let mut child = command
         .stdin(std::process::Stdio::piped())

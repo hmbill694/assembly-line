@@ -148,7 +148,7 @@ fn fake_gh_capturing_args(tmp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
     (bin_dir, capture)
 }
 
-/// The gate this task implements: a job's branch is real work either way, but
+/// Delivery is gated on `verify`: a job's branch is real work either way, but
 /// a pull request for work that failed `verify` is noise. If delivery were
 /// not gated on `failed`, this job's branch would reach `deliver` in `Pr`
 /// mode; with no `gh` on the test machine, that prints "pushed ... no pull
@@ -209,15 +209,13 @@ async fn a_passing_revise_round_is_delivered() {
 }
 
 /// `config.base` is consulted at exactly one place — `deliver_if_verified`
-/// choosing the pull request's base — and until now nothing proved it
-/// actually got there; every existing test on `base` only asserts that it
-/// parses. This drives the real binary with a fake `gh` standing in for the
-/// real one, so the `--base` a pull request would open with is captured
-/// directly instead of inferred from which `Delivered` variant printed.
+/// choosing the pull request's base. This drives the real binary with a fake
+/// `gh` standing in for the real one, so the `--base` a pull request would
+/// open with is captured directly instead of inferred from which `Delivered`
+/// variant printed.
 ///
 /// It also proves the divergence note fires: `base = "release"` here while
-/// the job is cut from the default checked-out branch, `main` — exactly the
-/// silent-scope-creep case the review found.
+/// the job is cut from the default checked-out branch, `main`.
 #[tokio::test]
 async fn configured_base_reaches_the_pull_request_and_the_divergence_is_reported() {
     let tmp = repo_running_with_base("fake-agent.sh", "true", "release").await;

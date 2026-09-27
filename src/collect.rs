@@ -98,7 +98,6 @@ async fn stream_into_logs<J: RunningJob>(
 /// it never blocks writing to a pipe nobody reads.
 async fn cancel_and_wait_out<J: RunningJob>(mut job: J) {
     job.cancel().await;
-    // A loop: each line is awaited in turn until the stream ends.
     while job.next_line().await.is_some() {}
     let _ = job.termination().await;
 }

@@ -83,7 +83,6 @@ impl JobProgress {
                 }),
                 ..self
             },
-            // Where the branch's name enters the record.
             EventKind::JobBranchPublished { branch, .. } => JobProgress {
                 branch: Some(branch.clone()),
                 ..self

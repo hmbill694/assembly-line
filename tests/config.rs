@@ -54,9 +54,8 @@ fn parses_durations() {
     assert!(parse_duration("soon").is_err());
 }
 
-// Validation. There are no task ids any more — job ids are integers
-// assembly-line allocates — so what is left to get wrong is the provider and
-// the duration.
+// Validation. Job ids are allocated, never configured, so what is left to get
+// wrong is the provider and the duration.
 
 #[test]
 fn a_provider_the_repository_never_declared_is_rejected() {
