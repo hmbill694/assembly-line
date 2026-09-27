@@ -1,4 +1,4 @@
-//! Where a job runs, and how its stream comes back.
+//! Where a round runs, and how its stream comes back.
 
 pub mod child;
 pub mod docker;
@@ -41,7 +41,7 @@ pub trait Runner {
     /// credential has to be sent along.
     const RUNS_IN_A_CONTAINER: bool;
 
-    /// Every reason this runner cannot launch a job right now, checked
+    /// Every reason this runner cannot launch a round right now, checked
     /// before a job directory is allocated.
     fn reasons_it_cannot_run(&self) -> impl Future<Output = Vec<RunnerProblem>> + Send;
 
@@ -68,7 +68,7 @@ pub trait RunningRound {
     fn termination(self) -> impl Future<Output = Termination> + Send;
 }
 
-/// Why a job's process stopped, as its runner can tell.
+/// Why a round's process stopped, as its runner can tell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Termination {
     Exited(i32),
@@ -88,7 +88,7 @@ impl std::fmt::Display for Termination {
     }
 }
 
-/// Something that stops a runner from launching a job.
+/// Something that stops a runner from launching a round.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunnerProblem {
     Unreachable {
@@ -102,7 +102,7 @@ pub enum RunnerProblem {
     },
     CopyNeedsLocalRunner,
     MissingEnvironment(String),
-    /// `--pass-env` named a variable assembly-line sets for the job itself.
+    /// `--pass-env` named a variable assembly-line sets for the round itself.
     ReservedEnvironment(String),
     /// The remote is a path on this machine, which a container cannot see.
     RemoteIsLocalPath {
@@ -133,12 +133,12 @@ impl std::fmt::Display for RunnerProblem {
             ),
             Self::MissingEnvironment(name) => write!(
                 f,
-                "${name} is not set — export it, since the job's container receives it from \
+                "${name} is not set — export it, since the round's container receives it from \
                  your environment"
             ),
             Self::ReservedEnvironment(name) => write!(
                 f,
-                "--pass-env {name} names a variable assembly-line sets for the job itself — \
+                "--pass-env {name} names a variable assembly-line sets for the round itself — \
                  drop it from --pass-env"
             ),
             Self::RemoteIsLocalPath { url } => write!(
@@ -150,11 +150,11 @@ impl std::fmt::Display for RunnerProblem {
     }
 }
 
-/// Names a container job's environment carries whatever `--pass-env` says:
+/// Names a round's container environment carries whatever `--pass-env` says:
 /// the payload, and the git credential that is always sent.
 const RESERVED_ENVIRONMENT: [&str; 2] = [PAYLOAD_VAR, GIT_TOKEN_VAR];
 
-/// Environment a container job receives, by name. Read from the host once,
+/// Environment a round's container receives, by name. Read from the host once,
 /// here, and only for names the host chose.
 #[derive(Clone, Default)]
 pub struct JobSecrets {

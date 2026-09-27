@@ -3,7 +3,7 @@ use crate::state::JobState;
 use chrono::{DateTime, Utc};
 use std::time::Duration;
 
-/// How much a job changed, as recorded when its work was committed.
+/// How much a round changed, as recorded when its work was committed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiffSummary {
     pub files: usize,
@@ -36,11 +36,12 @@ pub struct JobReport {
     pub rounds: u32,
     /// Wall time of the most recent round.
     pub duration: Option<Duration>,
-    /// What the job committed, or `None` if the agent changed nothing.
+    /// What the latest round committed, or `None` if its agent changed
+    /// nothing.
     pub diff: Option<DiffSummary>,
     /// Failure reason, when there is one.
     pub detail: Option<String>,
-    /// The branch the job's work is on, once it has been published. `None` is
+    /// The branch the job's work is on, once it has been pushed. `None` is
     /// a job that has not produced anything yet.
     pub branch: Option<String>,
 }
@@ -134,7 +135,7 @@ impl JobReport {
         }
     }
 
-    /// The single line printed at the end of a job:
+    /// The single line printed at the end of a round:
     /// `job 7: failed (round 2, 3 files +40/-2) — verify failed`.
     #[must_use]
     pub fn to_summary_line(&self) -> String {

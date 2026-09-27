@@ -9,7 +9,7 @@ use tokio::process::Command;
 pub enum Delivered {
     /// Nothing was attempted, and this is why: delivery is turned off.
     Skipped(String),
-    /// The job pushed the branch, but no pull request was opened — `gh` is
+    /// The round pushed the branch, but no pull request was opened — `gh` is
     /// not installed, or it refused.
     Pushed {
         branch: String,

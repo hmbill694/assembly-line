@@ -32,7 +32,7 @@ const VERIFY_RAN: &str = "verify-ran-in-this-checkout";
 /// away. The branch reaches the remote, and the checkout is still scratch and
 /// still discarded.
 #[tokio::test]
-async fn a_job_whose_verify_fails_is_a_failed_job() {
+async fn a_round_whose_verify_fails_is_a_failed_round() {
     let h = Harness::with_config(&format!(
         "verify = \"{VERIFY_REJECTS_THE_COMMITTED_WORK}\"\n{}",
         config_running("fake-agent.sh")
@@ -41,7 +41,7 @@ async fn a_job_whose_verify_fails_is_a_failed_job() {
 
     let outcome = h.run_job("write a file").await;
 
-    assert!(!outcome.passed, "a failing verify fails the job");
+    assert!(!outcome.passed, "a failing verify fails the round");
     assert!(
         outcome.has(|e| matches!(e, EventKind::VerifyRejected { .. })),
         "the failure should say verify was what rejected it"
@@ -163,7 +163,7 @@ async fn a_verify_cut_off_by_max_duration_is_not_a_rejection() {
 
     let outcome = h.run_job("write a file").await;
 
-    assert!(!outcome.passed, "an unfinished verify still fails a job");
+    assert!(!outcome.passed, "an unfinished verify still fails a round");
     assert!(
         !outcome.has(|e| matches!(e, EventKind::VerifyRejected { .. })),
         "a timed-out verify reached no ruling, so it is not a rejection"

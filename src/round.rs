@@ -270,7 +270,7 @@ enum VerifyRuling {
     Interrupted { reason: String },
 }
 
-/// What `verify` made of what the agent left, run in the job's own checkout
+/// What `verify` made of what the agent left, run in the round's own checkout
 /// after the commit, so it judges exactly the tree the branch carries.
 ///
 /// The outcome is matched here rather than flattened through

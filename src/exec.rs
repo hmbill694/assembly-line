@@ -48,7 +48,7 @@ impl ShellOutcome {
 /// # Errors
 ///
 /// Returns an error if `sh` cannot be spawned. A command that runs and fails
-/// is *not* an error — that is a `ShellOutcome`, because a failing job is a
+/// is *not* an error — that is a `ShellOutcome`, because a failing round is a
 /// normal part of using this.
 pub async fn run_shell<W: Write + Send + 'static>(
     cmd: &str,
@@ -99,8 +99,8 @@ async fn supervise<W: Write + Send + 'static>(
 ) -> anyhow::Result<ShellOutcome> {
     let mut child = detach_from_terminal(&mut command)
         .current_dir(cwd.as_ref())
-        // The payload names the job's plan; the agent has no use for it. The
-        // git token is the job's to push with, so it is kept out of the
+        // The payload names the round's plan; the agent has no use for it. The
+        // git token is the round's to push with, so it is kept out of the
         // agent's environment — though not out of its reach; see
         // `GIT_TOKEN_VAR`.
         .env_remove(PAYLOAD_VAR)

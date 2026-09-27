@@ -111,8 +111,8 @@ impl<W: Write> EventLog<W> {
         Ok(event)
     }
 
-    /// Append an event exactly as a job recorded it, keeping its own
-    /// timestamp: the collector's copy of the job's log, not a new event.
+    /// Append an event exactly as a round recorded it, keeping its own
+    /// timestamp: the collector's copy of the round's event, not a new one.
     ///
     /// # Errors
     ///

@@ -438,7 +438,7 @@ pub async fn current_branch(repo: impl AsRef<Path>) -> anyhow::Result<Option<Str
 /// into the repository's config. A later round pushes the same branch name
 /// again and fast-forwards without it.
 ///
-/// Runs no hooks: a job's clone is the agent's to write, `.git/hooks` and
+/// Runs no hooks: a round's clone is the agent's to write, `.git/hooks` and
 /// `core.hooksPath` included, and the push runs with the git token in its
 /// environment. A `-c` on the command line outranks anything the clone's
 /// own config says. This is the push's guarantee, not the round's: the
@@ -519,7 +519,7 @@ pub async fn head_is_ahead_of(repo: impl AsRef<Path>, since: &str) -> anyhow::Re
 /// Unstaging covers the commit assembly-line makes; this catches the agent
 /// committing a seeded file itself, in any commit since `since` — one that a
 /// later commit deleted again still carries it to the remote. Fatal, because
-/// a failed job is far better than a leaked credential on a branch bound for
+/// a failed round is far better than a leaked credential on a branch bound for
 /// a remote.
 ///
 /// Plumbing, not `git log`: the clone's config is the agent's to write, and

@@ -39,10 +39,10 @@ pub enum Command {
         runner: RunnerArgs,
     },
 
-    /// Run a job again, based on its own branch, with feedback
+    /// Run another round of a job, based on its own branch, with feedback
     ///
-    /// A new job, not a resumption: the agent's prior work arrives as files on
-    /// disk, and this round appends to the job's branch.
+    /// A new round, not a resumption: the agent's prior work arrives as files
+    /// on disk, and this round appends to the job's branch.
     Revise {
         job_id: u64,
         /// What to change about the previous round's work
@@ -91,8 +91,8 @@ pub enum RunnerKind {
     K8s,
 }
 
-/// Where a round runs. Shared by `run` and `revise`: a revise is a new job
-/// cut from the branch, so it may run somewhere the first round did not.
+/// Where a round runs. Shared by `run` and `revise`: a revise is a new round
+/// cut from the job's branch, so it may run somewhere the first round did not.
 #[derive(Debug, clap::Args)]
 pub struct RunnerArgs {
     #[arg(long, value_enum, default_value_t = RunnerKind::Local)]
@@ -100,7 +100,7 @@ pub struct RunnerArgs {
     /// The job image. Defaults to the published image at this version.
     #[arg(long)]
     pub image: Option<String>,
-    /// Pass this variable from your environment into the job's container.
+    /// Pass this variable from your environment into the round's container.
     /// Repeatable. `ASSEMBLY_GIT_TOKEN` is always passed.
     #[arg(long = "pass-env", value_name = "NAME")]
     pub pass_env: Vec<String>,

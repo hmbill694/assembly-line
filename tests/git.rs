@@ -163,7 +163,7 @@ async fn a_commit_containing_only_seeded_files_is_no_commit_at_all() {
 /// Unstaging protects the commits assembly-line makes. If the agent committed
 /// the secret itself, that has to fail loudly rather than reach a remote.
 #[tokio::test]
-async fn a_secret_committed_by_the_agent_fails_the_job() {
+async fn a_secret_committed_by_the_agent_fails_the_round() {
     let fx = Fixture::new().await;
     let node = fx.clone_on_branch("agent-commit", "al/job-5").await;
 
@@ -187,7 +187,7 @@ async fn a_secret_committed_by_the_agent_fails_the_job() {
 /// A secret the agent committed and then untracked again is no longer in the
 /// index, but it is still in history — which is what reaches the remote.
 #[tokio::test]
-async fn a_secret_the_agent_committed_and_then_removed_still_fails_the_job() {
+async fn a_secret_the_agent_committed_and_then_removed_still_fails_the_round() {
     let fx = Fixture::new().await;
     let node = fx.clone_on_branch("agent-hides", "al/job-6").await;
 
@@ -214,7 +214,7 @@ async fn a_secret_the_agent_committed_and_then_removed_still_fails_the_job() {
 /// about the path once merged — but the merge carries the side branch's
 /// commits, secret included, to the remote.
 #[tokio::test]
-async fn a_secret_committed_on_a_merged_side_branch_still_fails_the_job() {
+async fn a_secret_committed_on_a_merged_side_branch_still_fails_the_round() {
     let fx = Fixture::new().await;
     let node = fx.clone_on_branch("agent-merges", "al/job-7").await;
 
@@ -246,7 +246,7 @@ async fn a_secret_committed_on_a_merged_side_branch_still_fails_the_job() {
 /// A merge commit can introduce a file neither parent has, and a log shows no
 /// diff for a merge unless asked to.
 #[tokio::test]
-async fn a_secret_introduced_by_a_merge_commit_itself_fails_the_job() {
+async fn a_secret_introduced_by_a_merge_commit_itself_fails_the_round() {
     let fx = Fixture::new().await;
     let node = fx.clone_on_branch("agent-evil-merge", "al/job-8").await;
 
@@ -280,7 +280,7 @@ async fn a_secret_introduced_by_a_merge_commit_itself_fails_the_job() {
 /// A replace ref changes what the clone shows for a commit, not what a push
 /// sends — so a leaking commit dressed up as a clean one still leaks.
 #[tokio::test]
-async fn a_secret_behind_a_replace_ref_still_fails_the_job() {
+async fn a_secret_behind_a_replace_ref_still_fails_the_round() {
     let fx = Fixture::new().await;
     let base = fx.base().await;
     let node = fx.clone_on_branch("agent-replaces", "al/job-9").await;
@@ -316,7 +316,7 @@ async fn a_secret_behind_a_replace_ref_still_fails_the_job() {
 /// The clone's config is the agent's to write, and `log.diffMerges=off`
 /// would hide a merge that adds the secret and another that removes it.
 #[tokio::test]
-async fn a_secret_merged_in_and_out_under_the_agents_config_still_fails_the_job() {
+async fn a_secret_merged_in_and_out_under_the_agents_config_still_fails_the_round() {
     let fx = Fixture::new().await;
     let node = fx.clone_on_branch("agent-configures", "al/job-10").await;
 
@@ -353,7 +353,7 @@ async fn a_secret_merged_in_and_out_under_the_agents_config_still_fails_the_job(
 /// A root commit has no parent to differ from, and `log.showRoot=false` would
 /// show it as touching nothing.
 #[tokio::test]
-async fn a_secret_in_an_orphan_root_commit_still_fails_the_job() {
+async fn a_secret_in_an_orphan_root_commit_still_fails_the_round() {
     let fx = Fixture::new().await;
     let node = fx.clone_on_branch("agent-orphans", "al/job-11").await;
 

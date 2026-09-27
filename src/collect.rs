@@ -102,7 +102,7 @@ async fn cancel_and_wait_out<R: RunningRound>(mut running: R) {
     let _ = running.termination().await;
 }
 
-/// A runner that could not start the job at all still leaves a record: the
+/// A runner that could not start the round at all still leaves a record: the
 /// round began, it failed, and this is why.
 ///
 /// # Errors
@@ -115,7 +115,7 @@ pub fn record_launch_failure(
 ) -> anyhow::Result<Verdict> {
     log.append(EventKind::RoundStarted { round })?;
     log.append(EventKind::RoundFailed {
-        reason: format!("the runner could not start the job: {error}"),
+        reason: format!("the runner could not start the round: {error}"),
     })?;
     Ok(Verdict::Failed)
 }

@@ -300,7 +300,7 @@ async fn a_hangup_cancels_the_round_rather_than_orphaning_the_agent() {
 /// A job whose branch cannot leave the scratch clone has lost its work, and
 /// must say so rather than record a branch that exists nowhere.
 #[tokio::test]
-async fn a_refused_push_fails_the_job_and_says_the_work_is_lost() {
+async fn a_refused_push_fails_the_round_and_says_the_work_is_lost() {
     let h = Harness::new().await;
     let prepared = h.prepare_job("write a file").await;
 
@@ -458,7 +458,7 @@ async fn seeded_files_reach_the_agent_but_never_the_branch() {
 }
 
 #[tokio::test]
-async fn a_missing_provider_binary_fails_the_job_with_a_useful_message() {
+async fn a_missing_provider_binary_fails_the_round_with_a_useful_message() {
     let h = Harness::with_config(
         "provider = \"fake\"\n\
          [providers.fake]\ncmd = \"definitely-not-real-xyz\"\nargs = [\"{prompt}\"]\n",

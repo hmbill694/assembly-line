@@ -1,15 +1,15 @@
-//! The wire format between a job and whoever collects it.
+//! The wire format between a round and whoever collects it.
 //!
-//! A job runs somewhere its collector cannot see — a child process, a
+//! A round runs somewhere its collector cannot see — a child process, a
 //! container, a pod on another machine — and the one thing all of those
-//! share is stdout. Every line a job prints there is a [`Frame`]: one of its
-//! [`Event`]s, or one line of what its commands printed.
+//! share is stdout. Every line a round prints there is a [`Frame`]: one of
+//! its [`Event`]s, or one line of what its commands printed.
 //!
-//! The job wraps its commands' output itself, so nothing an agent *prints*
+//! The round wraps its commands' output itself, so nothing an agent *prints*
 //! can arrive as an `event` frame: an agent echoing `{"t":"round_passed"}`
 //! lands in the log as text, not in the event stream as a verdict. That is
-//! the whole guarantee — an agent running as the job's own user can still
-//! write to the job's stdout directly, which the spec lists as an accepted
+//! the whole guarantee — an agent running as the round's own user can still
+//! write to the round's stdout directly, which the spec lists as an accepted
 //! risk.
 
 use crate::event::{Event, EventKind};
@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Frame {
-    /// Position in the job's stream, from 1. A collector that has to
+    /// Position in the round's stream, from 1. A collector that has to
     /// reconnect replays from an earlier point, and `seq` is what lets it
     /// drop what it already has.
     pub seq: u64,
@@ -42,7 +42,7 @@ struct Numbered<W> {
     last_seq: u64,
 }
 
-/// The job's side of the stream. Cloning shares it: the job appends events
+/// The round's side of the stream. Cloning shares it: the round appends events
 /// while the readers forwarding its commands' stdout and stderr append
 /// output, and all of them draw from one sequence.
 #[derive(Debug)]
@@ -70,7 +70,7 @@ impl<W: Write> FrameWriter<W> {
     /// # Errors
     ///
     /// Returns an error if the frame cannot be written or flushed. The caller
-    /// should treat this as fatal: an event that never left the job is an
+    /// should treat this as fatal: an event that never left the round is an
     /// event the collector can never record.
     pub fn append_event(&self, kind: EventKind) -> io::Result<Event> {
         let event = Event {
@@ -121,10 +121,10 @@ impl<W: Write> FrameWriter<W> {
     }
 }
 
-/// What a collector does with one line of a job's stream.
+/// What a collector does with one line of a round's stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Routed {
-    /// Append to `events.jsonl`, as the job recorded it.
+    /// Append to `events.jsonl`, as the round recorded it.
     Event { seq: u64, event: Event },
     /// Append to the job's log.
     Output(String),
@@ -132,7 +132,7 @@ pub enum Routed {
     AlreadyCollected,
 }
 
-/// How far into a job's stream a collector has got.
+/// How far into a round's stream a collector has got.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StreamPosition {
     last_seq: u64,
@@ -161,9 +161,9 @@ impl StreamPosition {
 }
 
 /// The failure a collector records itself when a round's stream ended
-/// without the job saying how the round went — a pod OOM-killed, a runner
-/// that never started it, a `job-exec` that panicked. `None` when the job
-/// reported its own verdict.
+/// without saying how it went — a pod OOM-killed, a runner that never
+/// started it, a `job-exec` that panicked. `None` when the round reported its
+/// own verdict.
 ///
 /// `collected` is this round's events only: an earlier round's verdict says
 /// nothing about this one.
@@ -177,6 +177,6 @@ pub fn verdict_missing_from(collected: &[Event], ended_because: &str) -> Option<
     });
 
     (!reported).then(|| EventKind::RoundFailed {
-        reason: format!("the job ended without reporting a verdict: {ended_because}"),
+        reason: format!("the round ended without reporting a verdict: {ended_because}"),
     })
 }

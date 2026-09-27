@@ -76,7 +76,7 @@ fn a_payload_variable_holding_something_else_is_refused() {
     let err = RoundPayload::from_variable(Some("{\"job_id\": 1}"))
         .unwrap_err()
         .to_string();
-    assert!(err.contains("ASSEMBLY_JOB is not a job payload"), "{err}");
+    assert!(err.contains("ASSEMBLY_JOB is not a round payload"), "{err}");
 }
 
 #[test]

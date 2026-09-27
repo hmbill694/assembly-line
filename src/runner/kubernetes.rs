@@ -11,12 +11,12 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
-/// How long a pod may sit unscheduled or unpulled before the job fails.
+/// How long a pod may sit unscheduled or unpulled before the round fails.
 /// `Pending` forever is the likeliest k8s failure there is.
 const SCHEDULING_DEADLINE: Duration = Duration::from_mins(10);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// How many times in a row reading the pod's status may fail — an API
-/// server blip — before the job gives up on it.
+/// server blip — before the round gives up on it.
 const STATUS_ATTEMPTS: u32 = 5;
 /// How many reconnects in a row may bring back no new log lines before the
 /// stream is treated as broken rather than dropped.

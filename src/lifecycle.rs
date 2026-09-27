@@ -169,7 +169,7 @@ pub struct RoundConclusion {
 pub enum Handoff {
     /// The agent changed nothing, so there is nothing to deliver.
     NoBranch,
-    /// A failed job still leaves a real branch, but opening a pull request
+    /// A failed round still leaves a real branch, but opening a pull request
     /// for work that did not pass is noise.
     Withheld { branch: String },
     Delivered {
@@ -207,7 +207,7 @@ impl RoundConclusion {
             Handoff::NoBranch => Vec::new(),
             Handoff::Withheld { branch } => {
                 vec![format!(
-                    "branch: {branch} (not delivered — the job did not pass)"
+                    "branch: {branch} (not delivered — the round did not pass)"
                 )]
             }
             Handoff::Delivered {
@@ -685,7 +685,7 @@ fn payload_for_runner<R: Runner>(
 
 /// Launch the round and collect it. A launch failure is a failed round, not
 /// a usage error: the job directory already exists and must say what
-/// became of it. `cancel` reaches the launch too, so Ctrl-C while a job is
+/// became of it. `cancel` reaches the launch too, so Ctrl-C while a round is
 /// still starting stops it rather than waiting for it to start.
 async fn collect_round<R: Runner>(
     runner: &R,
@@ -701,7 +701,7 @@ async fn collect_round<R: Runner>(
     }
 }
 
-/// Hand a finished job's branch on, once `verify` accepted it.
+/// Hand the job's branch on, once its round passed.
 async fn hand_off(
     repo: &Path,
     config: &RepoConfig,

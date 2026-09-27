@@ -1,4 +1,4 @@
-//! One job's sandbox: a scratch clone of the remote, optionally seeded with
+//! One round's sandbox: a scratch clone of the remote, optionally seeded with
 //! files the repository does not carry.
 
 use crate::git::{self, PinnedRef};
@@ -82,7 +82,7 @@ pub async fn create(
 
     std::fs::create_dir_all(scratch_root.as_ref())?;
     let dir = tempfile::Builder::new()
-        .prefix("assembly-job-")
+        .prefix("assembly-round-")
         .tempdir_in(scratch_root)?;
 
     git::clone_into(remote_url, dir.path(), credential_helper).await?;

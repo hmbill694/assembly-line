@@ -1,11 +1,28 @@
 # assembly-line
 
 A Rust CLI that runs one coding-agent job — a repo, a ref, and a prompt — as a
-branch, decides whether it succeeded with `verify`, and opens a pull request
-when it did.
+branch, decides whether each round passed with `verify`, and opens a pull
+request when one did.
 
 - Design decisions: `docs/superpowers/specs/2026-09-11-software-factory-v2.md`
 - Current milestone: `docs/superpowers/plans/2026-09-21-software-factory-f2.md`
+
+## Vocabulary
+
+Three words, used the same way in code, events, CLI text and docs:
+
+- **job** — the durable thing: an id, its branch `al/job-{id}`, `meta.json`,
+  one event log. It lives across revises.
+- **round** — one execution inside the boundary. `run` is round 1; each
+  `revise` adds one.
+- **verdict** — how a round ended: passed or failed. `verify` rejecting the
+  work is one reason for failed, alongside a crash, a timeout or a lost push.
+  What `verify` itself says is its *ruling*.
+
+A Kubernetes `Job` is Kubernetes' word, not ours; one runs one round. Code
+around it keeps the Kubernetes name and wraps it in ours (`KubernetesRound`).
+`job-exec` and `ASSEMBLY_JOB` also kept their names: the image's entry point
+and its input, left alone by choice rather than for compatibility.
 
 ## Toolchain
 

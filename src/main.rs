@@ -13,9 +13,9 @@ use std::process::ExitCode;
 use tokio_util::sync::CancellationToken;
 
 /// Reserved for the user's mistake — a repository that has not opted in, a
-/// missing job, a wrong directory. A job that runs and fails exits 1 instead.
+/// missing job, a wrong directory. A round that runs and fails exits 1 instead.
 const EXIT_USAGE: u8 = 2;
-const EXIT_JOB_FAILED: u8 = 1;
+const EXIT_ROUND_FAILED: u8 = 1;
 
 fn main() -> ExitCode {
     install_tracing();
@@ -223,7 +223,7 @@ fn cancel_on_ctrl_c() -> CancellationToken {
 
 fn exit_code_for(verdict: Verdict) -> ExitCode {
     match verdict {
-        Verdict::Failed => ExitCode::from(EXIT_JOB_FAILED),
+        Verdict::Failed => ExitCode::from(EXIT_ROUND_FAILED),
         Verdict::Passed => ExitCode::SUCCESS,
     }
 }

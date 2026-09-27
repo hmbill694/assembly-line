@@ -16,10 +16,10 @@ use std::path::{Path, PathBuf};
 /// process, `docker run` and a pod spec all share.
 pub const PAYLOAD_VAR: &str = "ASSEMBLY_JOB";
 
-/// The git credential a container job clones and pushes with. Withheld from
-/// the agent's environment — see [`crate::exec`] — but an agent running as
-/// the same user can still read it from `job-exec`'s own process
-/// environment; the spec lists that as an accepted risk.
+/// The git credential a round in a container clones and pushes with.
+/// Withheld from the agent's environment — see [`crate::exec`] — but an
+/// agent running as the same user can still read it from `job-exec`'s own
+/// process environment; the spec lists that as an accepted risk.
 pub const GIT_TOKEN_VAR: &str = "ASSEMBLY_GIT_TOKEN";
 
 /// The HTTPS form of an SSH remote URL, which is what a token can
@@ -78,7 +78,7 @@ pub struct RoundPayload {
     /// runner sharing the host's filesystem can read.
     pub seed_from: PathBuf,
     /// Whether the round runs `mise install` before the agent. Set by
-    /// runners whose jobs arrive in an image with no toolchain of the
+    /// runners whose rounds arrive in an image with no toolchain of the
     /// repository's own.
     pub provision_toolchain: bool,
 }
@@ -154,7 +154,7 @@ impl RoundPayload {
             anyhow::anyhow!("{PAYLOAD_VAR} is not set — job-exec is started by a runner")
         })?;
         serde_json::from_str(json)
-            .map_err(|e| anyhow::anyhow!("{PAYLOAD_VAR} is not a job payload: {e}"))
+            .map_err(|e| anyhow::anyhow!("{PAYLOAD_VAR} is not a round payload: {e}"))
     }
 }
 

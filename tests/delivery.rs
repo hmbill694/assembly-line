@@ -154,7 +154,7 @@ fn fake_gh_capturing_args(tmp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
 /// no pull request opened", never "not delivered" — so this assertion only
 /// passes when the gate is in place.
 #[tokio::test]
-async fn a_failed_job_is_not_delivered() {
+async fn a_failed_round_is_not_delivered() {
     let tmp = repo_running("fake-agent.sh", "exit 1").await;
 
     assembly(&tmp)

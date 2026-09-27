@@ -127,7 +127,7 @@ async fn a_round_that_dies_before_announcing_itself_is_still_recorded_as_that_ro
 
 /// A round the runner could not even start still leaves its failure, and why.
 #[tokio::test]
-async fn a_runner_that_could_not_start_the_job_leaves_a_failed_round() {
+async fn a_runner_that_could_not_start_the_round_leaves_a_failed_round() {
     let h = Harness::new().await;
     let paths = h.job_paths();
     let mut log = EventLog::open_append(paths.events()).unwrap();

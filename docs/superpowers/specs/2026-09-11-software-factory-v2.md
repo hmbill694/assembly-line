@@ -201,7 +201,7 @@ process with stdout and an exit code.**
 The runner emits assembly-line's own event schema — the schema in
 `src/event.rs`, unchanged — inside an envelope, one frame per line:
 
-    {"seq":1,"event":{"at":"…","t":"job_started","round":1}}
+    {"seq":1,"event":{"at":"…","t":"round_started","round":1}}
     {"seq":2,"output":"fake-agent: writing the file"}
 
 `job-exec` pipes the agent's and `verify`'s output to itself and re-emits
@@ -211,12 +211,12 @@ user can still write to `job-exec`'s stdout directly (Accepted risk 11).
 Lines that are not frames — `job-exec`'s own stderr, merged in by
 k8s — go to the log. `seq` numbers every frame, so a collector that resumes a
 dropped stream drops what it already has. A stream that ends without a
-verdict gets one from the collector: `JobFailed` naming why the runner
+verdict gets one from the collector: `RoundFailed` naming why the runner
 stopped.
 
-The host resolves everything a job needs — config read from the base ref,
+The host resolves everything a round needs — config read from the base ref,
 the provider command, `verify`, timeouts — into a payload pinned to a commit
-SHA, and passes it in the `ASSEMBLY_JOB` environment variable. The job never
+SHA, and passes it in the `ASSEMBLY_JOB` environment variable. The round never
 reads config, so nothing inside the boundary can influence its own plan.
 
 This is the *adapter* contract the old spec already described, promoted from
