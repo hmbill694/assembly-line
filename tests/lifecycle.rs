@@ -1,10 +1,10 @@
 use assembly_line::config::Warning;
 use assembly_line::git;
 use assembly_line::lifecycle::{
-    Note, Prepared, Refusal, RevisionRequest, StartRequest, prepare_revision, prepare_start,
-    report_for_job,
+    Note, Prepared, Refusal, RevisionRequest, StartRequest, output_log_of, prepare_revision,
+    prepare_start, report_for_job,
 };
-use assembly_line::paths::{self, JobMeta};
+use assembly_line::paths::{self, JobMeta, JobPaths};
 use assembly_line::runner::local::LocalRunner;
 use support::{Harness, commit_all, config_running};
 
@@ -22,6 +22,23 @@ fn start_in(h: &Harness, provider: Option<&str>) -> StartRequest {
         base_ref: None,
         provider: provider.map(str::to_string),
     }
+}
+
+/// Job `id`'s directory and `meta.json` in `h`'s repository, as `run` would
+/// have left them before its round started.
+fn job_in(h: &Harness, id: u64) -> JobPaths {
+    let job = paths::create_job(&paths::jobs_root(&h.repo), id).unwrap();
+    paths::write_meta(
+        &job,
+        &JobMeta {
+            repo: h.repo.clone(),
+            base_ref: "main".into(),
+            prompt: "x".into(),
+            provider: "fake".into(),
+        },
+    )
+    .unwrap();
+    job
 }
 
 fn refusal_of<R>(prepared: Prepared<'_, R>) -> Refusal {
@@ -111,20 +128,8 @@ async fn a_repository_with_no_remote_cannot_be_prepared() {
 #[tokio::test]
 async fn status_without_a_job_id_reports_the_latest_job() {
     let h = Harness::new().await;
-    let jobs_root = paths::jobs_root(&h.repo);
-    [3, 12].iter().for_each(|&id| {
-        let job = paths::create_job(&jobs_root, id).unwrap();
-        paths::write_meta(
-            &job,
-            &JobMeta {
-                repo: h.repo.clone(),
-                base_ref: "main".into(),
-                prompt: "x".into(),
-                provider: "fake".into(),
-            },
-        )
-        .unwrap();
-    });
+    job_in(&h, 3);
+    job_in(&h, 12);
 
     let report = report_for_job(None, Some(h.repo.clone())).unwrap();
 
@@ -138,6 +143,25 @@ async fn status_in_a_repository_with_no_jobs_says_so() {
     let err = report_for_job(None, Some(h.repo.clone())).unwrap_err();
 
     assert_eq!(err.to_string(), "no jobs yet");
+}
+
+#[tokio::test]
+async fn a_job_that_has_captured_nothing_has_no_log_to_show() {
+    let h = Harness::new().await;
+    job_in(&h, 1);
+
+    let err = output_log_of(1, Some(h.repo.clone())).unwrap_err();
+
+    assert_eq!(err.to_string(), "job 1 has captured no output yet");
+}
+
+#[tokio::test]
+async fn a_job_that_has_captured_output_names_its_log() {
+    let h = Harness::new().await;
+    let job = job_in(&h, 1);
+    std::fs::write(job.log(), "agent says hi\n").unwrap();
+
+    assert_eq!(output_log_of(1, Some(h.repo.clone())).unwrap(), job.log());
 }
 
 #[tokio::test]

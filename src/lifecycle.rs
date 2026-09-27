@@ -423,14 +423,7 @@ pub async fn run<R: Runner>(
 
 /// The job `job_id` names in `repo`, or the latest one there when it names
 /// none.
-///
-/// # Errors
-///
-/// When there is no such repository or job, or its `meta.json` is unreadable.
-pub fn locate_job(
-    job_id: Option<u64>,
-    repo: Option<PathBuf>,
-) -> anyhow::Result<(JobPaths, JobMeta)> {
+fn locate_job(job_id: Option<u64>, repo: Option<PathBuf>) -> anyhow::Result<(JobPaths, JobMeta)> {
     let repo_root = repository_named_or_enclosing(repo)?;
     let jobs_root = paths::jobs_root(&repo_root);
 
@@ -454,6 +447,20 @@ pub fn locate_job(
 pub fn report_for_job(job_id: Option<u64>, repo: Option<PathBuf>) -> anyhow::Result<JobReport> {
     let (paths, _) = locate_job(job_id, repo)?;
     events_of(&paths).map(|events| JobReport::from_events(paths.id, &events))
+}
+
+/// Where job `job_id` in `repo` captured its output.
+///
+/// # Errors
+///
+/// When the job cannot be found, or has captured nothing yet.
+pub fn output_log_of(job_id: u64, repo: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    let (paths, _) = locate_job(Some(job_id), repo)?;
+    let log = paths.log();
+    match log.exists() {
+        true => Ok(log),
+        false => Err(anyhow!("job {job_id} has captured no output yet")),
+    }
 }
 
 fn events_of(paths: &JobPaths) -> anyhow::Result<Vec<Event>> {

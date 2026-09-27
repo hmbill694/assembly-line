@@ -1,9 +1,7 @@
 use assembly_line::cli::{Cli, Command, RunnerArgs, RunnerKind};
 use assembly_line::frame::FrameWriter;
 use assembly_line::job::{JobOutcome, run_round};
-use assembly_line::lifecycle::{
-    self, Note, Prepared, Refusal, RevisionRequest, StartRequest, locate_job,
-};
+use assembly_line::lifecycle::{self, Note, Prepared, Refusal, RevisionRequest, StartRequest};
 use assembly_line::payload::JobPayload;
 use assembly_line::runner::docker::DockerRunner;
 use assembly_line::runner::kubernetes::KubernetesRunner;
@@ -244,15 +242,10 @@ fn print_job_status(job_id: Option<u64>, repo: Option<PathBuf>) -> ExitCode {
 }
 
 fn print_job_log(job_id: u64, follow: bool, repo: Option<PathBuf>) -> ExitCode {
-    let paths = match locate_job(Some(job_id), repo) {
-        Ok((paths, _)) => paths,
+    let path = match lifecycle::output_log_of(job_id, repo) {
+        Ok(path) => path,
         Err(e) => return fail_with_usage_error(e),
     };
-
-    let path = paths.log();
-    if !path.exists() {
-        return fail_with_usage_error(format!("job {job_id} has captured no output yet"));
-    }
 
     match follow {
         // Delegated to `tail` rather than reimplemented; a machine without it
