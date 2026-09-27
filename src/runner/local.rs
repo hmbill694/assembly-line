@@ -1,8 +1,8 @@
-//! Running a job as a child of this process: no isolation, the host's own
+//! Running a round as a child of this process: no isolation, the host's own
 //! toolchain and credentials.
 
 use super::child::ChildLines;
-use super::{JobSecrets, Runner, RunnerProblem, RunningJob, Termination};
+use super::{JobSecrets, Runner, RunnerProblem, RunningRound, Termination};
 use crate::payload::{JobPayload, PAYLOAD_VAR};
 use std::path::PathBuf;
 use tokio::process::Command;
@@ -32,7 +32,7 @@ impl LocalRunner {
 }
 
 impl Runner for LocalRunner {
-    type Running = LocalJob;
+    type Running = LocalRound;
     const RUNS_IN_A_CONTAINER: bool = false;
 
     /// The host is already here: nothing to reach, nothing to create.
@@ -48,13 +48,13 @@ impl Runner for LocalRunner {
         payload: &JobPayload,
         _secrets: &JobSecrets,
         _cancel: &CancellationToken,
-    ) -> impl Future<Output = anyhow::Result<LocalJob>> + Send {
+    ) -> impl Future<Output = anyhow::Result<LocalRound>> + Send {
         std::future::ready(self.spawn_job_exec(payload))
     }
 }
 
 impl LocalRunner {
-    fn spawn_job_exec(&self, payload: &JobPayload) -> anyhow::Result<LocalJob> {
+    fn spawn_job_exec(&self, payload: &JobPayload) -> anyhow::Result<LocalRound> {
         let mut command = Command::new(&self.program);
         command
             .arg("job-exec")
@@ -63,16 +63,16 @@ impl LocalRunner {
             // `job-exec` authenticate with it instead of the host's own
             // credentials.
             .env_remove(crate::payload::GIT_TOKEN_VAR);
-        ChildLines::spawn(command).map(|lines| LocalJob { lines })
+        ChildLines::spawn(command).map(|lines| LocalRound { lines })
     }
 }
 
 #[derive(Debug)]
-pub struct LocalJob {
+pub struct LocalRound {
     lines: ChildLines,
 }
 
-impl RunningJob for LocalJob {
+impl RunningRound for LocalRound {
     async fn next_line(&mut self) -> Option<String> {
         self.lines.next_line().await
     }

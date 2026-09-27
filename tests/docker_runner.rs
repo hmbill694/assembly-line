@@ -2,7 +2,7 @@ use assembly_line::collect::collect;
 use assembly_line::event::{EventKind, EventLog};
 use assembly_line::payload::GIT_TOKEN_VAR;
 use assembly_line::runner::docker::DockerRunner;
-use assembly_line::runner::{JobSecrets, Runner, RunnerProblem, RunningJob};
+use assembly_line::runner::{JobSecrets, Runner, RunnerProblem, RunningRound};
 use std::path::{Path, PathBuf};
 use support::{Harness, fake_cli};
 use tokio_util::sync::CancellationToken;
@@ -55,11 +55,11 @@ async fn a_round_in_docker_is_launched_collected_and_cleaned_up() {
     let paths = h.job_paths();
     let mut log = EventLog::open_append(paths.events()).unwrap();
 
-    let job = runner
+    let running = runner
         .launch(&payload, &token(), &CancellationToken::new())
         .await
         .unwrap();
-    let verdict = collect(job, &mut log, &paths.log(), 1, CancellationToken::new())
+    let verdict = collect(running, &mut log, &paths.log(), 1, CancellationToken::new())
         .await
         .unwrap();
 
@@ -95,7 +95,7 @@ async fn the_agent_sees_neither_the_git_token_nor_the_payload() {
     let paths = h.job_paths();
     let mut log = EventLog::open_append(paths.events()).unwrap();
 
-    let job = runner
+    let running = runner
         .launch(
             &h.payload_for("x").await,
             &token(),
@@ -103,7 +103,7 @@ async fn the_agent_sees_neither_the_git_token_nor_the_payload() {
         )
         .await
         .unwrap();
-    collect(job, &mut log, &paths.log(), 1, CancellationToken::new())
+    collect(running, &mut log, &paths.log(), 1, CancellationToken::new())
         .await
         .unwrap();
 
@@ -126,7 +126,7 @@ async fn a_collector_that_cannot_write_removes_the_container_before_giving_up() 
     let mut log = EventLog::open_append(paths.events()).unwrap();
     let unwritable = fakes.join("no-such-directory").join("job.log");
 
-    let job = runner
+    let running = runner
         .launch(
             &h.payload_for("x").await,
             &token(),
@@ -134,7 +134,7 @@ async fn a_collector_that_cannot_write_removes_the_container_before_giving_up() 
         )
         .await
         .unwrap();
-    let collected = collect(job, &mut log, &unwritable, 1, CancellationToken::new()).await;
+    let collected = collect(running, &mut log, &unwritable, 1, CancellationToken::new()).await;
 
     assert!(collected.is_err());
     let calls = std::fs::read_to_string(&argv).unwrap();
@@ -173,7 +173,7 @@ async fn cancelling_stops_the_container_so_job_exec_reports_the_round() {
         later.cancel();
     });
 
-    let job = runner
+    let running = runner
         .launch(
             &h.payload_for("x").await,
             &token(),
@@ -181,7 +181,7 @@ async fn cancelling_stops_the_container_so_job_exec_reports_the_round() {
         )
         .await
         .unwrap();
-    let verdict = collect(job, &mut log, &paths.log(), 1, cancel)
+    let verdict = collect(running, &mut log, &paths.log(), 1, cancel)
         .await
         .unwrap();
 
@@ -251,7 +251,7 @@ async fn cancelling_a_container_that_prints_as_it_stops_still_ends_the_round() {
         later.cancel();
     });
 
-    let job = runner
+    let running = runner
         .launch(
             &h.payload_for("x").await,
             &token(),
@@ -261,7 +261,7 @@ async fn cancelling_a_container_that_prints_as_it_stops_still_ends_the_round() {
         .unwrap();
     let collected = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        collect(job, &mut log, &paths.log(), 1, cancel),
+        collect(running, &mut log, &paths.log(), 1, cancel),
     )
     .await;
 
@@ -281,7 +281,7 @@ async fn an_oom_killed_container_is_reported_by_its_reason() {
         program: fake_docker(&fakes, &fakes.join("argv"), true),
         image: "img:1".into(),
     };
-    let mut job = runner
+    let mut running = runner
         .launch(
             &h.payload_for("x").await,
             &token(),
@@ -290,8 +290,8 @@ async fn an_oom_killed_container_is_reported_by_its_reason() {
         .await
         .unwrap();
 
-    while job.next_line().await.is_some() {}
-    let termination = job.termination().await;
+    while running.next_line().await.is_some() {}
+    let termination = running.termination().await;
 
     assert_eq!(termination.to_string(), "out of memory");
 }

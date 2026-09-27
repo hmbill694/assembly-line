@@ -1,7 +1,7 @@
-//! Running a job in a container, through the `docker` CLI.
+//! Running a round in a container, through the `docker` CLI.
 
 use super::child::ChildLines;
-use super::{JobSecrets, Runner, RunnerProblem, RunningJob, Termination, job_resource_name};
+use super::{JobSecrets, Runner, RunnerProblem, RunningRound, Termination, job_resource_name};
 use crate::payload::{JobPayload, PAYLOAD_VAR};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
@@ -53,7 +53,7 @@ pub fn docker_run_args(image: &str, container: &str, env_names: &[&str]) -> Vec<
 }
 
 impl Runner for DockerRunner {
-    type Running = DockerJob;
+    type Running = DockerRound;
     const RUNS_IN_A_CONTAINER: bool = true;
 
     async fn reasons_it_cannot_run(&self) -> Vec<RunnerProblem> {
@@ -81,7 +81,7 @@ impl Runner for DockerRunner {
         payload: &JobPayload,
         secrets: &JobSecrets,
         _cancel: &CancellationToken,
-    ) -> impl Future<Output = anyhow::Result<DockerJob>> + Send {
+    ) -> impl Future<Output = anyhow::Result<DockerRound>> + Send {
         std::future::ready(self.spawn_docker_run(payload, secrets))
     }
 }
@@ -93,7 +93,7 @@ impl DockerRunner {
         &self,
         payload: &JobPayload,
         secrets: &JobSecrets,
-    ) -> anyhow::Result<DockerJob> {
+    ) -> anyhow::Result<DockerRound> {
         let container = job_resource_name(payload);
         let names = secrets.names();
         let env_names: Vec<&str> = std::iter::once(PAYLOAD_VAR)
@@ -106,7 +106,7 @@ impl DockerRunner {
             .env(PAYLOAD_VAR, serde_json::to_string(payload)?)
             .envs(secrets.vars());
 
-        ChildLines::spawn(command).map(|lines| DockerJob {
+        ChildLines::spawn(command).map(|lines| DockerRound {
             lines,
             container,
             program: self.program.clone(),
@@ -116,7 +116,7 @@ impl DockerRunner {
 }
 
 #[derive(Debug)]
-pub struct DockerJob {
+pub struct DockerRound {
     lines: ChildLines,
     container: String,
     program: PathBuf,
@@ -124,7 +124,7 @@ pub struct DockerJob {
     stopping: Option<tokio::process::Child>,
 }
 
-impl DockerJob {
+impl DockerRound {
     /// Remove the container, running or not. Nothing to remove is not a
     /// failure worth reporting, so the result is ignored.
     async fn remove_container(program: &Path, container: &str) {
@@ -144,7 +144,7 @@ impl DockerJob {
     }
 }
 
-impl RunningJob for DockerJob {
+impl RunningRound for DockerRound {
     async fn next_line(&mut self) -> Option<String> {
         self.lines.next_line().await
     }
@@ -158,7 +158,7 @@ impl RunningJob for DockerJob {
     /// container has exited, and a container still printing as it winds down
     /// blocks on a full pipe unless its output keeps being read — which the
     /// caller can only do once this returns. It is reaped, and the container
-    /// removed, at [`RunningJob::termination`].
+    /// removed, at [`RunningRound::termination`].
     ///
     /// A cancel that arrives before the container exists — the image still
     /// pulling — finds nothing to stop and is lost. Ctrl-C, the only cancel
@@ -177,7 +177,7 @@ impl RunningJob for DockerJob {
     }
 
     async fn termination(self) -> Termination {
-        let DockerJob {
+        let DockerRound {
             lines,
             container,
             program,
@@ -188,14 +188,14 @@ impl RunningJob for DockerJob {
             let _ = stop.wait().await;
         }
         let termination = match exit_code {
-            code if code != 0 && DockerJob::was_oom_killed(&program, &container).await => {
+            code if code != 0 && DockerRound::was_oom_killed(&program, &container).await => {
                 Termination::Killed {
                     reason: "out of memory".into(),
                 }
             }
             code => Termination::Exited(code),
         };
-        DockerJob::remove_container(&program, &container).await;
+        DockerRound::remove_container(&program, &container).await;
         termination
     }
 }

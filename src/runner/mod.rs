@@ -33,9 +33,9 @@ pub fn published_image() -> String {
 
 /// One way of running `job-exec` somewhere.
 pub trait Runner {
-    type Running: RunningJob + Send;
+    type Running: RunningRound + Send;
 
-    /// Whether jobs run somewhere sharing nothing with the host. Decides
+    /// Whether rounds run somewhere sharing nothing with the host. Decides
     /// whether the payload provisions a toolchain, whether the remote URL
     /// must suit a token, whether `copy` can work, and whether the git
     /// credential has to be sent along.
@@ -45,9 +45,9 @@ pub trait Runner {
     /// before a job directory is allocated.
     fn reasons_it_cannot_run(&self) -> impl Future<Output = Vec<RunnerProblem>> + Send;
 
-    /// Start the job. A runner whose launch waits — on a pod being
+    /// Start the round. A runner whose launch waits — on a pod being
     /// scheduled, say — gives up when `cancel` fires, cleaning up whatever
-    /// it had already created, so Ctrl-C reaches a job still starting.
+    /// it had already created, so Ctrl-C reaches a round still starting.
     fn launch(
         &self,
         payload: &JobPayload,
@@ -56,14 +56,14 @@ pub trait Runner {
     ) -> impl Future<Output = anyhow::Result<Self::Running>> + Send;
 }
 
-/// A launched job: its stream, a way to stop it, and why it stopped.
-pub trait RunningJob {
-    /// The next line of the job's merged output, or `None` at its end. A
+/// A launched round: its stream, a way to stop it, and why it stopped.
+pub trait RunningRound {
+    /// The next line of the round's merged output, or `None` at its end. A
     /// runner whose stream can drop reconnects inside this.
     fn next_line(&mut self) -> impl Future<Output = Option<String>> + Send;
-    /// Start stopping the job, and return without waiting for it to stop:
-    /// the caller keeps reading [`RunningJob::next_line`] until the stream
-    /// ends, and a job winding down may print more than any pipe holds.
+    /// Start stopping the round, and return without waiting for it to stop:
+    /// the caller keeps reading [`RunningRound::next_line`] until the stream
+    /// ends, and a round winding down may print more than any pipe holds.
     fn cancel(&mut self) -> impl Future<Output = ()> + Send;
     fn termination(self) -> impl Future<Output = Termination> + Send;
 }

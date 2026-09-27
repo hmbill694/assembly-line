@@ -8,7 +8,7 @@ use assembly_line::runner::kubernetes::{
     KubernetesRunner, LogReadPosition, PodProgress, active_deadline_secs, job_manifest,
     pod_progress, secret_manifest, split_timestamp,
 };
-use assembly_line::runner::{JobSecrets, Runner, RunningJob};
+use assembly_line::runner::{JobSecrets, Runner, RunningRound};
 use serde_json::json;
 use std::collections::BTreeMap;
 use support::{Harness, fake_cli};
@@ -404,7 +404,7 @@ fn kubectl_answering(
 async fn collected_round(h: &Harness, k8s: &KubernetesRunner) -> (bool, Vec<Event>) {
     let paths = h.job_paths();
     let mut log = EventLog::open_append(paths.events()).unwrap();
-    let job = k8s
+    let running = k8s
         .launch(
             &h.payload_for("x").await,
             &JobSecrets::default(),
@@ -414,7 +414,7 @@ async fn collected_round(h: &Harness, k8s: &KubernetesRunner) -> (bool, Vec<Even
         .unwrap();
     let verdict = tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        collect(job, &mut log, &paths.log(), 1, CancellationToken::new()),
+        collect(running, &mut log, &paths.log(), 1, CancellationToken::new()),
     )
     .await
     .expect("collection never ended")
@@ -720,7 +720,7 @@ async fn cancelling_a_running_job_deletes_the_job_and_its_secret() {
         "cat frames",
     ));
 
-    let mut job = k8s
+    let mut running = k8s
         .launch(
             &h.payload_for("x").await,
             &JobSecrets::default(),
@@ -728,7 +728,7 @@ async fn cancelling_a_running_job_deletes_the_job_and_its_secret() {
         )
         .await
         .unwrap();
-    job.cancel().await;
+    running.cancel().await;
 
     let argv = std::fs::read_to_string(fakes.join("argv")).unwrap();
     assert!(argv.contains("delete job"), "{argv}");

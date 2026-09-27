@@ -1,10 +1,10 @@
-//! The host's side of a job's stream: frames in, `events.jsonl` and the log
+//! The host's side of a round's stream: frames in, `events.jsonl` and the log
 //! out. Runner-agnostic — it sees lines and a termination, nothing else.
 
 use crate::event::{Event, EventKind, EventLog};
 use crate::frame::{Routed, StreamPosition, verdict_missing_from};
 use crate::round::Verdict;
-use crate::runner::RunningJob;
+use crate::runner::RunningRound;
 use std::io::Write;
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
@@ -15,26 +15,26 @@ use tokio_util::sync::CancellationToken;
 ///
 /// Returns an error only if the log or the event log cannot be written. A
 /// round that fails, or dies without saying how, is a [`Verdict::Failed`].
-/// The job is cancelled, and its end waited for, before the error is
+/// The round is cancelled, and its end waited for, before the error is
 /// returned: dropping it would kill only the local end — a `docker` client,
 /// or `job-exec` before it has stopped its agent — and leave the work
 /// running with nobody collecting it.
-pub async fn collect<J: RunningJob>(
-    mut job: J,
+pub async fn collect<R: RunningRound>(
+    mut running: R,
     log: &mut EventLog,
     output_log: &Path,
     round: u32,
     cancel: CancellationToken,
 ) -> anyhow::Result<Verdict> {
-    let collected = match stream_into_logs(&mut job, log, output_log, cancel).await {
+    let collected = match stream_into_logs(&mut running, log, output_log, cancel).await {
         Ok(collected) => collected,
         Err(e) => {
-            cancel_and_wait_out(job).await;
+            cancel_and_wait_out(running).await;
             return Err(e);
         }
     };
 
-    let termination = job.termination().await;
+    let termination = running.termination().await;
     let settled = start_missing_from(&collected, round)
         .into_iter()
         .chain(verdict_missing_from(&collected, &termination.to_string()))
@@ -43,7 +43,7 @@ pub async fn collect<J: RunningJob>(
     Ok(verdict_of(&[collected, settled].concat()))
 }
 
-/// The start of a round whose stream never announced one — a job that died
+/// The start of a round whose stream never announced one — a round that died
 /// before its first frame, or never ran. Without it the round's failure would
 /// read as the previous round's, and the next revise would reuse its number.
 fn start_missing_from(round_events: &[Event], round: u32) -> Option<EventKind> {
@@ -53,13 +53,13 @@ fn start_missing_from(round_events: &[Event], round: u32) -> Option<EventKind> {
     .then_some(EventKind::RoundStarted { round })
 }
 
-/// Route every line of the job's stream to the event log or the output log
+/// Route every line of the round's stream to the event log or the output log
 /// until the stream ends, returning the events collected.
 ///
 /// A loop, not a fold: each line is I/O that must land before the next is
 /// read, and cancellation arrives from outside mid-stream.
-async fn stream_into_logs<J: RunningJob>(
-    job: &mut J,
+async fn stream_into_logs<R: RunningRound>(
+    running: &mut R,
     log: &mut EventLog,
     output_log: &Path,
     cancel: CancellationToken,
@@ -71,9 +71,9 @@ async fn stream_into_logs<J: RunningJob>(
 
     loop {
         let line = tokio::select! {
-            line = job.next_line() => line,
+            line = running.next_line() => line,
             () = cancel.cancelled(), if !cancelling => {
-                job.cancel().await;
+                running.cancel().await;
                 cancelling = true;
                 continue;
             }
@@ -94,12 +94,12 @@ async fn stream_into_logs<J: RunningJob>(
     Ok(collected)
 }
 
-/// Cancel `job` and wait for it to end, discarding the rest of its stream so
-/// it never blocks writing to a pipe nobody reads.
-async fn cancel_and_wait_out<J: RunningJob>(mut job: J) {
-    job.cancel().await;
-    while job.next_line().await.is_some() {}
-    let _ = job.termination().await;
+/// Cancel `running` and wait for it to end, discarding the rest of its stream
+/// so it never blocks writing to a pipe nobody reads.
+async fn cancel_and_wait_out<R: RunningRound>(mut running: R) {
+    running.cancel().await;
+    while running.next_line().await.is_some() {}
+    let _ = running.termination().await;
 }
 
 /// A runner that could not start the job at all still leaves a record: the

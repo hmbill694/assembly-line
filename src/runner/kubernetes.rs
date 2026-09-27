@@ -1,7 +1,7 @@
-//! Running a job as a k8s Job, through the `kubectl` CLI.
+//! Running a round as a k8s Job, through the `kubectl` CLI.
 
 use super::child::ChildLines;
-use super::{JobSecrets, Runner, RunnerProblem, RunningJob, Termination, job_resource_name};
+use super::{JobSecrets, Runner, RunnerProblem, RunningRound, Termination, job_resource_name};
 use crate::payload::{JobPayload, PAYLOAD_VAR};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -347,7 +347,7 @@ async fn output_of(mut command: Command, stdin: Option<String>) -> anyhow::Resul
 }
 
 impl Runner for KubernetesRunner {
-    type Running = KubernetesJob;
+    type Running = KubernetesRound;
     const RUNS_IN_A_CONTAINER: bool = true;
 
     /// Every permission a round uses, asked up front: one found missing
@@ -393,19 +393,19 @@ impl Runner for KubernetesRunner {
         payload: &JobPayload,
         secrets: &JobSecrets,
         cancel: &CancellationToken,
-    ) -> anyhow::Result<KubernetesJob> {
-        let mut job = KubernetesJob::named(self.clone(), job_resource_name(payload));
-        match job.create_and_follow(payload, secrets, cancel).await {
-            Ok(()) => Ok(job),
+    ) -> anyhow::Result<KubernetesRound> {
+        let mut round = KubernetesRound::named(self.clone(), job_resource_name(payload));
+        match round.create_and_follow(payload, secrets, cancel).await {
+            Ok(()) => Ok(round),
             Err(e) => {
-                job.delete_job_and_secret().await;
+                round.delete_job_and_secret().await;
                 Err(e)
             }
         }
     }
 }
 
-/// Where a job's log is read from.
+/// Where a round's log is read from.
 #[derive(Debug)]
 enum LogStream {
     /// `kubectl logs -f`, which can drop while the pod runs on.
@@ -416,8 +416,10 @@ enum LogStream {
     Ended,
 }
 
+/// A round running as a Kubernetes Job. In this module "Job" is always the
+/// Kubernetes object, which runs exactly one round.
 #[derive(Debug)]
-pub struct KubernetesJob {
+pub struct KubernetesRound {
     runner: KubernetesRunner,
     name: String,
     pod: String,
@@ -435,10 +437,10 @@ pub struct KubernetesJob {
     stream_abandoned_because: Option<String>,
 }
 
-impl KubernetesJob {
+impl KubernetesRound {
     /// The handle for a Job not yet created.
     fn named(runner: KubernetesRunner, name: String) -> Self {
-        KubernetesJob {
+        KubernetesRound {
             runner,
             name,
             pod: String::new(),
@@ -668,7 +670,7 @@ impl KubernetesJob {
     }
 }
 
-impl RunningJob for KubernetesJob {
+impl RunningRound for KubernetesRound {
     /// A `kubectl logs -f` that ends while the pod is still running dropped;
     /// start another from the last timestamp. One that ends as the pod
     /// finishes is followed by a last drain from that timestamp. What either
