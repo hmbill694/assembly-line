@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # The steps are `just ci`'s dependency list, in order. Split here so a
+  # failure names itself in the UI; `just ci` runs the same set locally.
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: devenv shell bash -- -e {0}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+        with:
+          name: devenv
+      - name: Install devenv
+        shell: bash
+        run: nix profile add nixpkgs#devenv
+
+      # The justfile builds into /tmp/assembly-line-target, not target/.
+      - name: Cache build artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            /tmp/assembly-line-target
+          key: ${{ runner.os }}-build-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-build-
+
+      - run: just fmt-check
+      - run: just lint
+      - run: just test
+
+  # Advisory until trusted: an advisory with no fix yet should not block
+  # every PR. Drop continue-on-error to make it a gate.
+  audit:
+    name: Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    defaults:
+      run:
+        shell: devenv shell bash -- -e {0}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+        with:
+          name: devenv
+      - name: Install devenv
+        shell: bash
+        run: nix profile add nixpkgs#devenv
+      - run: just audit
+
+  # Proves the Dockerfile still builds from a plain checkout. Never pushes:
+  # a binary at X.Y.Z launches exactly the image tagged X.Y.Z, and only a
+  # release publishes one. amd64 only — releases build arm64 too.
+  image:
+    name: Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
