@@ -94,7 +94,7 @@ impl JobProgress {
                 ..self
             },
             EventKind::RoundPassed => JobProgress {
-                state: JobState::Succeeded,
+                state: JobState::Passed,
                 last_attempt_duration: self.time_spent_until(event.at),
                 ..self
             },

@@ -10,7 +10,7 @@ use crate::config::{self, ConfigError, RepoConfig, Warning};
 use crate::delivery::{self, Delivered, PullRequestText};
 use crate::event::{Event, EventKind, EventLog};
 use crate::git::{self, PinnedRef};
-use crate::job::JobOutcome;
+use crate::job::Verdict;
 use crate::paths::{self, JobMeta, JobPaths};
 use crate::payload::{self, JobPayload, RoundRequest};
 use crate::report::JobReport;
@@ -157,7 +157,7 @@ impl<R> ReadyRound<'_, R> {
 #[derive(Debug)]
 pub struct RoundConclusion {
     pub job: JobPaths,
-    pub outcome: JobOutcome,
+    pub verdict: Verdict,
     /// `None` when the job's own event log could not be read back.
     pub report: Option<JobReport>,
     pub handoff: Handoff,
@@ -393,7 +393,7 @@ pub async fn run<R: Runner>(
             seed_from: &meta.repo,
         },
     )?;
-    let outcome = collect_round(runner, &payload, &secrets, &mut log, &paths.log(), cancel).await?;
+    let verdict = collect_round(runner, &payload, &secrets, &mut log, &paths.log(), cancel).await?;
 
     let report = events_of(&paths)
         .ok()
@@ -404,7 +404,7 @@ pub async fn run<R: Runner>(
         &config,
         &meta.base_ref,
         branch,
-        outcome,
+        verdict,
         PullRequestText {
             title: &payload.commit_message,
             body: &meta.prompt,
@@ -414,7 +414,7 @@ pub async fn run<R: Runner>(
 
     Ok(RoundConclusion {
         job: paths,
-        outcome,
+        verdict,
         report,
         handoff,
         started_the_job,
@@ -694,7 +694,7 @@ async fn collect_round<R: Runner>(
     log: &mut EventLog,
     output_log: &Path,
     cancel: CancellationToken,
-) -> anyhow::Result<JobOutcome> {
+) -> anyhow::Result<Verdict> {
     match runner.launch(payload, secrets, &cancel).await {
         Ok(job) => collect(job, log, output_log, payload.round, cancel).await,
         Err(e) => record_launch_failure(log, payload.round, &e),
@@ -707,13 +707,13 @@ async fn hand_off(
     config: &RepoConfig,
     base_ref: &str,
     branch: Option<String>,
-    outcome: JobOutcome,
+    verdict: Verdict,
     pull_request: PullRequestText<'_>,
 ) -> Handoff {
-    match (branch, outcome) {
+    match (branch, verdict) {
         (None, _) => Handoff::NoBranch,
-        (Some(branch), JobOutcome::Failed) => Handoff::Withheld { branch },
-        (Some(branch), JobOutcome::Passed) => {
+        (Some(branch), Verdict::Failed) => Handoff::Withheld { branch },
+        (Some(branch), Verdict::Passed) => {
             let base = config.base.as_deref().unwrap_or(base_ref);
             let base_differs = (base != base_ref).then(|| BaseDiffers {
                 base: base.to_string(),

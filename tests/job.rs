@@ -17,8 +17,8 @@ async fn a_job_leaves_one_branch_carrying_its_work() {
 
     let outcome = h.run_job("write a file").await;
 
-    assert!(outcome.succeeded);
-    assert_eq!(outcome.state, JobState::Succeeded);
+    assert!(outcome.passed);
+    assert_eq!(outcome.state, JobState::Passed);
     assert!(
         outcome.has(|e| matches!(e, EventKind::RoundCommitted { .. })),
         "the agent's work should be committed"
@@ -94,7 +94,7 @@ async fn a_job_obeys_the_committed_config_not_the_working_trees() {
     let outcome = h.run_job("go").await;
 
     assert!(
-        outcome.succeeded,
+        outcome.passed,
         "the working tree's provider ran: {:?}",
         outcome.events
     );
@@ -118,7 +118,7 @@ async fn a_job_leaves_the_target_repositorys_working_tree_untouched() {
 
     let outcome = h.run_job("add authentication").await;
 
-    assert!(outcome.succeeded);
+    assert!(outcome.passed);
     assert_eq!(head_sha(&h.repo).await.unwrap(), base);
     assert_eq!(
         git::current_branch(&h.repo).await.unwrap().as_deref(),
@@ -161,7 +161,7 @@ async fn a_failing_agent_preserves_its_work_on_a_branch_and_leaves_no_checkout()
 
     let outcome = h.run_job("x").await;
 
-    assert!(!outcome.succeeded);
+    assert!(!outcome.passed);
     assert_eq!(outcome.state, JobState::Failed);
     assert!(
         outcome
@@ -196,7 +196,7 @@ async fn a_checkout_the_agent_write_protected_is_still_discarded_and_its_work_ke
 
     let outcome = h.run_job("x").await;
 
-    assert!(outcome.succeeded, "{:?}", outcome.state);
+    assert!(outcome.passed, "{:?}", outcome.state);
     assert!(outcome.has(|k| matches!(k, EventKind::RoundCommitted { .. })));
     assert!(
         h.files_on_remote_branch(&job_branch_name(outcome.job_id))
@@ -334,7 +334,7 @@ async fn a_refused_push_fails_the_job_and_says_the_work_is_lost() {
 
     let outcome = h.run(prepared).await;
 
-    assert!(!outcome.succeeded);
+    assert!(!outcome.passed);
     assert!(
         !outcome.has(|k| matches!(k, EventKind::BranchPushed { .. })),
         "a branch that never left the clone was recorded as published: {:?}",
@@ -375,13 +375,13 @@ async fn a_repository_with_no_remote_has_nothing_to_clone() {
 }
 
 #[tokio::test]
-async fn an_agent_that_changes_nothing_succeeds_without_committing() {
+async fn an_agent_that_changes_nothing_passes_without_committing() {
     let h = Harness::with_config(&config_running("noop-agent.sh")).await;
 
     let outcome = h.run_job("x").await;
 
-    assert!(outcome.succeeded);
-    assert_eq!(outcome.state, JobState::Succeeded);
+    assert!(outcome.passed);
+    assert_eq!(outcome.state, JobState::Passed);
     assert!(!outcome.has(|k| matches!(k, EventKind::RoundCommitted { .. })));
 }
 
@@ -394,7 +394,7 @@ async fn an_agent_that_commits_its_own_work_has_it_published() {
 
     let outcome = h.run_job("self-committed").await;
 
-    assert!(outcome.succeeded);
+    assert!(outcome.passed);
     assert!(outcome.has(|k| matches!(k, EventKind::RoundCommitted { .. })));
     assert_eq!(
         h.file_on_remote_branch(&job_branch_name(outcome.job_id), "agent-output.txt")
@@ -416,7 +416,7 @@ async fn an_agent_that_switches_branches_publishes_what_it_left_checked_out() {
     std::fs::write(h.repo.join(".env"), "API_KEY=hunter2\n").unwrap();
 
     let outcome = h.run_job("switched").await;
-    assert!(outcome.succeeded);
+    assert!(outcome.passed);
 
     let branch = job_branch_name(outcome.job_id);
     assert_eq!(
@@ -446,7 +446,7 @@ async fn seeded_files_reach_the_agent_but_never_the_branch() {
     std::fs::write(h.repo.join(".env"), "API_KEY=hunter2\n").unwrap();
 
     let outcome = h.run_job("x").await;
-    assert!(outcome.succeeded);
+    assert!(outcome.passed);
 
     let listed = h
         .files_on_remote_branch(&job_branch_name(outcome.job_id))
@@ -467,7 +467,7 @@ async fn a_missing_provider_binary_fails_the_job_with_a_useful_message() {
 
     let outcome = h.run_job("x").await;
 
-    assert!(!outcome.succeeded);
+    assert!(!outcome.passed);
     assert!(
         outcome.has(
             |k| matches!(k, EventKind::RoundFailed { reason } if reason.contains("definitely-not-real-xyz"))
@@ -526,10 +526,10 @@ async fn a_revise_round_continues_the_branch_instead_of_starting_over() {
     let h = Harness::with_config(&config_running("revising-agent.sh")).await;
 
     let first = h.run_job("hi").await;
-    assert!(first.succeeded);
+    assert!(first.passed);
 
     let second = h.revise_job(first.job_id, "add error handling").await;
-    assert!(second.succeeded);
+    assert!(second.passed);
 
     let branch = job_branch_name(second.job_id);
     let body = h

@@ -16,7 +16,7 @@ fn a_job_starts_pending() {
 }
 
 #[test]
-fn starting_and_finishing_moves_a_job_through_running_to_succeeded() {
+fn starting_and_passing_moves_a_job_through_running_to_passed() {
     let started = vec![EventKind::RoundStarted { round: 1 }];
     assert_eq!(
         JobState::replay(&stream(started.clone())),
@@ -24,7 +24,7 @@ fn starting_and_finishing_moves_a_job_through_running_to_succeeded() {
     );
 
     let finished = [started, vec![EventKind::RoundPassed]].concat();
-    assert_eq!(JobState::replay(&stream(finished)), JobState::Succeeded);
+    assert_eq!(JobState::replay(&stream(finished)), JobState::Passed);
 }
 
 #[test]
@@ -54,7 +54,7 @@ fn a_commit_is_progress_not_completion() {
     );
 
     let finished = [through_commit, vec![EventKind::RoundPassed]].concat();
-    assert_eq!(JobState::replay(&stream(finished)), JobState::Succeeded);
+    assert_eq!(JobState::replay(&stream(finished)), JobState::Passed);
 }
 
 /// A round's branch is pushed before its verdict is reached, so pushing must
@@ -103,13 +103,13 @@ fn replay_reconstructs_the_final_state_from_the_log_alone() {
         EventKind::RoundPassed,
     ]));
 
-    assert_eq!(st, JobState::Succeeded);
+    assert_eq!(st, JobState::Passed);
 }
 
 #[test]
 fn every_state_has_a_label() {
     assert_eq!(JobState::Pending.label(), "pending");
     assert_eq!(JobState::Running.label(), "running");
-    assert_eq!(JobState::Succeeded.label(), "succeeded");
+    assert_eq!(JobState::Passed.label(), "passed");
     assert_eq!(JobState::Failed.label(), "failed");
 }

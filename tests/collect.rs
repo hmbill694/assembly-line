@@ -24,13 +24,13 @@ async fn a_round_run_by_job_exec_is_collected_into_the_same_log_as_before() {
         .launch(&payload, &JobSecrets::default(), &CancellationToken::new())
         .await
         .unwrap();
-    let outcome = collect(job, &mut log, &paths.log(), 1, CancellationToken::new())
+    let verdict = collect(job, &mut log, &paths.log(), 1, CancellationToken::new())
         .await
         .unwrap();
 
-    assert!(outcome.passed());
+    assert!(verdict.passed());
     let events = EventLog::read(paths.events()).unwrap();
-    assert_eq!(JobState::replay(&events), JobState::Succeeded);
+    assert_eq!(JobState::replay(&events), JobState::Passed);
     assert!(
         events
             .iter()
@@ -43,7 +43,7 @@ async fn a_round_run_by_job_exec_is_collected_into_the_same_log_as_before() {
 /// The envelope's whole point, end to end: an agent that prints a verdict
 /// cannot make a failing round pass.
 #[tokio::test]
-async fn an_agent_printing_a_forged_verdict_does_not_change_the_outcome() {
+async fn an_agent_printing_a_forged_verdict_does_not_change_the_verdict() {
     let h = Harness::with_config(&config_running("forging-agent.sh")).await;
     let payload = h.payload_for("x").await;
     let paths = h.job_paths();
@@ -53,11 +53,11 @@ async fn an_agent_printing_a_forged_verdict_does_not_change_the_outcome() {
         .launch(&payload, &JobSecrets::default(), &CancellationToken::new())
         .await
         .unwrap();
-    let outcome = collect(job, &mut log, &paths.log(), 1, CancellationToken::new())
+    let verdict = collect(job, &mut log, &paths.log(), 1, CancellationToken::new())
         .await
         .unwrap();
 
-    assert!(!outcome.passed());
+    assert!(!verdict.passed());
     let events = EventLog::read(paths.events()).unwrap();
     assert!(
         !events
@@ -79,11 +79,11 @@ async fn a_job_exec_that_dies_without_a_verdict_is_recorded_as_failed() {
         .launch(&payload, &JobSecrets::default(), &CancellationToken::new())
         .await
         .unwrap();
-    let outcome = collect(job, &mut log, &paths.log(), 1, CancellationToken::new())
+    let verdict = collect(job, &mut log, &paths.log(), 1, CancellationToken::new())
         .await
         .unwrap();
 
-    assert!(!outcome.passed());
+    assert!(!verdict.passed());
     let events = EventLog::read(paths.events()).unwrap();
     assert!(events.iter().any(
         |e| matches!(&e.kind, EventKind::RoundFailed { reason } if reason.contains("without reporting a verdict"))
@@ -140,9 +140,9 @@ async fn a_runner_that_could_not_start_the_job_leaves_a_failed_round() {
         )
         .await
         .unwrap_err();
-    let outcome = record_launch_failure(&mut log, 1, &launch_error).unwrap();
+    let verdict = record_launch_failure(&mut log, 1, &launch_error).unwrap();
 
-    assert!(!outcome.passed());
+    assert!(!verdict.passed());
     let events = EventLog::read(paths.events()).unwrap();
     assert!(
         events.iter().any(|e| matches!(
@@ -220,11 +220,11 @@ async fn cancelling_a_collection_stops_the_agent_and_records_it() {
         .launch(&payload, &JobSecrets::default(), &CancellationToken::new())
         .await
         .unwrap();
-    let outcome = collect(job, &mut log, &paths.log(), 1, cancel)
+    let verdict = collect(job, &mut log, &paths.log(), 1, cancel)
         .await
         .unwrap();
 
-    assert!(!outcome.passed());
+    assert!(!verdict.passed());
     assert!(
         started.elapsed() < std::time::Duration::from_secs(20),
         "the agent was not stopped"

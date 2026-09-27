@@ -59,12 +59,12 @@ async fn a_round_in_docker_is_launched_collected_and_cleaned_up() {
         .launch(&payload, &token(), &CancellationToken::new())
         .await
         .unwrap();
-    let outcome = collect(job, &mut log, &paths.log(), 1, CancellationToken::new())
+    let verdict = collect(job, &mut log, &paths.log(), 1, CancellationToken::new())
         .await
         .unwrap();
 
     assert!(
-        outcome.passed(),
+        verdict.passed(),
         "{:?}",
         EventLog::read(paths.events()).unwrap()
     );
@@ -181,11 +181,11 @@ async fn cancelling_stops_the_container_so_job_exec_reports_the_round() {
         )
         .await
         .unwrap();
-    let outcome = collect(job, &mut log, &paths.log(), 1, cancel)
+    let verdict = collect(job, &mut log, &paths.log(), 1, cancel)
         .await
         .unwrap();
 
-    assert!(!outcome.passed());
+    assert!(!verdict.passed());
     let events = EventLog::read(paths.events()).unwrap();
     assert!(
         events

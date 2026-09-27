@@ -8,7 +8,7 @@ pub enum JobState {
     #[default]
     Pending,
     Running,
-    Succeeded,
+    Passed,
     Failed,
 }
 
@@ -18,7 +18,7 @@ impl JobState {
         match self {
             Self::Pending => "pending",
             Self::Running => "running",
-            Self::Succeeded => "succeeded",
+            Self::Passed => "passed",
             Self::Failed => "failed",
         }
     }
@@ -28,7 +28,7 @@ impl JobState {
     fn after_event(self, event: &Event) -> Self {
         match &event.kind {
             EventKind::RoundStarted { .. } => JobState::Running,
-            EventKind::RoundPassed => JobState::Succeeded,
+            EventKind::RoundPassed => JobState::Passed,
             EventKind::RoundFailed { .. } => JobState::Failed,
             // Progress markers, not transitions. Listed one by one rather
             // than behind a catch-all, so a new event kind is a compile error

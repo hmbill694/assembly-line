@@ -3,18 +3,18 @@
 
 use crate::event::{Event, EventKind, EventLog};
 use crate::frame::{Routed, StreamPosition, verdict_missing_from};
-use crate::job::JobOutcome;
+use crate::job::Verdict;
 use crate::runner::RunningJob;
 use std::io::Write;
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
-/// Collect one round's stream until it ends, then settle its outcome.
+/// Collect one round's stream until it ends, then settle its verdict.
 ///
 /// # Errors
 ///
 /// Returns an error only if the log or the event log cannot be written. A
-/// job that fails, or dies without saying how, is a [`JobOutcome::Failed`].
+/// round that fails, or dies without saying how, is a [`Verdict::Failed`].
 /// The job is cancelled, and its end waited for, before the error is
 /// returned: dropping it would kill only the local end — a `docker` client,
 /// or `job-exec` before it has stopped its agent — and leave the work
@@ -25,7 +25,7 @@ pub async fn collect<J: RunningJob>(
     output_log: &Path,
     round: u32,
     cancel: CancellationToken,
-) -> anyhow::Result<JobOutcome> {
+) -> anyhow::Result<Verdict> {
     let collected = match stream_into_logs(&mut job, log, output_log, cancel).await {
         Ok(collected) => collected,
         Err(e) => {
@@ -40,7 +40,7 @@ pub async fn collect<J: RunningJob>(
         .chain(verdict_missing_from(&collected, &termination.to_string()))
         .map(|kind| log.append(kind))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(outcome_of(&[collected, settled].concat()))
+    Ok(verdict_of(&[collected, settled].concat()))
 }
 
 /// The start of a round whose stream never announced one — a job that died
@@ -112,25 +112,25 @@ pub fn record_launch_failure(
     log: &mut EventLog,
     round: u32,
     error: &anyhow::Error,
-) -> anyhow::Result<JobOutcome> {
+) -> anyhow::Result<Verdict> {
     log.append(EventKind::RoundStarted { round })?;
     log.append(EventKind::RoundFailed {
         reason: format!("the runner could not start the job: {error}"),
     })?;
-    Ok(JobOutcome::Failed)
+    Ok(Verdict::Failed)
 }
 
 /// What a round's events add up to: the last verdict in them.
-fn outcome_of(round: &[Event]) -> JobOutcome {
+fn verdict_of(round: &[Event]) -> Verdict {
     round
         .iter()
         .rev()
         .find_map(|e| match e.kind {
-            EventKind::RoundPassed => Some(JobOutcome::Passed),
-            EventKind::RoundFailed { .. } => Some(JobOutcome::Failed),
+            EventKind::RoundPassed => Some(Verdict::Passed),
+            EventKind::RoundFailed { .. } => Some(Verdict::Failed),
             _ => None,
         })
-        .unwrap_or(JobOutcome::Failed)
+        .unwrap_or(Verdict::Failed)
 }
 
 fn open_for_append(path: &Path) -> std::io::Result<std::fs::File> {

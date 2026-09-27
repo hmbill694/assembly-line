@@ -41,7 +41,7 @@ async fn a_job_whose_verify_fails_is_a_failed_job() {
 
     let outcome = h.run_job("write a file").await;
 
-    assert!(!outcome.succeeded, "a failing verify fails the job");
+    assert!(!outcome.passed, "a failing verify fails the job");
     assert!(
         outcome.has(|e| matches!(e, EventKind::VerifyRejected { .. })),
         "the failure should say verify was what rejected it"
@@ -81,7 +81,7 @@ async fn a_job_whose_verify_fails_is_a_failed_job() {
 /// same sentinel that must be absent there must be present here, or that test
 /// would pass for a verify that never runs under any circumstances.
 #[tokio::test]
-async fn a_job_whose_verify_passes_succeeds() {
+async fn a_round_whose_verify_passes_passes() {
     let h = Harness::with_config(&format!(
         "verify = \"echo {VERIFY_RAN} && {VERIFY_SEES_THE_COMMITTED_WORK}\"\n{}",
         config_running("fake-agent.sh")
@@ -91,25 +91,25 @@ async fn a_job_whose_verify_passes_succeeds() {
     let outcome = h.run_job("write a file").await;
 
     assert!(
-        outcome.succeeded,
+        outcome.passed,
         "verify runs in the job's checkout after the commit, so it sees the work"
     );
     assert!(!outcome.has(|e| matches!(e, EventKind::VerifyRejected { .. })));
     assert!(
         outcome.output.contains(VERIFY_RAN),
-        "a round the agent succeeded is a round verify is asked about"
+        "a round the agent finished cleanly is a round verify is asked about"
     );
 }
 
 #[tokio::test]
-async fn a_job_with_no_verify_succeeds_on_the_agents_exit_code() {
+async fn a_round_with_no_verify_passes_on_the_agents_exit_code() {
     // No `verify` key at all — not an empty config, which would declare no
     // provider either and leave the job with nothing to run.
     let h = Harness::with_config(&config_running("fake-agent.sh")).await;
 
     let outcome = h.run_job("write a file").await;
 
-    assert!(outcome.succeeded);
+    assert!(outcome.passed);
 }
 
 /// The composition rule: an agent failure is the earlier and more fundamental
@@ -129,7 +129,7 @@ async fn an_agent_failure_wins_over_verify() {
 
     let outcome = h.run_job("write a file").await;
 
-    assert!(!outcome.succeeded);
+    assert!(!outcome.passed);
     assert!(
         outcome.has(|e| matches!(e, EventKind::RoundFailed { reason } if reason == "exit 3")),
         "the job failed for the agent's reason, not verify's: {:?}",
@@ -163,10 +163,10 @@ async fn a_verify_cut_off_by_max_duration_is_not_a_rejection() {
 
     let outcome = h.run_job("write a file").await;
 
-    assert!(!outcome.succeeded, "an unfinished verify still fails a job");
+    assert!(!outcome.passed, "an unfinished verify still fails a job");
     assert!(
         !outcome.has(|e| matches!(e, EventKind::VerifyRejected { .. })),
-        "a timed-out verify reached no verdict, so it is not a rejection"
+        "a timed-out verify reached no ruling, so it is not a rejection"
     );
     assert!(
         outcome.has(

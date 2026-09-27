@@ -1,6 +1,6 @@
 use assembly_line::cli::{Cli, Command, RunnerArgs, RunnerKind};
 use assembly_line::frame::FrameWriter;
-use assembly_line::job::{JobOutcome, run_round};
+use assembly_line::job::{Verdict, run_round};
 use assembly_line::lifecycle::{self, Note, Prepared, Refusal, RevisionRequest, StartRequest};
 use assembly_line::payload::JobPayload;
 use assembly_line::runner::docker::DockerRunner;
@@ -179,7 +179,7 @@ async fn run_work<R: Runner>(
         .to_lines()
         .iter()
         .for_each(|line| println!("{line}"));
-    Ok(exit_code_for(conclusion.outcome))
+    Ok(exit_code_for(conclusion.verdict))
 }
 
 /// Every reason on its own line; the refusal itself becomes the usage error.
@@ -221,10 +221,10 @@ fn cancel_on_ctrl_c() -> CancellationToken {
     cancel
 }
 
-fn exit_code_for(outcome: JobOutcome) -> ExitCode {
-    match outcome {
-        JobOutcome::Failed => ExitCode::from(EXIT_JOB_FAILED),
-        JobOutcome::Passed => ExitCode::SUCCESS,
+fn exit_code_for(verdict: Verdict) -> ExitCode {
+    match verdict {
+        Verdict::Failed => ExitCode::from(EXIT_JOB_FAILED),
+        Verdict::Passed => ExitCode::SUCCESS,
     }
 }
 

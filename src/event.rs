@@ -36,7 +36,7 @@ pub enum EventKind {
     /// one whose agent crashed.
     ///
     /// `reason` is how `verify` failed — `exit 1` — not what it printed; the
-    /// command's output is in the job's log. Written only for a verdict
+    /// command's output is in the job's log. Written only for a ruling
     /// `verify` actually reached: a run that was cancelled or cut off at
     /// `max_duration` judged nothing, and this event would claim otherwise in
     /// a log that can never be corrected.

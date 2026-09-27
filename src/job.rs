@@ -27,15 +27,16 @@ const PROVISIONING_LIMIT: Duration = Duration::from_mins(15);
 /// it has not been told to trust, and a fresh clone is exactly that.
 const PROVISIONING_STEPS: [&[&str]; 2] = [&["trust", "--all", "--yes"], &["install", "--yes"]];
 
-/// Whether a job's work was accepted. `verify` decides this when the
-/// repository declares one; otherwise the agent's exit code does.
+/// How a round ended: whether its work was accepted. `verify` decides this
+/// when the repository declares one; otherwise the agent's exit code does. A
+/// round that crashed, timed out or lost its push failed too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JobOutcome {
+pub enum Verdict {
     Passed,
     Failed,
 }
 
-impl JobOutcome {
+impl Verdict {
     #[must_use]
     pub fn passed(self) -> bool {
         matches!(self, Self::Passed)
@@ -53,17 +54,18 @@ struct AgentWork {
     pushed_to: String,
 }
 
-/// How a round ended. Every variant that can carry work does carry it: a
-/// round is judged after its work is preserved, never instead of.
+/// How a round ended, and the work it left. Every variant that can carry work
+/// does carry it: a round is judged after its work is preserved, never
+/// instead of.
 #[derive(Debug)]
 enum RoundResult {
     /// An agent that correctly decided nothing needed doing.
-    Succeeded,
-    Committed {
+    PassedUnchanged,
+    PassedWithWork {
         work: AgentWork,
     },
-    /// `verify` rejected an otherwise-successful round.
-    VerifyRejected {
+    /// `verify` rejected a round the agent finished cleanly.
+    Rejected {
         reason: String,
         work: Option<AgentWork>,
     },
@@ -80,13 +82,13 @@ enum RoundResult {
 ///
 /// Returns an error only if the round cannot be *administered* — its frames
 /// cannot be written. An agent that fails, a clone that fails, and a push
-/// that fails are all [`JobOutcome::Failed`], reported as events.
+/// that fails are all [`Verdict::Failed`], reported as events.
 pub async fn run_round<W: Write + Send + 'static>(
     payload: &JobPayload,
     frames: &FrameWriter<W>,
     scratch_root: &Path,
     cancel: CancellationToken,
-) -> anyhow::Result<JobOutcome> {
+) -> anyhow::Result<Verdict> {
     let timeout = payload.command_limit_secs.map(Duration::from_secs);
 
     frames.append_event(EventKind::RoundStarted {
@@ -169,10 +171,10 @@ async fn round_result<W: Write + Send + 'static>(
 
     // Bound before the literal: both borrow `ws`, which `discard` consumes.
     let preserved = agent_work_on_branch(payload, &ws).await;
-    let verdict = match agent_failure {
-        Some(_) => VerifyVerdict::NoObjection,
+    let ruling = match agent_failure {
+        Some(_) => VerifyRuling::NoObjection,
         None => {
-            verify_verdict(
+            verify_ruling(
                 payload.verify.as_deref(),
                 ws.path(),
                 frames,
@@ -190,16 +192,16 @@ async fn round_result<W: Write + Send + 'static>(
     }
     let work = preserved?;
 
-    Ok(match (agent_failure, verdict) {
+    Ok(match (agent_failure, ruling) {
         // Neither of these is a judgement about the work, so neither becomes
         // a `VerifyRejected`.
-        (Some(reason), _) | (None, VerifyVerdict::Interrupted { reason }) => {
+        (Some(reason), _) | (None, VerifyRuling::Interrupted { reason }) => {
             RoundResult::Failed { reason, work }
         }
-        (None, VerifyVerdict::Rejected { reason }) => RoundResult::VerifyRejected { reason, work },
-        (None, VerifyVerdict::NoObjection) => match work {
-            None => RoundResult::Succeeded,
-            Some(work) => RoundResult::Committed { work },
+        (None, VerifyRuling::Rejected { reason }) => RoundResult::Rejected { reason, work },
+        (None, VerifyRuling::NoObjection) => match work {
+            None => RoundResult::PassedUnchanged,
+            Some(work) => RoundResult::PassedWithWork { work },
         },
     })
 }
@@ -253,7 +255,7 @@ async fn provision_toolchain<W: Write + Send + 'static>(
 
 /// What `verify` had to say about the tree the branch carries.
 #[derive(Debug)]
-enum VerifyVerdict {
+enum VerifyRuling {
     /// Nothing `verify` holds against the round: it exited 0, the repository
     /// configures no `verify`, or the agent had already failed and there was
     /// nothing left worth judging.
@@ -273,31 +275,31 @@ enum VerifyVerdict {
 ///
 /// The outcome is matched here rather than flattened through
 /// `ShellOutcome::failure_reason`, which cannot tell `exit 1` from a kill.
-async fn verify_verdict<W: Write + Send + 'static>(
+async fn verify_ruling<W: Write + Send + 'static>(
     verify: Option<&str>,
     workspace: &Path,
     frames: &FrameWriter<W>,
     timeout: Option<Duration>,
     cancel: CancellationToken,
-) -> VerifyVerdict {
+) -> VerifyRuling {
     let Some(command) = verify else {
-        return VerifyVerdict::NoObjection;
+        return VerifyRuling::NoObjection;
     };
 
     match run_shell(command, workspace, frames, timeout, cancel).await {
-        Ok(ShellOutcome::Exited(0)) => VerifyVerdict::NoObjection,
-        Ok(ShellOutcome::Exited(code)) => VerifyVerdict::Rejected {
+        Ok(ShellOutcome::Exited(0)) => VerifyRuling::NoObjection,
+        Ok(ShellOutcome::Exited(code)) => VerifyRuling::Rejected {
             reason: format!("exit {code}"),
         },
-        Ok(ShellOutcome::TimedOut) => VerifyVerdict::Interrupted {
+        Ok(ShellOutcome::TimedOut) => VerifyRuling::Interrupted {
             reason: "verify timed out".to_string(),
         },
-        Ok(ShellOutcome::Cancelled) => VerifyVerdict::Interrupted {
+        Ok(ShellOutcome::Cancelled) => VerifyRuling::Interrupted {
             reason: "verify cancelled".to_string(),
         },
-        // A verdict rather than an error: the branch is already on the
+        // A ruling rather than an error: the branch is already on the
         // remote, and an error would take the round's record of it down too.
-        Err(e) => VerifyVerdict::Interrupted {
+        Err(e) => VerifyRuling::Interrupted {
             reason: format!("verify could not run: {e}"),
         },
     }
@@ -334,14 +336,14 @@ async fn agent_work_on_branch(
 fn record_completion<W: Write>(
     frames: &FrameWriter<W>,
     result: RoundResult,
-) -> anyhow::Result<JobOutcome> {
-    let (events, outcome) = events_for_completion(result);
+) -> anyhow::Result<Verdict> {
+    let (events, verdict) = events_for_completion(result);
 
     events
         .into_iter()
         .try_for_each(|kind| frames.append_event(kind).map(|_| ()))?;
 
-    Ok(outcome)
+    Ok(verdict)
 }
 
 /// Empty for an agent that correctly changed nothing.
@@ -364,21 +366,21 @@ fn work_recorded(work: Option<&AgentWork>) -> Vec<EventKind> {
 }
 
 /// The events a completion implies, in the order things settled, paired with
-/// the outcome they add up to.
+/// the verdict they add up to.
 ///
 /// Pure, so the ordering that makes replay correct can be asserted without
 /// running anything. Work is recorded before the verdict that judges it.
-fn events_for_completion(result: RoundResult) -> (Vec<EventKind>, JobOutcome) {
+fn events_for_completion(result: RoundResult) -> (Vec<EventKind>, Verdict) {
     match result {
-        RoundResult::Succeeded => (vec![EventKind::RoundPassed], JobOutcome::Passed),
-        RoundResult::Failed { reason, work } => (
-            work_recorded(work.as_ref())
+        RoundResult::PassedUnchanged => (vec![EventKind::RoundPassed], Verdict::Passed),
+        RoundResult::PassedWithWork { work } => (
+            work_recorded(Some(&work))
                 .into_iter()
-                .chain([EventKind::RoundFailed { reason }])
+                .chain([EventKind::RoundPassed])
                 .collect(),
-            JobOutcome::Failed,
+            Verdict::Passed,
         ),
-        RoundResult::VerifyRejected { reason, work } => (
+        RoundResult::Rejected { reason, work } => (
             work_recorded(work.as_ref())
                 .into_iter()
                 .chain([
@@ -390,14 +392,14 @@ fn events_for_completion(result: RoundResult) -> (Vec<EventKind>, JobOutcome) {
                     },
                 ])
                 .collect(),
-            JobOutcome::Failed,
+            Verdict::Failed,
         ),
-        RoundResult::Committed { work } => (
-            work_recorded(Some(&work))
+        RoundResult::Failed { reason, work } => (
+            work_recorded(work.as_ref())
                 .into_iter()
-                .chain([EventKind::RoundPassed])
+                .chain([EventKind::RoundFailed { reason }])
                 .collect(),
-            JobOutcome::Passed,
+            Verdict::Failed,
         ),
     }
 }

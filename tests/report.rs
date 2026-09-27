@@ -87,7 +87,7 @@ fn a_new_round_clears_the_previous_rounds_failure_reason() {
 
     let report = JobReport::from_events(1, &events);
 
-    assert_eq!(report.state, JobState::Succeeded);
+    assert_eq!(report.state, JobState::Passed);
     assert!(report.detail.is_none(), "stale reason survived");
     assert!(report.diff.is_none(), "stale diff survived");
 }
@@ -189,7 +189,7 @@ fn status_of_a_finished_job_names_its_timing_and_branch() {
     assert_eq!(
         JobReport::from_events(4, &events).to_status_lines(),
         [
-            "job 4: succeeded (round 1, 1 file +1/-0)",
+            "job 4: passed (round 1, 1 file +1/-0)",
             "took 3.0s",
             "branch: al/job-4",
         ]

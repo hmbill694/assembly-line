@@ -412,14 +412,14 @@ async fn collected_round(h: &Harness, k8s: &KubernetesRunner) -> (bool, Vec<Even
         )
         .await
         .unwrap();
-    let outcome = tokio::time::timeout(
+    let verdict = tokio::time::timeout(
         std::time::Duration::from_secs(20),
         collect(job, &mut log, &paths.log(), 1, CancellationToken::new()),
     )
     .await
     .expect("collection never ended")
     .unwrap();
-    (outcome.passed(), EventLog::read(paths.events()).unwrap())
+    (verdict.passed(), EventLog::read(paths.events()).unwrap())
 }
 
 /// `kubectl create` can fail after the server made the Job — a timeout, a

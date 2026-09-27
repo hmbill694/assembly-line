@@ -97,7 +97,7 @@ async fn run_exits_zero_and_records_the_job() {
         .args(["run", "--prompt", "do the thing"])
         .assert()
         .success()
-        .stdout(contains("job 1: succeeded"));
+        .stdout(contains("job 1: passed"));
 
     assert!(tmp.path().join(".assembly/jobs/1/events.jsonl").is_file());
     assert!(tmp.path().join(".assembly/jobs/1/meta.json").is_file());
@@ -149,7 +149,7 @@ async fn a_job_id_already_taken_on_the_remote_is_skipped() {
         .args(["run", "--prompt", "x"])
         .assert()
         .success()
-        .stdout(contains("job 2: succeeded"));
+        .stdout(contains("job 2: passed"));
 
     assert_eq!(
         git_on_origin(&tmp, &["rev-parse", "al/job-1"]),
@@ -371,7 +371,7 @@ async fn a_job_started_elsewhere_is_found_by_pointing_the_read_commands_at_it() 
         .args(["status", "--repo", &at])
         .assert()
         .success()
-        .stdout(contains("job 1: succeeded"));
+        .stdout(contains("job 1: passed"));
 
     assembly(&standing_in)
         .args(["logs", "1", "--repo", &at])
@@ -528,7 +528,7 @@ async fn a_revise_round_continues_the_branch_instead_of_starting_over() {
         .args(["revise", "1", "add error handling"])
         .assert()
         .success()
-        .stdout(contains("round 2").and(contains("job 1: succeeded")));
+        .stdout(contains("round 2").and(contains("job 1: passed")));
 
     // Two commits on the job's branch, not one replaced by another.
     let count: usize = git_on_origin(&tmp, &["rev-list", "--count", "al/job-1"])

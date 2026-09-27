@@ -289,7 +289,7 @@ impl Harness {
         let events = EventLog::read(conclusion.job.events()).unwrap();
 
         Outcome {
-            succeeded: conclusion.outcome.passed(),
+            passed: conclusion.verdict.passed(),
             job_id: conclusion.job.id,
             state: JobState::replay(&events),
             events: events.into_iter().map(|e| e.kind).collect(),
@@ -316,7 +316,7 @@ fn assembly_with_scratch_under(scratch_root: &Path, bin_dir: &Path) -> LocalRunn
 /// What a finished job left in its event log.
 #[derive(Debug)]
 pub struct Outcome {
-    pub succeeded: bool,
+    pub passed: bool,
     pub job_id: u64,
     pub state: JobState,
     pub events: Vec<EventKind>,
