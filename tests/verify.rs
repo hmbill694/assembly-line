@@ -2,7 +2,6 @@ mod support;
 
 use assembly_line::event::EventKind;
 use assembly_line::git;
-use assembly_line::workspace::job_branch_name;
 use support::{Harness, config_running};
 
 /// A `verify` line that can only pass in the job's own checkout, *after* the
@@ -51,7 +50,7 @@ async fn a_round_whose_verify_fails_is_a_failed_round() {
         "the agent's work is still committed even though verify rejected it"
     );
 
-    let branch = job_branch_name(outcome.job_id);
+    let branch = outcome.job_id.branch_name();
     assert!(
         outcome.has(|e| matches!(
             e,

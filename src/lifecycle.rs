@@ -10,6 +10,7 @@ use crate::config::{self, ConfigError, RepoConfig, Warning};
 use crate::delivery::{self, Delivered, PullRequestText};
 use crate::event::{Event, EventLog};
 use crate::git::{self, PinnedRef};
+use crate::job::JobId;
 use crate::paths::{self, JobMeta, JobPaths};
 use crate::payload::{self, RoundPayload, RoundRequest};
 use crate::report::JobReport;
@@ -17,7 +18,7 @@ use crate::round::Verdict;
 use crate::runner::{
     JobSecrets, Runner, RunnerProblem, payload_fitted_to, secrets_or_reasons_it_cannot_run,
 };
-use crate::workspace::{DEFAULT_REMOTE, JOB_BRANCH_PATTERN, job_branch_name};
+use crate::workspace::DEFAULT_REMOTE;
 use anyhow::anyhow;
 use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
@@ -263,16 +264,13 @@ pub async fn prepare_start<'r, R: Runner>(
         Ok(runnable) => runnable,
         Err(refusal) => return Prepared::refused(notes, refusal),
     };
-    let remote_job_branches = match git::remote_branches_matching(
-        &located.repo,
-        DEFAULT_REMOTE,
-        JOB_BRANCH_PATTERN,
-    )
-    .await
-    {
-        Ok(branches) => branches,
-        Err(e) => return Prepared::refused(notes, Refusal::Unpreparable(e)),
-    };
+    let remote_job_branches =
+        match git::remote_branches_matching(&located.repo, DEFAULT_REMOTE, JobId::BRANCH_PATTERN)
+            .await
+        {
+            Ok(branches) => branches,
+            Err(e) => return Prepared::refused(notes, Refusal::Unpreparable(e)),
+        };
     let secrets = match secrets_or_reasons_it_cannot_run(
         runner,
         &config.copy,
@@ -704,7 +702,7 @@ async fn hand_off(
 /// is absent rather than unpushed, and "push it first" would be the wrong
 /// advice.
 async fn job_branch_tip(repo: &Path, job_id: u64) -> anyhow::Result<PinnedRef> {
-    let branch = job_branch_name(job_id);
+    let branch = JobId::from(job_id).branch_name();
     match git::pinned(repo, DEFAULT_REMOTE, &branch).await {
         Ok(tip) => Ok(tip),
         Err(e) => match git::remote_lacks_ref(repo, DEFAULT_REMOTE, &branch).await {

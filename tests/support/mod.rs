@@ -8,6 +8,7 @@
 use assembly_line::config::RepoConfig;
 use assembly_line::event::{EventKind, EventLog};
 use assembly_line::git;
+use assembly_line::job::JobId;
 use assembly_line::lifecycle::{
     self, Prepared, Refusal, RevisionRequest, StartRequest, prepare_revision, prepare_start,
 };
@@ -223,9 +224,9 @@ impl Harness {
     }
 
     /// Another round on job `job_id`, continuing its branch.
-    pub async fn revise_job(&self, job_id: u64, feedback: &str) -> Outcome {
+    pub async fn revise_job(&self, job_id: JobId, feedback: &str) -> Outcome {
         let request = RevisionRequest {
-            job_id,
+            job_id: job_id.into(),
             feedback: feedback.to_string(),
             repo: Some(self.repo.clone()),
         };
@@ -291,7 +292,7 @@ impl Harness {
 
         Outcome {
             passed: conclusion.verdict.passed(),
-            job_id: conclusion.job.id,
+            job_id: JobId::from(conclusion.job.id),
             state: JobReport::from_events(conclusion.job.id, &events).state,
             events: events.into_iter().map(|e| e.kind).collect(),
             output: std::fs::read_to_string(conclusion.job.log()).unwrap_or_default(),
@@ -318,7 +319,7 @@ fn assembly_with_scratch_under(scratch_root: &Path, bin_dir: &Path) -> LocalRunn
 #[derive(Debug)]
 pub struct Outcome {
     pub passed: bool,
-    pub job_id: u64,
+    pub job_id: JobId,
     pub state: JobState,
     pub events: Vec<EventKind>,
     /// Everything the job's output log captured.

@@ -4,7 +4,6 @@ use assembly_line::git::{self, head_sha};
 use assembly_line::lifecycle::Refusal;
 use assembly_line::payload;
 use assembly_line::state::JobState;
-use assembly_line::workspace::job_branch_name;
 use support::{Harness, commit_all, config_running, provider_block};
 
 mod support;
@@ -24,7 +23,7 @@ async fn a_job_leaves_one_branch_carrying_its_work() {
         "the agent's work should be committed"
     );
     assert!(
-        !h.files_on_remote_branch(&job_branch_name(outcome.job_id))
+        !h.files_on_remote_branch(&outcome.job_id.branch_name())
             .await
             .is_empty(),
         "the branch is the job's whole durable output"
@@ -58,7 +57,7 @@ async fn a_job_is_cut_from_the_ref_it_names_not_from_head() {
 
     let outcome = h.run_job_from("go", "start-here").await;
 
-    let branch = job_branch_name(outcome.job_id);
+    let branch = outcome.job_id.branch_name();
     let parent = git::run_allowing_failure(&h.origin, &["rev-parse", &format!("{branch}^")])
         .await
         .unwrap();
@@ -99,7 +98,7 @@ async fn a_job_obeys_the_committed_config_not_the_working_trees() {
         outcome.events
     );
     let listed = h
-        .files_on_remote_branch(&job_branch_name(outcome.job_id))
+        .files_on_remote_branch(&outcome.job_id.branch_name())
         .await;
     assert!(
         listed.contains("agent-output.txt"),
@@ -132,7 +131,7 @@ async fn a_job_leaves_the_target_repositorys_working_tree_untouched() {
     assert!(status.is_empty(), "{status}");
 
     let listed = h
-        .files_on_remote_branch(&job_branch_name(outcome.job_id))
+        .files_on_remote_branch(&outcome.job_id.branch_name())
         .await;
     assert!(listed.contains("agent-output.txt"), "{listed}");
 }
@@ -145,7 +144,7 @@ async fn the_prompt_reaches_the_agent_intact() {
     let outcome = h.run_job(prompt).await;
 
     let content = h
-        .file_on_remote_branch(&job_branch_name(outcome.job_id), "agent-output.txt")
+        .file_on_remote_branch(&outcome.job_id.branch_name(), "agent-output.txt")
         .await
         .expect("the agent's output reached the branch");
     // Equality, not `contains`: the quote is a hazard too, and a `contains`
@@ -169,7 +168,7 @@ async fn a_failing_agent_preserves_its_work_on_a_branch_and_leaves_no_checkout()
     );
     assert!(outcome.has(|k| matches!(k, EventKind::RoundCommitted { .. })));
 
-    let branch = job_branch_name(outcome.job_id);
+    let branch = outcome.job_id.branch_name();
     assert!(
         outcome
             .has(|k| matches!(k, EventKind::BranchPushed { branch: b, pushed_to } if *b == branch && pushed_to == "origin"))
@@ -199,7 +198,7 @@ async fn a_checkout_the_agent_write_protected_is_still_discarded_and_its_work_ke
     assert!(outcome.passed, "{:?}", outcome.state);
     assert!(outcome.has(|k| matches!(k, EventKind::RoundCommitted { .. })));
     assert!(
-        h.files_on_remote_branch(&job_branch_name(outcome.job_id))
+        h.files_on_remote_branch(&outcome.job_id.branch_name())
             .await
             .contains("locked/work.txt")
     );
@@ -397,7 +396,7 @@ async fn an_agent_that_commits_its_own_work_has_it_published() {
     assert!(outcome.passed);
     assert!(outcome.has(|k| matches!(k, EventKind::RoundCommitted { .. })));
     assert_eq!(
-        h.file_on_remote_branch(&job_branch_name(outcome.job_id), "agent-output.txt")
+        h.file_on_remote_branch(&outcome.job_id.branch_name(), "agent-output.txt")
             .await
             .as_deref(),
         Some("self-committed\n")
@@ -418,7 +417,7 @@ async fn an_agent_that_switches_branches_publishes_what_it_left_checked_out() {
     let outcome = h.run_job("switched").await;
     assert!(outcome.passed);
 
-    let branch = job_branch_name(outcome.job_id);
+    let branch = outcome.job_id.branch_name();
     assert_eq!(
         h.file_on_remote_branch(&branch, "agent-output.txt")
             .await
@@ -449,7 +448,7 @@ async fn seeded_files_reach_the_agent_but_never_the_branch() {
     assert!(outcome.passed);
 
     let listed = h
-        .files_on_remote_branch(&job_branch_name(outcome.job_id))
+        .files_on_remote_branch(&outcome.job_id.branch_name())
         .await;
     assert!(
         !listed.contains(".env"),
@@ -531,7 +530,7 @@ async fn a_revise_round_continues_the_branch_instead_of_starting_over() {
     let second = h.revise_job(first.job_id, "add error handling").await;
     assert!(second.passed);
 
-    let branch = job_branch_name(second.job_id);
+    let branch = second.job_id.branch_name();
     let body = h
         .file_on_remote_branch(&branch, "rounds.txt")
         .await

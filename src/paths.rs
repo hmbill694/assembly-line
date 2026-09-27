@@ -9,7 +9,7 @@
 
 #![allow(clippy::missing_errors_doc)]
 
-use crate::workspace::job_id_from_branch_name;
+use crate::job::JobId;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -56,7 +56,7 @@ pub fn job_id_past(
         .chain(
             remote_branches
                 .iter()
-                .filter_map(|branch| job_id_from_branch_name(branch)),
+                .filter_map(|branch| JobId::from_branch_name(branch).map(u64::from)),
         )
         .max()
         .unwrap_or(0)
@@ -75,7 +75,7 @@ pub fn next_job_id(jobs_root: &Path, remote_branches: &[String]) -> io::Result<u
         job_id_past(ids, remote_branches).ok_or_else(|| {
             io::Error::other(format!(
                 "a job branch has taken the last job id — delete {} from the remote",
-                crate::workspace::job_branch_name(u64::MAX)
+                JobId::from(u64::MAX).branch_name()
             ))
         })
     })

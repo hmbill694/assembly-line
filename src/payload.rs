@@ -7,8 +7,8 @@
 
 use crate::config::{ConfigError, RepoConfig, parse_duration};
 use crate::git::{self, PinnedRef};
+use crate::job::JobId;
 use crate::provider::{CommandSpec, render_command};
-use crate::workspace::job_branch_name;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -124,7 +124,7 @@ impl RoundPayload {
             remote_url: request.remote_url,
             remote_name: request.remote_name.to_string(),
             start: request.start,
-            branch: job_branch_name(request.job_id),
+            branch: JobId::from(request.job_id).branch_name(),
             command: render_command(provider, request.prompt),
             commit_message: commit_message(request.job_id, request.prompt),
             verify: config.verify.clone(),

@@ -192,7 +192,7 @@ async fn a_revise_is_numbered_past_the_highest_round_recorded() {
     let h = Harness::new().await;
     let first = h.run_job("x").await;
     assert!(first.passed);
-    let job = paths::open_job(&paths::jobs_root(&h.repo), first.job_id).unwrap();
+    let job = paths::open_job(&paths::jobs_root(&h.repo), first.job_id.into()).unwrap();
     let mut log = EventLog::open_append(job.events()).unwrap();
     log.append(EventKind::RoundStarted { round: 3 }).unwrap();
     log.append(EventKind::RoundPassed).unwrap();
@@ -202,7 +202,7 @@ async fn a_revise_is_numbered_past_the_highest_round_recorded() {
         &runner,
         &[],
         RevisionRequest {
-            job_id: first.job_id,
+            job_id: first.job_id.into(),
             feedback: "more".into(),
             repo: Some(h.repo.clone()),
         },

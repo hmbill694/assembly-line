@@ -276,7 +276,7 @@ Where a type owns a sink or source, make it generic with a sensible default
   branches are shared on the remote, so a second clone, a teammate, or a
   deleted `.assembly/jobs` must not restart at 1 and push onto a branch
   somebody else already published. Its branch name is derived
-  from that id alone (`al/job-{id}`, `workspace::job_branch_name`) — always a
+  from that id alone (`al/job-{id}`, `JobId::branch_name` in `src/job.rs`) — always a
   well-formed git ref, with no pattern check needed because nothing
   user-authored ever reaches it.
 - The target repository's working tree is never modified beyond

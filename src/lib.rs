@@ -8,6 +8,7 @@ pub mod event;
 pub mod exec;
 pub mod frame;
 pub mod git;
+pub mod job;
 pub mod lifecycle;
 pub mod paths;
 pub mod payload;
