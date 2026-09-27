@@ -28,7 +28,7 @@ fn start_in(h: &Harness, provider: Option<&str>) -> StartRequest {
 /// Job `id`'s directory and `meta.json` in `h`'s repository, as `run` would
 /// have left them before its round started.
 fn job_in(h: &Harness, id: u64) -> JobPaths {
-    let job = paths::create_job(&paths::jobs_root(&h.repo), id).unwrap();
+    let job = paths::create_job(&paths::jobs_root(&h.repo), id.into()).unwrap();
     paths::write_meta(
         &job,
         &JobMeta {
@@ -192,7 +192,7 @@ async fn a_revise_is_numbered_past_the_highest_round_recorded() {
     let h = Harness::new().await;
     let first = h.run_job("x").await;
     assert!(first.passed);
-    let job = paths::open_job(&paths::jobs_root(&h.repo), first.job_id.into()).unwrap();
+    let job = paths::open_job(&paths::jobs_root(&h.repo), first.job_id).unwrap();
     let mut log = EventLog::open_append(job.events()).unwrap();
     log.append(EventKind::RoundStarted { round: 3 }).unwrap();
     log.append(EventKind::RoundPassed).unwrap();

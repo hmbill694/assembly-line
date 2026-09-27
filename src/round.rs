@@ -420,7 +420,7 @@ mod provisioning_tests {
 
     fn payload_asking_for_provisioning() -> RoundPayload {
         RoundPayload {
-            job_id: 1,
+            job_id: 1.into(),
             round: 1,
             remote_url: "does-not-matter".to_string(),
             remote_name: "origin".to_string(),

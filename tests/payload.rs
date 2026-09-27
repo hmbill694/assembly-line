@@ -5,7 +5,7 @@ use std::path::Path;
 
 fn request(provider: &str) -> RoundRequest<'_> {
     RoundRequest {
-        job_id: 7,
+        job_id: 7.into(),
         round: 1,
         prompt: "add a README\n\nwith sections",
         provider,
@@ -55,6 +55,16 @@ fn a_payload_round_trips_through_json() {
         serde_json::from_str::<RoundPayload>(&json).unwrap(),
         payload
     );
+}
+
+/// A release's image may run a payload from a host built between releases,
+/// so how the job is named on the wire must not move.
+#[test]
+fn a_payload_names_its_job_by_a_bare_number_and_a_branch() {
+    let payload = RoundPayload::for_round(&config(RUNNABLE), request("fake")).unwrap();
+    let json = serde_json::to_value(&payload).unwrap();
+    assert_eq!(json["job_id"], serde_json::json!(7));
+    assert_eq!(json["branch"], serde_json::json!("al/job-7"));
 }
 
 #[test]

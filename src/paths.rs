@@ -28,12 +28,19 @@ pub fn jobs_root(git_root: &Path) -> PathBuf {
     git_root.join(".assembly").join("jobs")
 }
 
-fn existing_job_ids(jobs_root: &Path) -> io::Result<Vec<u64>> {
+fn existing_job_ids(jobs_root: &Path) -> io::Result<Vec<JobId>> {
     match std::fs::read_dir(jobs_root) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(e),
         Ok(entries) => entries
-            .map(|e| e.map(|e| e.file_name().to_str().and_then(|s| s.parse::<u64>().ok())))
+            .map(|e| {
+                e.map(|e| {
+                    e.file_name()
+                        .to_str()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .map(JobId::from)
+                })
+            })
             .collect::<io::Result<Vec<_>>>()
             .map(|ids| ids.into_iter().flatten().collect()),
     }
@@ -48,19 +55,20 @@ fn existing_job_ids(jobs_root: &Path) -> io::Result<Vec<u64>> {
 /// ignored. `None` when a branch has already taken the last id there is.
 #[must_use]
 pub fn job_id_past(
-    local_ids: impl IntoIterator<Item = u64>,
+    local_ids: impl IntoIterator<Item = JobId>,
     remote_branches: &[String],
-) -> Option<u64> {
+) -> Option<JobId> {
     local_ids
         .into_iter()
         .chain(
             remote_branches
                 .iter()
-                .filter_map(|branch| JobId::from_branch_name(branch).map(u64::from)),
+                .filter_map(|branch| JobId::from_branch_name(branch)),
         )
         .max()
-        .unwrap_or(0)
+        .map_or(0, u64::from)
         .checked_add(1)
+        .map(JobId::from)
 }
 
 /// [`job_id_past`] the job directories under `jobs_root` and
@@ -70,7 +78,7 @@ pub fn job_id_past(
 /// # Errors
 ///
 /// Also fails when a job branch has taken the last id there is.
-pub fn next_job_id(jobs_root: &Path, remote_branches: &[String]) -> io::Result<u64> {
+pub fn next_job_id(jobs_root: &Path, remote_branches: &[String]) -> io::Result<JobId> {
     existing_job_ids(jobs_root).and_then(|ids| {
         job_id_past(ids, remote_branches).ok_or_else(|| {
             io::Error::other(format!(
@@ -82,13 +90,13 @@ pub fn next_job_id(jobs_root: &Path, remote_branches: &[String]) -> io::Result<u
 }
 
 /// The most recent job, or `None` when there have been none.
-pub fn latest_job_id(jobs_root: &Path) -> io::Result<Option<u64>> {
+pub fn latest_job_id(jobs_root: &Path) -> io::Result<Option<JobId>> {
     existing_job_ids(jobs_root).map(|ids| ids.into_iter().max())
 }
 
 #[derive(Debug, Clone)]
 pub struct JobPaths {
-    pub id: u64,
+    pub id: JobId,
     pub dir: PathBuf,
 }
 
@@ -112,7 +120,7 @@ impl JobPaths {
 }
 
 /// Create the directory layout for a new job.
-pub fn create_job(jobs_root: &Path, id: u64) -> io::Result<JobPaths> {
+pub fn create_job(jobs_root: &Path, id: JobId) -> io::Result<JobPaths> {
     let dir = jobs_root.join(id.to_string());
     std::fs::create_dir_all(&dir)?;
     Ok(JobPaths { id, dir })
@@ -120,7 +128,7 @@ pub fn create_job(jobs_root: &Path, id: u64) -> io::Result<JobPaths> {
 
 /// Locate an existing job. `NotFound` rather than an empty result, so
 /// `revise` and `status` can report a wrong job id.
-pub fn open_job(jobs_root: &Path, id: u64) -> io::Result<JobPaths> {
+pub fn open_job(jobs_root: &Path, id: JobId) -> io::Result<JobPaths> {
     let dir = jobs_root.join(id.to_string());
     match dir.is_dir() {
         true => Ok(JobPaths { id, dir }),
