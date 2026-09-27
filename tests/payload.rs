@@ -55,6 +55,28 @@ fn a_payload_round_trips_through_json() {
 }
 
 #[test]
+fn job_exec_reads_the_payload_its_runner_passed() {
+    let payload = JobPayload::for_round(&config(RUNNABLE), request("fake")).unwrap();
+    let json = serde_json::to_string(&payload).unwrap();
+    assert_eq!(JobPayload::from_variable(Some(&json)).unwrap(), payload);
+}
+
+#[test]
+fn job_exec_without_a_payload_says_a_runner_starts_it() {
+    let err = JobPayload::from_variable(None).unwrap_err().to_string();
+    assert!(err.contains("ASSEMBLY_JOB is not set"), "{err}");
+    assert!(err.contains("started by a runner"), "{err}");
+}
+
+#[test]
+fn a_payload_variable_holding_something_else_is_refused() {
+    let err = JobPayload::from_variable(Some("{\"job_id\": 1}"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("ASSEMBLY_JOB is not a job payload"), "{err}");
+}
+
+#[test]
 fn an_undeclared_provider_cannot_become_a_payload() {
     let err = JobPayload::for_round(&config(RUNNABLE), request("other")).unwrap_err();
     assert!(err.to_string().contains("'other'"), "{err}");

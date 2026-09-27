@@ -131,6 +131,28 @@ impl JobPayload {
             provision_toolchain: false,
         })
     }
+
+    /// The payload a runner handed `job-exec` in [`PAYLOAD_VAR`].
+    ///
+    /// # Errors
+    ///
+    /// When the variable is unset or does not hold a payload.
+    pub fn from_environment() -> anyhow::Result<JobPayload> {
+        Self::from_variable(std::env::var(PAYLOAD_VAR).ok().as_deref())
+    }
+
+    /// [`Self::from_environment`], given the variable's value.
+    ///
+    /// # Errors
+    ///
+    /// When `value` is absent or does not hold a payload.
+    pub fn from_variable(value: Option<&str>) -> anyhow::Result<JobPayload> {
+        let json = value.ok_or_else(|| {
+            anyhow::anyhow!("{PAYLOAD_VAR} is not set — job-exec is started by a runner")
+        })?;
+        serde_json::from_str(json)
+            .map_err(|e| anyhow::anyhow!("{PAYLOAD_VAR} is not a job payload: {e}"))
+    }
 }
 
 /// A commit subject a human can scan in `git log`: the job, then the first

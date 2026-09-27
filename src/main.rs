@@ -5,7 +5,7 @@ use assembly_line::event::{Event, EventKind, EventLog};
 use assembly_line::frame::FrameWriter;
 use assembly_line::job::{JobOutcome, run_round};
 use assembly_line::paths::{JobMeta, JobPaths};
-use assembly_line::payload::{self, JobPayload, PAYLOAD_VAR, RoundRequest};
+use assembly_line::payload::{self, JobPayload, RoundRequest};
 use assembly_line::report::JobReport;
 use assembly_line::runner::docker::DockerRunner;
 use assembly_line::runner::kubernetes::KubernetesRunner;
@@ -86,12 +86,7 @@ fn install_tracing() {
 /// The exit code mirrors the round, but the collector decides from the
 /// frames — the code only matters when the frames never said.
 async fn execute_payload_from_environment() -> Result<ExitCode, String> {
-    let payload: JobPayload = std::env::var(PAYLOAD_VAR)
-        .map_err(|_| format!("{PAYLOAD_VAR} is not set — job-exec is started by a runner"))
-        .and_then(|json| {
-            serde_json::from_str(&json)
-                .map_err(|e| format!("{PAYLOAD_VAR} is not a job payload: {e}"))
-        })?;
+    let payload = JobPayload::from_environment().map_err(|e| e.to_string())?;
 
     let frames = FrameWriter::new(std::io::stdout());
     let cancel = CancellationToken::new();
