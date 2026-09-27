@@ -63,9 +63,8 @@ fn delivery_is_configurable_from_the_repositorys_own_config() {
     assert_eq!(config.delivery.mode, DeliveryMode::None);
 }
 
-// The line below prints only from `src/main.rs`, once a job's outcome is
-// known — the library's `Harness` has no stdout to assert on — so this one
-// test drives the real binary, the way `tests/cli.rs` does.
+// The tests below assert on what a finished job prints, so they drive the
+// real binary, the way `tests/cli.rs` does.
 
 fn assembly(tmp: &tempfile::TempDir) -> Command {
     let mut cmd = Command::cargo_bin("assembly").unwrap();
@@ -167,10 +166,9 @@ async fn a_failed_job_is_not_delivered() {
     discard_origin(&tmp);
 }
 
-/// The gate above is wired into `run`, but `revise` has its own call site
-/// (`src/main.rs`'s `revise_existing_job`) which nothing else exercises — a
-/// regression that dropped it would pass the whole suite. A passing revise
-/// round must deliver just as a passing `run` does.
+/// A passing revise round must deliver just as a passing `run` does. Both
+/// reach the gate through `lifecycle::run`, but a revise gets there from
+/// `prepare_revision`, which nothing else here exercises.
 ///
 /// The `gh` on this test's `PATH` always refuses, so reaching delivery prints
 /// "no pull request opened"; a skipped gate would print "not delivered".
@@ -206,7 +204,7 @@ async fn a_passing_revise_round_is_delivered() {
     discard_origin(&tmp);
 }
 
-/// `config.base` is consulted at exactly one place — `deliver_if_verified`
+/// `config.base` is consulted at exactly one place — `lifecycle::hand_off`
 /// choosing the pull request's base. This drives the real binary with a fake
 /// `gh` standing in for the real one, so the `--base` a pull request would
 /// open with is captured directly instead of inferred from which `Delivered`

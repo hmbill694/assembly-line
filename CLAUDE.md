@@ -132,7 +132,7 @@ match (prompt, prompt_file) {
 }
 ```
 
-(`src/main.rs`'s `prompt_text`.)
+(`src/lifecycle.rs`'s `prompt_text`.)
 
 ### Build values, don't mutate them
 
