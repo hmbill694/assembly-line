@@ -1,6 +1,10 @@
 # Software Factory V2 — Design Spec
 
 **Status:** agreed 2026-09-11
+**Amended:** 2026-09-21 — F2 design interview. Runner implementors, the wire
+envelope, credentials, the job image and `copy` are settled below; see
+`docs/superpowers/plans/2026-09-21-software-factory-f2.md` for the decision
+table.
 **Supersedes:** `2026-08-15-assembly-line.md` from M4 onward. M1–M3 shipped and
 most of that code survives; what it was *heading toward* does not.
 **Scope:** full product. F1 is the first implementable slice; see Milestones.
@@ -83,8 +87,8 @@ audit trail. The factory stores none of it.
 - **No inbound API.** Polling out, Socket Mode out. No ingress, no public URL,
   no webhook signature verification.
 - **No secrets management.** One credential set, the daemon's, injected into
-  jobs as short-lived per-job secrets and destroyed on completion. No vault,
-  no rotation, no service accounts.
+  jobs as per-job secrets — short-lived once F4 mints them — and destroyed
+  on completion. No vault, no rotation, no service accounts.
 
 ## Issue sources
 
@@ -165,14 +169,28 @@ also the job's base, so the claim and the work are the same object.
 
 One trait, three implementors, all present on day one:
 
-| Implementor | Isolation | Event stream |
-|---|---|---|
-| Local process | None | A pipe |
-| `docker run` | Container | `docker logs` |
-| k8s Job | Pod, another machine | The k8s log API |
+| Implementor | Isolation | Launched by | Event stream |
+|---|---|---|---|
+| Local process | None | spawning `assembly job-exec` | the child's stdout |
+| `docker run` | Container | the `docker` CLI | the attached `docker run`'s stdout |
+| k8s Job | Pod, another machine | the `kubectl` CLI | `kubectl logs -f`, resumed on disconnect |
 
 Three implementors is what earns the trait `CLAUDE.md` forbids defining
-speculatively.
+speculatively. Each holds differently shaped state while a job runs — a
+child, a container name, a Job and its Secret — which is what a trait with a
+per-implementor running handle is for.
+
+Docker and k8s drive their CLIs rather than their APIs. Anyone who can use
+either runner already has the CLI, auth (kubeconfig, exec plugins, in-cluster
+service accounts) comes for free, and the implementors stay testable offline
+against shell-script fakes of `docker` and `kubectl`. Moving one implementor
+to its API later is invisible above the trait.
+
+**What runs inside the boundary is the whole job.** A hidden
+`assembly job-exec` clones the remote into scratch, runs the agent, commits,
+runs `verify`, pushes, and reports. The host never touches a checkout, so
+every runner — local included — clones, and a job can only start from a ref
+the remote has.
 
 ### Reporting is NDJSON on stdout
 
@@ -181,8 +199,25 @@ question. The answer is the one thing all three targets already have: **a
 process with stdout and an exit code.**
 
 The runner emits assembly-line's own event schema — the schema in
-`src/event.rs`, unchanged — as newline-delimited JSON on stdout, and pushes
-its branch. The daemon collects that stream three ways behind the trait.
+`src/event.rs`, unchanged — inside an envelope, one frame per line:
+
+    {"seq":1,"event":{"at":"…","t":"job_started","round":1}}
+    {"seq":2,"output":"fake-agent: writing the file"}
+
+`job-exec` pipes the agent's and `verify`'s output to itself and re-emits
+each line as an `output` frame, so nothing an agent *prints* can arrive as
+an `event`. That is all it promises: an agent running as `job-exec`'s own
+user can still write to `job-exec`'s stdout directly (Accepted risk 11).
+Lines that are not frames — `job-exec`'s own stderr, merged in by
+k8s — go to the log. `seq` numbers every frame, so a collector that resumes a
+dropped stream drops what it already has. A stream that ends without a
+verdict gets one from the collector: `JobFailed` naming why the runner
+stopped.
+
+The host resolves everything a job needs — config read from the base ref,
+the provider command, `verify`, timeouts — into a payload pinned to a commit
+SHA, and passes it in the `ASSEMBLY_JOB` environment variable. The job never
+reads config, so nothing inside the boundary can influence its own plan.
 
 This is the *adapter* contract the old spec already described, promoted from
 optional enrichment to the reporting path. It means:
@@ -198,10 +233,25 @@ is shaped the way it is.
 
 ### Credentials
 
-The daemon is the only credential holder. Each job receives an ephemeral,
-short-lived secret — a git credential and the agent's API key — destroyed on
-completion. Jobs push their own branches, so a pushed branch stays durable
-even if the daemon dies mid-job.
+The daemon is the only credential holder, and the holder decides what
+leaves. A container job always receives `ASSEMBLY_GIT_TOKEN`, which
+`job-exec` wires into a git credential helper for its clone and push, and
+withholds from the agent's environment — though an agent running as the same
+user can still read it from `job-exec`'s process environment (accepted risk
+11). SSH remotes are rewritten to HTTPS for it.
+Anything else the agent needs — its API key — is named by the host
+(`--pass-env` in F2, daemon config from F3). Docker receives values as
+`-e NAME`, never on a command line; k8s as a per-job Secret owned by the Job
+and deleted with it. The local runner inherits the host's environment, as it
+has no isolation to preserve.
+
+**"Per-job" in F2 means scoped to the job's lifetime, not short-lived.**
+Minting short-lived git credentials needs a token issuer — realistically a
+GitHub App — which is F4 machinery; it is an F4 stretch goal.
+
+Jobs push their own branches, so a pushed branch stays durable even if the
+daemon dies mid-job. **A job that cannot push fails:** its only local ref is
+in a scratch clone that is deleted with it.
 
 The alternative the old spec named — clone read-only, bundle back, daemon
 pushes — removes git credentials from the container but makes durability
@@ -211,6 +261,32 @@ forgotten.
 **Assumption, stated:** jobs run against development repositories with
 non-sensitive data. Nothing here is a substitute for secrets management, and
 the factory should not be pointed at a repository where it would need to be.
+
+### The job image
+
+One published image, `ghcr.io/hmbill694/assembly-line:<version>`, carrying
+`assembly`, `git`, `mise`, and the Claude Code, Codex and opencode CLIs. The
+runner launches the image whose tag is its own version. A release and its
+image are built from the same tag, so a released collector and its `job-exec`
+agree; a build between releases still carries the last version number, and
+launches an image that may lag its own code — `--image` points it at one
+built from its own tree (`just image`) instead. Users of a release never build
+an image. GHCR makes a new package private, so the package is made public once,
+by hand, after its first publish; until then no runner can pull it without
+credentials.
+
+A repository's toolchain — which `verify` and the agent both need — is
+provisioned at job start by `mise install`, from files repositories already
+carry: `mise.toml`, `.tool-versions`, `.nvmrc`, `.python-version`,
+`rust-toolchain.toml`, `go.mod`. Provisioning runs in containers only; the
+local runner uses the host's toolchain. Both container runners provision
+cold in F2, so every job pays for its install (see Deferred).
+System packages are out of reach until the mise-nix backend lands in F8;
+there is deliberately no `setup` field to fill that gap in the meantime.
+
+`copy` is local-only in F2: its files come from a human's checkout, which a
+container does not have. Container runners refuse a repository that declares
+it. Where those files come from for a daemon is decided in F3.
 
 ## Per-repo configuration
 
@@ -343,6 +419,7 @@ revise as actions. It is the observability surface — the thing a team watches
 | `supervise`, `Supervise` | Review moved to the pull request |
 | `hooks`, `output_file`, `{{ tasks.<id>.output }}` | Parsed and referenced nowhere; the last needed siblings |
 | `delivery.mode = "push"` | Auto-merge-by-label replaces it |
+| `src/gc.rs`, worktrees, `ASSEMBLY_WORKTREE_ROOT` | Jobs clone into scratch that is deleted with them; nothing is left to collect |
 
 Two of the old spec's accepted risks dissolve rather than being fixed: **#5**
 (a merge landing in the integration worktree under a running shell node) has
@@ -355,9 +432,9 @@ is closed by enforcing `verify`.
 |---|---|
 | `src/event.rs`, `src/state.rs` | The NDJSON wire format *and* the daemon's state model — the fold widens from one run to all jobs |
 | `revise_node` (`scheduler.rs:320`) | The tester loop's remediation primitive, unchanged |
-| `src/git.rs` | Worktrees, branches, publish — the job's whole mechanism |
-| `src/paths.rs` | Already keyed by repo slug, so already multi-repo shaped |
-| `src/workspace.rs` | `copy` seeding, with `.git/info/exclude` keeping secrets off branches |
+| `src/git.rs` | Clone, branches, publish — the job's whole mechanism |
+| `src/paths.rs` | Job ids, and where a job's state lives until F3 moves it out of the repository |
+| `src/workspace.rs` | `copy` seeding into a scratch clone |
 | `src/provider.rs`, `src/exec.rs` | Vendor-neutral agent invocation, unchanged |
 | `src/delivery.rs` | Folds into the forge trait's `open_change` |
 | `verify`, `retries`, `max_duration` | Enforced for the first time |
@@ -381,7 +458,7 @@ Carried forward, with two amendments.
 - **The factory never writes to a target repository's working tree.**
   `.assembly/config.toml` is written by humans; all job state lives under the
   daemon's root.
-- Worktrees are scratch and always removed. Branches are the artifact.
+- Checkouts are scratch and always removed. Branches are the artifact.
 
 ## Testing
 
@@ -394,22 +471,22 @@ affordable.
 - Sources and the forge are tested against **fakes implementing the trait**.
   No test reaches GitHub or Slack.
 
-**The one exception to record:** the k8s runner cannot be tested without a
-cluster or a fake API server. That implementor, and only that implementor, is
-feature-gated out of the default suite — the same treatment the old spec gave
-real-agent smoke tests.
+**No exception.** Every runner, k8s included, is tested against
+shell-script fakes of the CLI it drives. Only a real-cluster smoke test
+would need a cluster, and none is part of the suite.
 
 ## Milestones
 
 | | Scope |
 |---|---|
 | **F1** ✅ | Subtraction. Delete the DAG, run branch, merge, shell nodes, graph loading, review inbox. `assembly run --repo --ref --prompt` is a single job. `verify` enforced. `.assembly/config.toml`. |
-| **F2** | The runner seam. One trait; local, `docker run`, and k8s Job implementors. NDJSON on stdout. Daemon-injected per-job credentials. |
+| **F2** | The runner seam. One trait; local, `docker run`, and k8s Job implementors driving their CLIs. The whole job inside the boundary as `job-exec`; clone, push or fail. NDJSON frames on stdout. Host-resolved payload. Host-chosen per-job credentials. One published image; `mise` provisioning. |
 | **F3** | The daemon. Long-lived process, fold across all jobs, job state under its own root, CLI driving it. |
-| **F4** | Sources and the watcher. Source trait; GitHub issues and Slack. Claim-by-ref, ordering, fairness, dispatch, pull request delivery. |
+| **F4** | Sources and the watcher. Source trait; GitHub issues and Slack. Claim-by-ref, ordering, fairness, dispatch, pull request delivery. Stretch: short-lived, per-job git credentials minted from a GitHub App. |
 | **F5** | The tester loop. CI, mergeability and comment signals; budget and refill; `needs-human` escalation; the `auto-merge` path. |
 | **F6** | The web UI, served by the daemon. |
 | **F7** | The refinement session. |
+| **F8** | mise-nix: Nix in the image; system packages declared in a repository's `mise.toml`. Closes the gap F2 leaves open, once the factory itself is finished. |
 
 F1 is pure subtraction and is where the stack starts. Enforcing `verify` is a
 behavior change and gets its own change in that stack rather than riding along
@@ -427,12 +504,15 @@ with a deletion.
 4. **The `auto-merge` path has the trunk as its blast radius.** Its only gate
    is forge CI. Reading config from the base ref closes the
    self-modification hole; a weak test suite is not closed by anything here.
-5. **An agent container briefly holds a git credential.** Mitigated by
-   short-lived per-job secrets and by the assumption that the factory runs
-   against non-sensitive development repositories.
-6. **Copied files are git-safe, not log-safe.** Carried over unchanged:
-   nothing prevents an agent from printing a copied file's contents to stdout,
-   which now lands in a stream the daemon collects.
+5. **An agent container holds a git credential for the job's lifetime.**
+   Mitigated by per-job secrets destroyed with the job — short-lived only
+   once F4 mints them — and by the assumption that the factory runs against
+   non-sensitive development repositories.
+6. **Copied files are kept out of commits by accident, not against intent,
+   and are not log-safe.** No commit a round pushes carries one, but an
+   agent that means to can copy their contents into another file, or push
+   them itself; and nothing prevents it from printing them to stdout, which
+   now lands in a stream the daemon collects.
 7. **Concurrent jobs on the same repo will conflict**, by design. The tester
    loop absorbs it. If a repo's issues routinely overlap, the loop pays for it
    in rounds, and the answer is fewer concurrent slots for that repo rather
@@ -441,14 +521,41 @@ with a deletion.
    so they hold credentials. Revisit only if the factory is ever pointed at a
    repository where that is unacceptable — at which point bundle-back is the
    design, and it is written down above.
+9. **System packages are unavailable to container jobs** until F8's
+   mise-nix backend. A repository that needs one runs on the local runner.
+10. **Container jobs provision their toolchain cold**, costing minutes per
+    job, until F3 configures a cache.
+11. **A container job's agent runs as the same user as `job-exec`**, so
+    through `/proc` it can read the git token from `job-exec`'s process
+    environment — or reach it by writing the clone's git config and hooks,
+    which the git commands the round runs after the agent then execute with
+    the token in their environment; only the push is kept from running
+    hooks. It can also write to `job-exec`'s stdout via
+    `/proc/<pid>/fd/1` and so forge a frame — a verdict included. Isolating
+    it needs the agent under its own uid — a later
+    milestone's image change. Separately, a docker job's environment — the
+    payload and the git token — can be read with `docker inspect` by anyone
+    with access to the docker daemon until the container is removed at the
+    end of the round.
+12. **A docker job cancelled while its image is still pulling runs anyway.**
+    `docker stop` finds no container yet. Ctrl-C, F2's only cancel, reaches
+    the `docker run` client directly and aborts it; the daemon's cancel (F3)
+    has no terminal behind it and needs the container created before the
+    round is handed back.
 
 ## Deferred, knowingly
 
 - Where refinement happens for Slack-sourced work — the thread is the obvious
   home, and it overlaps the web UI's chat. Decided when F7 is reached.
 - Web UI authentication.
-- Container image strategy for the Docker and k8s runners.
-- How `copy`-seeded files reach a remote runner without landing in a branch or
-  a log.
-- Branch pruning across many repositories. `gc` lost its worktree policy in M3
-  and has not yet gained the branch job that replaces it.
+- Branch pruning. `gc` was deleted in F2 along with worktrees, and nothing
+  yet prunes the job branches left on a remote.
+- A cache for `mise` provisioning — a docker volume, a PVC, node-local
+  storage. Whatever it is, the jobs that read it must not be able to write
+  it: a cache the agent can write runs its code in every later job, that
+  job's clone and git token included. Provisioning runs the repository's
+  own `mise.toml`, which on a revise the agent wrote, so read-only to the
+  agent is not enough on its own. Decided with daemon config in F3; F2
+  provisions cold.
+- Reattaching to a job after the collector restarts. `seq` makes it
+  additive; the daemon (F3) is the first long-lived collector.

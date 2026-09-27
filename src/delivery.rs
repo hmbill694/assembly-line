@@ -1,18 +1,16 @@
 //! Getting a finished job's branch off the machine, as a pull request.
 
 use crate::config::{Delivery, DeliveryMode};
-use crate::git;
 use std::path::Path;
 use tokio::process::Command;
 
 /// What actually happened to the job's branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Delivered {
-    /// Nothing was attempted, and this is why. Not a failure: a repository
-    /// with no remote, or delivery turned off, is an ordinary local job.
+    /// Nothing was attempted, and this is why: delivery is turned off.
     Skipped(String),
-    /// Pushed, but no pull request was opened — `gh` is not installed, or it
-    /// refused. The work is safe on the remote either way.
+    /// The job pushed the branch, but no pull request was opened — `gh` is
+    /// not installed, or it refused.
     Pushed {
         branch: String,
         because: String,
@@ -34,38 +32,43 @@ impl std::fmt::Display for Delivered {
     }
 }
 
-/// # Errors
+/// What a pull request says about itself.
 ///
-/// Returns an error only if git itself fails — a push rejected because the
-/// base moved, most often. A missing `gh` is reported as [`Delivered::Pushed`]
-/// rather than an error: the branch reached the remote, which is the part that
-/// matters.
+/// Given explicitly rather than left to `gh pr create --fill`, which reads
+/// the branch's commits from the local repository — and a job's branch
+/// exists only on the remote.
+#[derive(Debug, Clone, Copy)]
+pub struct PullRequestText<'a> {
+    pub title: &'a str,
+    pub body: &'a str,
+}
+
+/// Ask for a pull request from `job_branch` into `base`. The job already
+/// pushed the branch, so nothing here can lose work.
 pub async fn deliver(
     repo: impl AsRef<Path>,
     delivery: &Delivery,
-    remote: &str,
     job_branch: &str,
     base: &str,
-) -> anyhow::Result<Delivered> {
-    let repo = repo.as_ref();
-
+    text: PullRequestText<'_>,
+) -> Delivered {
     match delivery.mode {
-        DeliveryMode::None => Ok(Delivered::Skipped("delivery mode is \"none\"".into())),
-        DeliveryMode::Pr if !git::remote_exists(repo, remote).await? => Ok(Delivered::Skipped(
-            format!("the repository has no '{remote}' remote, so the branch stays local"),
-        )),
-        DeliveryMode::Pr => {
-            git::push_branch(repo, remote, job_branch).await?;
-            Ok(open_pull_request(repo, job_branch, base).await)
-        }
+        DeliveryMode::None => Delivered::Skipped("delivery mode is \"none\"".into()),
+        DeliveryMode::Pr => open_pull_request(repo.as_ref(), job_branch, base, text).await,
     }
 }
 
 /// Ask `gh` for a pull request. Never fatal — the branch is already pushed.
-async fn open_pull_request(repo: &Path, job_branch: &str, base: &str) -> Delivered {
+async fn open_pull_request(
+    repo: &Path,
+    job_branch: &str,
+    base: &str,
+    text: PullRequestText<'_>,
+) -> Delivered {
     let attempt = Command::new("gh")
         .args([
-            "pr", "create", "--base", base, "--head", job_branch, "--fill",
+            "pr", "create", "--base", base, "--head", job_branch, "--title", text.title, "--body",
+            text.body,
         ])
         .current_dir(repo)
         .output()

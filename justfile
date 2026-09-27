@@ -115,6 +115,15 @@ demo:
     "$bin" status
     echo "demo job left in $dir"
 
+# Build the job image locally, for the host's platform.
+image tag="assembly-line:dev":
+    docker buildx build --load -t {{tag}} .
+
+# Boot the built image against a scratch repository and prove job-exec runs
+# a round end to end. Needs a docker daemon; not part of `just check`.
+smoke-docker tag="assembly-line:dev": (image tag)
+    scripts/smoke-docker.sh {{tag}}
+
 # Prune build artifacts and the out-of-repo target directory.
 clean:
     cargo clean || true

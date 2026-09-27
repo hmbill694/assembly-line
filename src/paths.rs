@@ -9,6 +9,7 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+use crate::workspace::job_id_from_branch_name;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -27,128 +28,6 @@ pub fn jobs_root(git_root: &Path) -> PathBuf {
     git_root.join(".assembly").join("jobs")
 }
 
-/// File inside a repository's worktree directory naming the repository it
-/// belongs to.
-const REPOSITORY_MARKER: &str = "repo";
-
-/// FNV-1a, written out rather than taken from `DefaultHasher`, whose output is
-/// explicitly unspecified across Rust releases. A worktree path that moved
-/// under a toolchain upgrade would orphan every job already on disk.
-fn stable_hash(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
-}
-
-/// A directory name identifying one repository.
-///
-/// Job ids restart at 1 in every repository, so a job id alone cannot key a
-/// worktree directory — the first job of two different repos would claim the
-/// same path. The slug leads with the repository's own directory name so the
-/// tree stays browsable, and ends with a hash of its absolute path so two
-/// repositories sharing a name stay apart.
-#[must_use]
-pub fn repo_slug(repo: &Path) -> String {
-    let name: String = repo
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)
-        .unwrap_or("repo")
-        .chars()
-        .map(
-            |c| match c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                true => c,
-                false => '-',
-            },
-        )
-        .collect();
-
-    format!(
-        "{name}-{:016x}",
-        stable_hash(repo.as_os_str().as_encoded_bytes())
-    )
-}
-
-/// Environment variable that moves every worktree somewhere other than
-/// `$HOME` — a faster disk, or a directory a test owns outright.
-///
-/// Worktrees live under `$HOME` by default, never inside the repository: the
-/// target repo must stay untouched, and a worktree inside it would need a
-/// `.gitignore` entry assembly-line is not entitled to add.
-pub const WORKTREE_ROOT_VAR: &str = "ASSEMBLY_WORKTREE_ROOT";
-
-/// Where worktrees go, given what the environment says. The override wins
-/// outright and is used verbatim.
-///
-/// Split from the lookup below because reading the environment is not
-/// something a test can do twice: `set_var` is process-global and unsafe under
-/// edition 2024, so the rule stays testable only while it is a function of its
-/// arguments.
-#[must_use]
-pub fn worktrees_root_given(
-    override_root: Option<impl Into<PathBuf>>,
-    home: Option<impl Into<PathBuf>>,
-) -> Option<PathBuf> {
-    match override_root {
-        Some(elsewhere) => Some(elsewhere.into()),
-        None => home.map(|home| home.into().join(".assembly").join("wt")),
-    }
-}
-
-/// Every repository's worktrees.
-///
-/// `None` only when neither [`WORKTREE_ROOT_VAR`] nor `$HOME` is set, which
-/// the caller should report rather than guessing a location.
-#[must_use]
-pub fn worktrees_root() -> Option<PathBuf> {
-    worktrees_root_given(
-        std::env::var_os(WORKTREE_ROOT_VAR),
-        std::env::var_os("HOME"),
-    )
-}
-
-/// One repository's worktrees, across all of its jobs. This is the level `gc`
-/// walks, and where the repository marker lives.
-#[must_use]
-pub fn repo_worktrees_root(repo: &Path) -> Option<PathBuf> {
-    worktrees_root().map(|root| root.join(repo_slug(repo)))
-}
-
-/// One job's worktrees.
-#[must_use]
-pub fn worktree_root(repo: &Path, job_id: u64) -> Option<PathBuf> {
-    repo_worktrees_root(repo).map(|root| root.join(job_id.to_string()))
-}
-
-/// Record which repository a worktree directory belongs to, returning that
-/// directory.
-///
-/// The slug carries a hash, so it cannot be read backwards. Without this
-/// marker `gc` could only collect leftovers for the repository it happens to
-/// be run from; with it, every repository's are reachable from one place.
-///
-/// # Errors
-///
-/// Beyond the usual, an error when `$HOME` is unset.
-pub fn record_repository_for_worktrees(repo: &Path) -> io::Result<PathBuf> {
-    let dir = repo_worktrees_root(repo)
-        .ok_or_else(|| io::Error::other("HOME is unset, so worktrees have nowhere to live"))?;
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(
-        dir.join(REPOSITORY_MARKER),
-        repo.as_os_str().as_encoded_bytes(),
-    )?;
-    Ok(dir)
-}
-
-/// The repository a worktree directory belongs to, or `None` when it carries
-/// no marker — an empty or hand-made directory, which `gc` leaves alone.
-#[must_use]
-pub fn repository_owning_worktrees(repo_worktrees_root: &Path) -> Option<PathBuf> {
-    std::fs::read_to_string(repo_worktrees_root.join(REPOSITORY_MARKER))
-        .ok()
-        .map(|path| PathBuf::from(path.trim_end_matches('\n')))
-}
-
 fn existing_job_ids(jobs_root: &Path) -> io::Result<Vec<u64>> {
     match std::fs::read_dir(jobs_root) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -160,10 +39,46 @@ fn existing_job_ids(jobs_root: &Path) -> io::Result<Vec<u64>> {
     }
 }
 
-/// The id a new job should claim. A missing jobs directory is not an error —
-/// it means this is the first job.
-pub fn next_job_id(jobs_root: &Path) -> io::Result<u64> {
-    existing_job_ids(jobs_root).map(|ids| ids.into_iter().max().unwrap_or(0) + 1)
+/// The id a new job should claim: one past every id already taken, whether
+/// by a job directory here or by a job branch on the remote.
+///
+/// The remote counts because job branches are shared there — a second clone,
+/// a teammate, or a deleted `.assembly/jobs` would otherwise restart at 1 and
+/// push onto somebody else's branch. Branches that are not a job's are
+/// ignored. `None` when a branch has already taken the last id there is.
+#[must_use]
+pub fn job_id_past(
+    local_ids: impl IntoIterator<Item = u64>,
+    remote_branches: &[String],
+) -> Option<u64> {
+    local_ids
+        .into_iter()
+        .chain(
+            remote_branches
+                .iter()
+                .filter_map(|branch| job_id_from_branch_name(branch)),
+        )
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+}
+
+/// [`job_id_past`] the job directories under `jobs_root` and
+/// `remote_branches`. A missing jobs directory is not an error — it means
+/// this is the first job here.
+///
+/// # Errors
+///
+/// Also fails when a job branch has taken the last id there is.
+pub fn next_job_id(jobs_root: &Path, remote_branches: &[String]) -> io::Result<u64> {
+    existing_job_ids(jobs_root).and_then(|ids| {
+        job_id_past(ids, remote_branches).ok_or_else(|| {
+            io::Error::other(format!(
+                "a job branch has taken the last job id — delete {} from the remote",
+                crate::workspace::job_branch_name(u64::MAX)
+            ))
+        })
+    })
 }
 
 /// The most recent job, or `None` when there have been none.
@@ -188,18 +103,11 @@ impl JobPaths {
         self.dir.join("meta.json")
     }
 
-    /// Everything the agent printed, across every round — one job, one log.
+    /// Everything the job's commands printed, across every round — one job,
+    /// one log.
     #[must_use]
     pub fn log(&self) -> PathBuf {
         self.dir.join("job.log")
-    }
-
-    /// Where the job's scratch checkout lives, one level below
-    /// [`worktree_root`] rather than being it — so removing the checkout
-    /// leaves the job's own directory for `gc` to find and report.
-    #[must_use]
-    pub fn worktree(&self, repo: &Path) -> Option<PathBuf> {
-        worktree_root(repo, self.id).map(|root| root.join("checkout"))
     }
 }
 

@@ -1,0 +1,182 @@
+//! The wire format between a job and whoever collects it.
+//!
+//! A job runs somewhere its collector cannot see — a child process, a
+//! container, a pod on another machine — and the one thing all of those
+//! share is stdout. Every line a job prints there is a [`Frame`]: one of its
+//! [`Event`]s, or one line of what its commands printed.
+//!
+//! The job wraps its commands' output itself, so nothing an agent *prints*
+//! can arrive as an `event` frame: an agent echoing `{"t":"job_finished"}`
+//! lands in the log as text, not in the event stream as a verdict. That is
+//! the whole guarantee — an agent running as the job's own user can still
+//! write to the job's stdout directly, which the spec lists as an accepted
+//! risk.
+
+use crate::event::{Event, EventKind};
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Frame {
+    /// Position in the job's stream, from 1. A collector that has to
+    /// reconnect replays from an earlier point, and `seq` is what lets it
+    /// drop what it already has.
+    pub seq: u64,
+    #[serde(flatten)]
+    pub body: FrameBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameBody {
+    Event(Event),
+    /// One line a command printed, on stdout or stderr.
+    Output(String),
+}
+
+#[derive(Debug)]
+struct Numbered<W> {
+    sink: W,
+    last_seq: u64,
+}
+
+/// The job's side of the stream. Cloning shares it: the job appends events
+/// while the readers forwarding its commands' stdout and stderr append
+/// output, and all of them draw from one sequence.
+#[derive(Debug)]
+pub struct FrameWriter<W: Write> {
+    shared: Arc<Mutex<Numbered<W>>>,
+}
+
+impl<W: Write> Clone for FrameWriter<W> {
+    fn clone(&self) -> Self {
+        FrameWriter {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+impl<W: Write> FrameWriter<W> {
+    pub fn new(sink: W) -> Self {
+        FrameWriter {
+            shared: Arc::new(Mutex::new(Numbered { sink, last_seq: 0 })),
+        }
+    }
+
+    /// Append one event, stamped now, and flush it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the frame cannot be written or flushed. The caller
+    /// should treat this as fatal: an event that never left the job is an
+    /// event the collector can never record.
+    pub fn append_event(&self, kind: EventKind) -> io::Result<Event> {
+        let event = Event {
+            at: Utc::now(),
+            kind,
+        };
+        self.append(FrameBody::Event(event.clone()))?;
+        Ok(event)
+    }
+
+    /// Append one line a command printed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the frame cannot be written or flushed.
+    pub fn append_output(&self, line: &str) -> io::Result<()> {
+        self.append(FrameBody::Output(line.to_string()))
+    }
+
+    fn append(&self, body: FrameBody) -> io::Result<()> {
+        let mut numbered = self
+            .shared
+            .lock()
+            .map_err(|_| io::Error::other("a frame writer panicked mid-write"))?;
+        let frame = Frame {
+            seq: numbered.last_seq + 1,
+            body,
+        };
+        let line = serde_json::to_string(&frame).map_err(io::Error::other)?;
+        numbered.sink.write_all(line.as_bytes())?;
+        numbered.sink.write_all(b"\n")?;
+        numbered.sink.flush()?;
+        numbered.last_seq = frame.seq;
+        Ok(())
+    }
+
+    /// What has been written so far — for tests, which write into a `Vec`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a writer panicked while holding the lock.
+    #[must_use]
+    pub fn copy_of_sink(&self) -> W
+    where
+        W: Clone,
+    {
+        self.shared.lock().expect("frame writer lock").sink.clone()
+    }
+}
+
+/// What a collector does with one line of a job's stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Routed {
+    /// Append to `events.jsonl`, as the job recorded it.
+    Event { seq: u64, event: Event },
+    /// Append to the job's log.
+    Output(String),
+    /// A frame at or before one already routed — a resumed stream replaying.
+    AlreadyCollected,
+}
+
+/// How far into a job's stream a collector has got.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StreamPosition {
+    last_seq: u64,
+}
+
+impl StreamPosition {
+    /// Where `line` goes, and where the stream stands after it.
+    ///
+    /// A line that is not a frame is output: `job-exec`'s own stderr, or a
+    /// crash backtrace, merged into the stream by a runner that cannot keep
+    /// the two apart. It does not move the position.
+    #[must_use]
+    pub fn route(self, line: &str) -> (StreamPosition, Routed) {
+        match serde_json::from_str::<Frame>(line) {
+            Err(_) => (self, Routed::Output(line.to_string())),
+            Ok(frame) if frame.seq <= self.last_seq => (self, Routed::AlreadyCollected),
+            Ok(Frame { seq, body }) => (
+                StreamPosition { last_seq: seq },
+                match body {
+                    FrameBody::Event(event) => Routed::Event { seq, event },
+                    FrameBody::Output(text) => Routed::Output(text),
+                },
+            ),
+        }
+    }
+}
+
+/// The failure a collector records itself when a round's stream ended
+/// without the job saying how the round went — a pod OOM-killed, a runner
+/// that never started it, a `job-exec` that panicked. `None` when the job
+/// reported its own verdict.
+///
+/// `collected` is this round's events only: an earlier round's verdict says
+/// nothing about this one.
+#[must_use]
+pub fn verdict_missing_from(collected: &[Event], ended_because: &str) -> Option<EventKind> {
+    let reported = collected.iter().any(|e| {
+        matches!(
+            e.kind,
+            EventKind::JobFinished { .. } | EventKind::JobFailed { .. }
+        )
+    });
+
+    (!reported).then(|| EventKind::JobFailed {
+        reason: format!("the job ended without reporting a verdict: {ended_because}"),
+    })
+}

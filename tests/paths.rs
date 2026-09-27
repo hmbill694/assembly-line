@@ -1,10 +1,8 @@
 use assembly_line::paths::{
-    JobMeta, create_job, git_root, jobs_root, latest_job_id, next_job_id, open_job, read_meta,
-    record_repository_for_worktrees, repo_slug, repository_owning_worktrees, worktree_root,
-    worktrees_root_given, write_meta,
+    JobMeta, create_job, git_root, job_id_past, jobs_root, latest_job_id, next_job_id, open_job,
+    read_meta, write_meta,
 };
 use std::fs;
-use std::path::Path;
 
 #[test]
 fn finds_the_git_root_by_walking_up() {
@@ -29,15 +27,15 @@ fn allocates_monotonic_job_ids() {
     let tmp = tempfile::tempdir().unwrap();
     let root = jobs_root(tmp.path());
 
-    assert_eq!(next_job_id(&root).unwrap(), 1);
+    assert_eq!(next_job_id(&root, &[]).unwrap(), 1);
     assert_eq!(latest_job_id(&root).unwrap(), None);
 
     create_job(&root, 1).unwrap();
-    assert_eq!(next_job_id(&root).unwrap(), 2);
+    assert_eq!(next_job_id(&root, &[]).unwrap(), 2);
     assert_eq!(latest_job_id(&root).unwrap(), Some(1));
 
     create_job(&root, 2).unwrap();
-    assert_eq!(next_job_id(&root).unwrap(), 3);
+    assert_eq!(next_job_id(&root, &[]).unwrap(), 3);
     assert_eq!(latest_job_id(&root).unwrap(), Some(2));
 }
 
@@ -47,7 +45,50 @@ fn ignores_non_numeric_directories_when_allocating() {
     let root = jobs_root(tmp.path());
     fs::create_dir_all(root.join("scratch")).unwrap();
     create_job(&root, 7).unwrap();
-    assert_eq!(next_job_id(&root).unwrap(), 8);
+    assert_eq!(next_job_id(&root, &[]).unwrap(), 8);
+}
+
+/// Job branches are shared on the remote, so a fresh clone — or a deleted
+/// `.assembly/jobs` — must not restart at 1 and collide with them.
+#[test]
+fn a_new_job_id_is_past_the_remotes_job_branches_too() {
+    let remote = ["al/job-4".to_string(), "al/job-12".to_string()];
+    assert_eq!(job_id_past([], &remote), Some(13));
+    assert_eq!(job_id_past([20], &remote), Some(21));
+    assert_eq!(job_id_past([], &[]), Some(1));
+}
+
+/// Anyone who can push can make a branch at the very last id; that is a
+/// refusal to allocate, not an overflow.
+#[test]
+fn a_branch_at_the_last_id_leaves_none_to_allocate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let last = [format!("al/job-{}", u64::MAX)];
+
+    assert_eq!(job_id_past([], &last), None);
+    let err = next_job_id(&jobs_root(tmp.path()), &last).unwrap_err();
+    assert!(err.to_string().contains(&last[0]), "{err}");
+}
+
+#[test]
+fn branches_that_are_not_a_jobs_are_ignored_when_allocating() {
+    let remote = [
+        "main".to_string(),
+        "al/job-x".to_string(),
+        "al/jobs-9".to_string(),
+        "feature/al/job-50".to_string(),
+    ];
+    assert_eq!(job_id_past([2], &remote), Some(3));
+}
+
+#[test]
+fn the_jobs_directory_and_the_remote_together_decide_the_next_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = jobs_root(tmp.path());
+    create_job(&root, 3).unwrap();
+
+    assert_eq!(next_job_id(&root, &["al/job-5".to_string()]).unwrap(), 6);
+    assert_eq!(next_job_id(&root, &["al/job-1".to_string()]).unwrap(), 4);
 }
 
 #[test]
@@ -69,21 +110,6 @@ fn create_job_lays_out_the_directory() {
 fn open_job_fails_for_a_missing_job() {
     let tmp = tempfile::tempdir().unwrap();
     assert!(open_job(&jobs_root(tmp.path()), 99).is_err());
-}
-
-/// The checkout sits below the job's worktree directory rather than being it,
-/// so discarding the checkout still leaves `gc` something to find.
-#[test]
-fn a_jobs_checkout_lives_below_its_worktree_directory() {
-    let tmp = tempfile::tempdir().unwrap();
-    let p = create_job(&jobs_root(tmp.path()), 3).unwrap();
-    let repo = Path::new("/work/acme");
-
-    let checkout = p
-        .worktree(repo)
-        .expect("HOME is set in the test environment");
-    assert!(checkout.starts_with(worktree_root(repo, 3).unwrap()));
-    assert_ne!(checkout, worktree_root(repo, 3).unwrap());
 }
 
 #[test]
@@ -123,100 +149,4 @@ fn meta_written_by_an_older_version_still_loads() {
     let meta = read_meta(&job).unwrap();
     assert_eq!(meta.prompt, "go");
     assert_eq!(meta.base_ref, "main");
-}
-
-#[test]
-fn worktrees_live_under_home_not_in_the_repo() {
-    let repo = Path::new("/work/acme");
-    let root = worktree_root(repo, 42).expect("HOME is set in the test environment");
-
-    assert!(
-        root.starts_with(std::env::var("HOME").unwrap()),
-        "{}",
-        root.display()
-    );
-    assert!(!root.starts_with(repo), "{}", root.display());
-    assert!(
-        root.ends_with(format!("{}/42", repo_slug(repo))),
-        "{}",
-        root.display()
-    );
-}
-
-#[test]
-fn two_repositories_on_the_same_job_id_do_not_share_a_worktree_root() {
-    // Job ids restart at 1 in every repository, so the id alone cannot key the
-    // directory — the first job of two repos would land in the same place.
-    let alpha = worktree_root(Path::new("/work/alpha"), 1).unwrap();
-    let beta = worktree_root(Path::new("/work/beta"), 1).unwrap();
-    assert_ne!(alpha, beta);
-}
-
-#[test]
-fn a_repo_slug_names_the_repository_and_still_separates_same_named_ones() {
-    let slug = repo_slug(Path::new("/work/my-repo"));
-
-    // The digest is pinned, not merely recomputed: a slug that moves orphans
-    // every job already on disk, and calling the same pure function twice in
-    // one process cannot notice that.
-    assert_eq!(slug, "my-repo-a4d82cedfd38e369");
-    assert_ne!(
-        slug,
-        repo_slug(Path::new("/elsewhere/my-repo")),
-        "same name at a different path must not collide"
-    );
-}
-
-#[test]
-fn a_repo_slug_is_usable_as_a_directory_name() {
-    let slug = repo_slug(Path::new("/work/we ird:na/me?"));
-    assert!(
-        slug.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
-        "{slug}"
-    );
-}
-
-#[test]
-fn the_repository_owning_a_worktree_directory_can_be_read_back() {
-    // The slug is a hash, so gc cannot invert it — the marker is how a
-    // worktree directory says which repository it belongs to.
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("some-repo");
-    fs::create_dir_all(&repo).unwrap();
-
-    let dir = record_repository_for_worktrees(&repo).unwrap();
-    let owner = repository_owning_worktrees(&dir);
-    fs::remove_dir_all(&dir).unwrap();
-
-    assert_eq!(owner.unwrap(), repo);
-}
-
-#[test]
-fn a_worktree_directory_without_a_marker_owns_nothing() {
-    let tmp = tempfile::tempdir().unwrap();
-    assert!(repository_owning_worktrees(tmp.path()).is_none());
-}
-
-#[test]
-fn the_override_wins_over_home_and_is_used_verbatim() {
-    let chosen = worktrees_root_given(Some("/fast/disk/wt"), Some("/home/dev"));
-    assert_eq!(chosen.unwrap(), Path::new("/fast/disk/wt"));
-}
-
-#[test]
-fn without_an_override_worktrees_land_under_home() {
-    let chosen = worktrees_root_given(None::<&str>, Some("/home/dev"));
-    assert_eq!(chosen.unwrap(), Path::new("/home/dev/.assembly/wt"));
-}
-
-#[test]
-fn with_neither_set_there_is_no_worktree_root_to_guess() {
-    assert!(worktrees_root_given(None::<&str>, None::<&str>).is_none());
-}
-
-#[test]
-fn an_override_alone_is_enough_even_with_no_home() {
-    let chosen = worktrees_root_given(Some("/scratch"), None::<&str>);
-    assert_eq!(chosen.unwrap(), Path::new("/scratch"));
 }

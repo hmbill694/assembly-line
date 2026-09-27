@@ -35,6 +35,8 @@ pub enum Command {
         /// Overrides the repository's declared provider
         #[arg(long)]
         provider: Option<String>,
+        #[command(flatten)]
+        runner: RunnerArgs,
     },
 
     /// Run a job again, based on its own branch, with feedback
@@ -48,6 +50,8 @@ pub enum Command {
         /// The repository the job belongs to. Defaults to the enclosing one.
         #[arg(long)]
         repo: Option<PathBuf>,
+        #[command(flatten)]
+        runner: RunnerArgs,
     },
 
     /// Show a job's state, timing and diff
@@ -70,13 +74,40 @@ pub enum Command {
         repo: Option<PathBuf>,
     },
 
-    /// Remove worktrees left behind by jobs that died mid-run
-    Gc {
-        /// Also remove worktrees untouched for this long, e.g. "7d"
-        #[arg(long)]
-        older_than: Option<String>,
-        /// Report what would be removed, and remove nothing
-        #[arg(long)]
-        dry_run: bool,
-    },
+    /// Run the round in `ASSEMBLY_JOB` and report it as frames on stdout.
+    /// Started by a runner, never by hand.
+    #[command(name = "job-exec", hide = true)]
+    JobExec,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum RunnerKind {
+    /// A child process on this machine, with its toolchain and credentials
+    Local,
+    /// A container, through the `docker` CLI
+    Docker,
+    /// A k8s Job, through the `kubectl` CLI
+    #[value(name = "k8s")]
+    K8s,
+}
+
+/// Where a round runs. Shared by `run` and `revise`: a revise is a new job
+/// cut from the branch, so it may run somewhere the first round did not.
+#[derive(Debug, clap::Args)]
+pub struct RunnerArgs {
+    #[arg(long, value_enum, default_value_t = RunnerKind::Local)]
+    pub runner: RunnerKind,
+    /// The job image. Defaults to the published image at this version.
+    #[arg(long)]
+    pub image: Option<String>,
+    /// Pass this variable from your environment into the job's container.
+    /// Repeatable. `ASSEMBLY_GIT_TOKEN` is always passed.
+    #[arg(long = "pass-env", value_name = "NAME")]
+    pub pass_env: Vec<String>,
+    /// Where k8s Jobs and their Secrets are created. Required for k8s.
+    #[arg(long, required_if_eq("runner", "k8s"))]
+    pub namespace: Option<String>,
+    /// The kubectl context. Defaults to kubectl's current one.
+    #[arg(long)]
+    pub context: Option<String>,
 }

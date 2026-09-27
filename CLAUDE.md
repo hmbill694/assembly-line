@@ -5,11 +5,11 @@ branch, decides whether it succeeded with `verify`, and opens a pull request
 when it did.
 
 - Design decisions: `docs/superpowers/specs/2026-09-11-software-factory-v2.md`
-- Current milestone: `docs/superpowers/plans/2026-09-11-software-factory-f1.md`
+- Current milestone: `docs/superpowers/plans/2026-09-21-software-factory-f2.md`
 
 ## Toolchain
 
-Edition 2024, pinned to stable 1.97.1 via `rust-toolchain.toml`. Do not
+Edition 2024, pinned to stable 1.98.1 via `rust-toolchain.toml`. Do not
 downgrade the edition to work around a compile error — fix the code.
 
 ```
@@ -103,7 +103,8 @@ std::fs::read_dir(dir)
     .collect()
 ```
 
-(`src/gc.rs`'s `job_directories`.)
+(`src/paths.rs`'s `existing_job_ids` is the same idea, collecting into an
+`io::Result` so that an unreadable entry is an error rather than skipped.)
 
 ### Prefer pattern matching to if-else chains
 
@@ -155,18 +156,19 @@ would. `git::commit_all_except` unstages each `never_commit` path this way
 (`src/git.rs`) — a genuine loop, not a map in disguise.
 
 When you do write one, it should be because the alternative is worse, and
-that should be obvious to the next reader. F1 runs exactly one job at a time,
-so there is no scheduler loop any more to hold up as the headline case — if a
-later milestone's daemon brings one back, it belongs here.
+that should be obvious to the next reader. `assembly` runs exactly one job at
+a time, so there is no scheduler loop any more to hold up as the headline
+case — if a later milestone's daemon brings one back, it belongs here.
 
 ### Cost
 
 The unit of work is one job, and the collections around it — a repository's
-declared providers, its `copy` list, the remotes `git remote` prints, a `gc`
-run's stale worktrees — are a handful of items, not millions. Favor clarity:
-`git::remote_exists` checks membership by scanning `git remote`'s output line
-by line rather than collecting it into a `HashSet` first (`src/git.rs`); with
-a handful of remotes the scan is clearer and the difference in cost does not
+declared providers, its `copy` list, the job branches `git ls-remote` lists,
+the frames one job prints — are a handful of items, not millions. Favor
+clarity: `git::remote_branches_matching` hands back the remote's job
+branches as a plain `Vec`, and `paths::job_id_past` scans it for the highest
+id rather than indexing it first (`src/git.rs`, `src/paths.rs`); with a
+handful of branches the scan is clearer and the difference in cost does not
 exist. There is no graph left to traverse — no DFS, no Kahn's-style peeling;
 a job either runs or it doesn't. If a later milestone's daemon runs many jobs
 at once, the cost question becomes scheduling contention, not walking a data
@@ -178,10 +180,9 @@ A name should tell the reader what the thing *is* or *decides*, without them
 opening it. Bare verbs (`check`, `handle`, `process`, `absorb`, `skip`) and
 bare nouns (`data`, `info`, `result`, `entry`) fail that test.
 
-- **Predicates read as claims:** `git::branch_exists`, not `exists`.
-- **Filters name what they select:** `gc::collectable`, not `filtered` — it
-  names the `RepositoryLeftovers` a `gc` run would actually remove
-  (`src/gc.rs`).
+- **Predicates read as claims:** `git::remote_lacks_ref`, not `check_ref`.
+- **Filters name what they select:** `RepoConfig::settings_worth_flagging`,
+  not `warnings` — it names which settings it picks out (`src/config.rs`).
 - **Error producers name the fault:** `RepoConfig::reasons_it_cannot_run`,
   `unparseable_max_duration` — not `problems`, `duration_error`
   (`src/config.rs`).
@@ -228,7 +229,10 @@ Where a type owns a sink or source, make it generic with a sensible default
 
 ## Testing
 
-- Integration tests in `tests/`, one file per module concern.
+- Integration tests in `tests/`, one file per module concern. The one
+  exception: a `#[cfg(test)]` unit test in `src/` is acceptable only where
+  the behaviour is unreachable through the public API in reasonable time —
+  today that is `src/job.rs`'s provisioning deadline.
 - Test through the public API. `JobState::replay` and `JobReport::from_events`
   are both pure folds over an event stream, so most behavior can be asserted
   by feeding them events, with no processes involved (`src/state.rs`,
@@ -237,11 +241,12 @@ Where a type owns a sink or source, make it generic with a sensible default
   test may touch the network or require credentials.
 - Prove concurrency with observable evidence — a wall-clock bound, or a probe
   that records how many copies of a command were live at once — not by
-  inspecting internal state. This is forward-looking, not descriptive of F1's
-  own tests: F1 runs exactly one job at a time, so there is nothing concurrent
-  to observe today, and the DAG scheduler's wall-clock probes were deleted
-  with it. Apply this rule when a later milestone's daemon actually runs jobs
-  concurrently — don't go looking for the tests it describes before then.
+  inspecting internal state. This is forward-looking, not descriptive of
+  today's tests: `assembly` runs exactly one job at a time, so there is
+  nothing concurrent to observe today, and the DAG scheduler's wall-clock
+  probes were deleted with it. Apply this rule when a later milestone's
+  daemon actually runs jobs concurrently — don't go looking for the tests it
+  describes before then.
 
 ## Invariants
 
@@ -250,14 +255,19 @@ Where a type owns a sink or source, make it generic with a sensible default
   `JobReport::from_events`. Anything that cannot be reconstructed from
   `events.jsonl` does not belong in `JobState` or `JobReport`.
 - Job ids are never user input, so there is nothing to validate. A job's id is
-  a `u64` that `paths::next_job_id` allocates by scanning the existing job
-  directories and taking one past the max, and its branch name is derived
+  a `u64` that `paths::next_job_id` allocates one past the max of both the
+  existing job directories and the remote's `al/job-*` branches — job
+  branches are shared on the remote, so a second clone, a teammate, or a
+  deleted `.assembly/jobs` must not restart at 1 and push onto a branch
+  somebody else already published. Its branch name is derived
   from that id alone (`al/job-{id}`, `workspace::job_branch_name`) — always a
   well-formed git ref, with no pattern check needed because nothing
   user-authored ever reaches it.
-- The target repository is never modified beyond `.assembly/jobs/`, where a
-  job's event log and metadata live until a later milestone moves that state
-  out of the repository entirely (`src/paths.rs`). Worktrees live under
-  `$HOME` (or `$ASSEMBLY_WORKTREE_ROOT`, which tests set), never inside the
-  repo: the target repo must stay untouched, and a worktree inside it would
-  need a `.gitignore` entry assembly-line is not entitled to add.
+- The target repository's working tree is never modified beyond
+  `.assembly/jobs/`, where a job's event log and metadata live until a later
+  milestone moves that state out of the repository entirely
+  (`src/paths.rs`). Its `.git` gains only what a fetch writes — objects,
+  `FETCH_HEAD`, remote-tracking refs — when a job pins its start to the
+  remote (`git::pinned`). Checkouts are scratch
+  clones under the system temp directory, never inside the repository, and
+  are deleted with the round that made them.

@@ -38,7 +38,6 @@ async fn a_job_whose_verify_fails_is_a_failed_job() {
         config_running("fake-agent.sh")
     ))
     .await;
-    let origin = h.with_origin().await;
 
     let outcome = h.run_job("write a file").await;
 
@@ -62,12 +61,12 @@ async fn a_job_whose_verify_fails_is_a_failed_job() {
         "the branch survives a failed verify — that is what makes it inspectable"
     );
     assert!(
-        !h.worktree_root().join("checkout").exists(),
+        h.scratch_is_empty(),
         "a job's checkout is scratch — even one verify rejected discards it"
     );
 
     let on_remote =
-        git::run_allowing_failure(&origin, &["show", "--name-only", "--format=", &branch])
+        git::run_allowing_failure(&h.origin, &["show", "--name-only", "--format=", &branch])
             .await
             .unwrap();
     assert!(on_remote.succeeded(), "{}", on_remote.stderr);
@@ -97,9 +96,7 @@ async fn a_job_whose_verify_passes_succeeds() {
     );
     assert!(!outcome.has(|e| matches!(e, EventKind::JobVerifyFailed { .. })));
     assert!(
-        std::fs::read_to_string(&outcome.log)
-            .unwrap()
-            .contains(VERIFY_RAN),
+        outcome.output.contains(VERIFY_RAN),
         "a round the agent succeeded is a round verify is asked about"
     );
 }
@@ -142,10 +139,10 @@ async fn an_agent_failure_wins_over_verify() {
         !outcome.has(|e| matches!(e, EventKind::JobVerifyFailed { .. })),
         "nothing may claim verify rejected work it never looked at"
     );
-    let job_log = std::fs::read_to_string(&outcome.log).unwrap();
     assert!(
-        !job_log.contains(VERIFY_RAN),
-        "verify ran on a round the agent had already failed: {job_log}"
+        !outcome.output.contains(VERIFY_RAN),
+        "verify ran on a round the agent had already failed: {}",
+        outcome.output
     );
     assert!(
         outcome.has(|e| matches!(e, EventKind::JobCommitted { .. })),

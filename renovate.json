@@ -2,5 +2,24 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
+  ],
+  "packageRules": [
+    {
+      "description": "The builder's rust tag must match rust-toolchain.toml's channel, which renovate does not bump; bump both together by hand.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["rust"],
+      "enabled": false
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "fileMatch": ["^Dockerfile$"],
+      "matchStrings": [
+        "ARG MISE_VERSION=(?<currentValue>v[\\d.]+)"
+      ],
+      "depNameTemplate": "jdx/mise",
+      "datasourceTemplate": "github-releases"
+    }
   ]
 }

@@ -9,7 +9,7 @@ pub const PROMPT_PLACEHOLDER: &str = "{prompt}";
 ///
 /// Deliberately not a shell string. A prompt contains quotes, newlines and
 /// `$`; substituting it into a shell string would be an injection bug.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommandSpec {
     pub program: String,
     pub args: Vec<String>,
