@@ -32,7 +32,8 @@ impl std::fmt::Display for DiffSummary {
 pub struct JobReport {
     pub id: u64,
     pub state: JobState,
-    /// How many rounds this job has had. 1 unless it has been revised.
+    /// How many rounds this job has had: the highest round any
+    /// `RoundStarted` records, and at least 1.
     pub rounds: u32,
     /// Wall time of the most recent round.
     pub duration: Option<Duration>,
@@ -65,7 +66,7 @@ impl JobProgress {
             // reason and diff, so a revised job reports its final round.
             EventKind::RoundStarted { round } => JobProgress {
                 state: JobState::Running,
-                rounds: (*round).max(self.rounds + 1),
+                rounds: (*round).max(self.rounds),
                 round_started_at: Some(event.at),
                 committed_diff: None,
                 detail: None,

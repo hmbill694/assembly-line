@@ -71,6 +71,29 @@ fn a_revised_job_reports_its_last_round() {
     assert_eq!(report.duration.unwrap().as_secs(), 3);
 }
 
+/// A torn line is skipped when the log is read, so a round's start can be
+/// missing; the rounds after it keep their numbers.
+#[test]
+fn a_missing_round_start_does_not_lower_the_round_count() {
+    let events = timeline(vec![
+        (0, EventKind::RoundStarted { round: 1 }),
+        (1, EventKind::RoundPassed),
+        (2, EventKind::RoundStarted { round: 3 }),
+    ]);
+
+    assert_eq!(JobReport::from_events(1, &events).rounds, 3);
+}
+
+#[test]
+fn a_round_started_twice_is_counted_once() {
+    let events = timeline(vec![
+        (0, EventKind::RoundStarted { round: 2 }),
+        (1, EventKind::RoundStarted { round: 2 }),
+    ]);
+
+    assert_eq!(JobReport::from_events(1, &events).rounds, 2);
+}
+
 #[test]
 fn a_new_round_clears_the_previous_rounds_failure_reason() {
     let events = timeline(vec![
