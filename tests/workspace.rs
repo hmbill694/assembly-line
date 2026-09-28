@@ -34,13 +34,11 @@ impl Fixture {
         git::pinned(&self.repo, "origin", "main").await.unwrap()
     }
 
-    async fn workspace(&self, copy: &[String]) -> anyhow::Result<workspace::RoundWorkspace> {
+    async fn workspace(&self) -> anyhow::Result<workspace::RoundWorkspace> {
         workspace::create(
             self.url(),
             &self.main().await,
             "al/job-1",
-            &self.repo,
-            copy,
             self.scratch(),
             None,
         )
@@ -51,7 +49,7 @@ impl Fixture {
 #[tokio::test]
 async fn creating_a_workspace_checks_out_the_pinned_commit_on_the_jobs_branch() {
     let fx = Fixture::new().await;
-    let ws = fx.workspace(&[]).await.unwrap();
+    let ws = fx.workspace().await.unwrap();
 
     assert_eq!(head_sha(ws.path()).await.unwrap(), fx.main().await.sha);
     assert_eq!(
@@ -66,7 +64,7 @@ async fn creating_a_workspace_checks_out_the_pinned_commit_on_the_jobs_branch() 
 #[tokio::test]
 async fn a_workspace_commits_as_assembly_line() {
     let fx = Fixture::new().await;
-    let ws = fx.workspace(&[]).await.unwrap();
+    let ws = fx.workspace().await.unwrap();
 
     std::fs::write(ws.path().join("work.txt"), "did the work\n").unwrap();
     workspace::commit(&ws, "work").await.unwrap().unwrap();
@@ -79,66 +77,9 @@ async fn a_workspace_commits_as_assembly_line() {
 }
 
 #[tokio::test]
-async fn seeded_files_are_copied_in_and_kept_out_of_the_commit() {
-    let fx = Fixture::new().await;
-    std::fs::write(fx.repo.join(".env"), "API_KEY=hunter2\n").unwrap();
-
-    let ws = fx.workspace(&[".env".to_string()]).await.unwrap();
-
-    assert_eq!(
-        std::fs::read_to_string(ws.path().join(".env")).unwrap(),
-        "API_KEY=hunter2\n",
-        "the agent must be able to read it"
-    );
-
-    std::fs::write(ws.path().join("work.txt"), "did the work\n").unwrap();
-    workspace::commit(&ws, "node work").await.unwrap().unwrap();
-
-    let tracked = git::run_allowing_failure(ws.path(), &["ls-files"])
-        .await
-        .unwrap()
-        .stdout;
-    assert!(tracked.contains("work.txt"), "{tracked}");
-    assert!(
-        !tracked.contains(".env"),
-        "seeded secret was committed: {tracked}"
-    );
-}
-
-#[tokio::test]
-async fn seeding_preserves_nested_paths() {
-    let fx = Fixture::new().await;
-    std::fs::create_dir_all(fx.repo.join(".claude")).unwrap();
-    std::fs::write(fx.repo.join(".claude/settings.local.json"), "{}\n").unwrap();
-
-    let ws = fx
-        .workspace(&[".claude/settings.local.json".to_string()])
-        .await
-        .unwrap();
-
-    assert!(ws.path().join(".claude/settings.local.json").is_file());
-}
-
-#[tokio::test]
-async fn a_missing_seed_path_names_the_file_and_leaves_no_checkout() {
-    let fx = Fixture::new().await;
-
-    let err = fx
-        .workspace(&["nope.env".to_string()])
-        .await
-        .unwrap_err()
-        .to_string();
-
-    assert!(err.contains("nope.env"), "{err}");
-    let scratch_is_empty =
-        std::fs::read_dir(fx.scratch()).map_or(true, |mut entries| entries.next().is_none());
-    assert!(scratch_is_empty, "a typo should cost nothing");
-}
-
-#[tokio::test]
 async fn committing_an_untouched_workspace_produces_nothing() {
     let fx = Fixture::new().await;
-    let ws = fx.workspace(&[]).await.unwrap();
+    let ws = fx.workspace().await.unwrap();
 
     assert!(
         workspace::commit(&ws, "nothing happened")
@@ -152,7 +93,7 @@ async fn committing_an_untouched_workspace_produces_nothing() {
 #[tokio::test]
 async fn discarding_a_workspace_removes_it_and_the_published_branch_survives() {
     let fx = Fixture::new().await;
-    let ws = fx.workspace(&[]).await.unwrap();
+    let ws = fx.workspace().await.unwrap();
     std::fs::write(ws.path().join("work.txt"), "done\n").unwrap();
     let sha = workspace::commit(&ws, "work").await.unwrap().unwrap();
     workspace::publish(&ws).await.unwrap();
@@ -174,24 +115,16 @@ async fn discarding_a_workspace_removes_it_and_the_published_branch_survives() {
 #[tokio::test]
 async fn continuing_a_branch_restores_the_previous_rounds_work() {
     let fx = Fixture::new().await;
-    let first = fx.workspace(&[]).await.unwrap();
+    let first = fx.workspace().await.unwrap();
     std::fs::write(first.path().join("rounds.txt"), "one\n").unwrap();
     workspace::commit(&first, "round 1").await.unwrap().unwrap();
     workspace::publish(&first).await.unwrap();
     workspace::discard(first).unwrap();
 
     let tip = git::pinned(&fx.repo, "origin", "al/job-1").await.unwrap();
-    let second = workspace::create(
-        fx.url(),
-        &tip,
-        "al/job-1",
-        &fx.repo,
-        &[],
-        fx.scratch(),
-        None,
-    )
-    .await
-    .unwrap();
+    let second = workspace::create(fx.url(), &tip, "al/job-1", fx.scratch(), None)
+        .await
+        .unwrap();
 
     assert_eq!(
         std::fs::read_to_string(second.path().join("rounds.txt")).unwrap(),
@@ -208,7 +141,7 @@ async fn publishing_runs_no_hook_from_the_clone() {
     use std::os::unix::fs::PermissionsExt;
 
     let fx = Fixture::new().await;
-    let ws = fx.workspace(&[]).await.unwrap();
+    let ws = fx.workspace().await.unwrap();
     let marker = fx.tmp.path().join("pre-push-ran");
     let hook = ws.path().join(".git/hooks/pre-push");
     std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
@@ -233,7 +166,7 @@ async fn publishing_runs_no_hook_from_the_clone() {
 #[tokio::test]
 async fn a_refused_publish_names_the_branch_and_what_was_lost() {
     let fx = Fixture::new().await;
-    let ws = fx.workspace(&[]).await.unwrap();
+    let ws = fx.workspace().await.unwrap();
     std::fs::write(ws.path().join("work.txt"), "done\n").unwrap();
     workspace::commit(&ws, "work").await.unwrap().unwrap();
     // A remote that no longer exists refuses every attempt.

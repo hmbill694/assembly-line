@@ -1,5 +1,4 @@
-//! One round's sandbox: a scratch clone of the remote, optionally seeded with
-//! files the repository does not carry.
+//! One round's sandbox: a scratch clone of the remote.
 
 use crate::git::{self, PinnedRef};
 use std::os::unix::fs::PermissionsExt;
@@ -12,8 +11,6 @@ pub struct RoundWorkspace {
     /// checkout scratch whatever becomes of the round.
     dir: tempfile::TempDir,
     pub branch: String,
-    /// Relative paths copied in, which must never reach a commit.
-    seeded: Vec<String>,
     /// The commit the branch was checked out at — every commit since is
     /// this round's.
     started_at: String,
@@ -34,32 +31,20 @@ pub const DEFAULT_REMOTE: &str = "origin";
 const CLONE_REMOTE: &str = "origin";
 
 /// Clone `remote_url` into a fresh directory under `scratch_root`, with
-/// `branch` checked out at `start`, and seed it. A `credential_helper`
-/// authenticates both the clone and the eventual push.
+/// `branch` checked out at `start`. A `credential_helper` authenticates both
+/// the clone and the eventual push.
 ///
 /// # Errors
 ///
-/// Seed paths are checked *before* anything is cloned, so a typo leaves
-/// nothing behind. A clone that fails midway leaves nothing either: the
-/// directory is removed as the error propagates.
+/// A clone that fails midway leaves nothing: the directory is removed as
+/// the error propagates.
 pub async fn create(
     remote_url: &str,
     start: &PinnedRef,
     branch: &str,
-    seed_from: impl AsRef<Path>,
-    copy_paths: &[String],
     scratch_root: impl AsRef<Path>,
     credential_helper: Option<&str>,
 ) -> anyhow::Result<RoundWorkspace> {
-    let seed_from = seed_from.as_ref();
-
-    if let Some(missing) = missing_seed_path(seed_from, copy_paths) {
-        anyhow::bail!(
-            "copy path '{missing}' does not exist under {}",
-            seed_from.display()
-        );
-    }
-
     std::fs::create_dir_all(scratch_root.as_ref())?;
     let dir = tempfile::Builder::new()
         .prefix("assembly-round-")
@@ -71,32 +56,11 @@ pub async fn create(
     git::run_allowing_failure(dir.path(), &["fetch", "--quiet", CLONE_REMOTE, &start.name]).await?;
     git::check_out_new_branch(dir.path(), branch, &start.sha).await?;
     git::commit_as_assembly_line(dir.path()).await?;
-    seed_files(dir.path(), seed_from, copy_paths)?;
 
     Ok(RoundWorkspace {
         dir,
         branch: branch.to_string(),
-        seeded: copy_paths.to_vec(),
         started_at: start.sha.clone(),
-    })
-}
-
-/// The first `copy` path the repository declares that is not actually there.
-fn missing_seed_path<'a>(seed_from: &Path, copy_paths: &'a [String]) -> Option<&'a String> {
-    copy_paths.iter().find(|rel| !seed_from.join(rel).exists())
-}
-
-/// Copy the repository's `copy` paths into the checkout, creating whatever
-/// directories they nest in.
-fn seed_files(into: &Path, seed_from: &Path, copy_paths: &[String]) -> anyhow::Result<()> {
-    copy_paths.iter().try_for_each(|rel| -> anyhow::Result<()> {
-        let destination = into.join(rel);
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::copy(seed_from.join(rel), destination)
-            .map(|_| ())
-            .map_err(|e| anyhow::anyhow!("copying '{rel}' into the workspace: {e}"))
     })
 }
 
@@ -107,9 +71,9 @@ fn seed_files(into: &Path, seed_from: &Path, copy_paths: &[String]) -> anyhow::R
 ///
 /// # Errors
 ///
-/// See [`git::commit_all_except`].
+/// See [`git::commit_all`].
 pub async fn commit(ws: &RoundWorkspace, message: &str) -> anyhow::Result<Option<String>> {
-    git::commit_all_except(ws.path(), message, &ws.seeded, &ws.started_at).await?;
+    git::commit_all(ws.path(), message).await?;
     match git::head_is_ahead_of(ws.path(), &ws.started_at).await? {
         true => git::head_sha(ws.path()).await.map(Some),
         false => Ok(None),

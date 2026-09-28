@@ -73,7 +73,7 @@ pub fn config_running(script: &str) -> String {
 
 /// Stage everything in `repo` and commit it. `None` means the tree was clean.
 pub async fn commit_all(repo: &Path, message: &str) -> anyhow::Result<Option<String>> {
-    git::commit_all_except(repo, message, &[], "HEAD").await
+    git::commit_all(repo, message).await
 }
 
 /// Turn `at` into a git repository with one commit, so a job has somewhere to
@@ -260,7 +260,6 @@ impl Harness {
                 start,
                 remote_name: "origin",
                 remote_url: self.origin.to_string_lossy().into_owned(),
-                seed_from: &self.repo,
             },
         )
         .unwrap()

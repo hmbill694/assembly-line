@@ -1,7 +1,6 @@
 use assembly_line::config::RepoConfig;
 use assembly_line::git::PinnedRef;
 use assembly_line::payload::{RoundPayload, RoundRequest, revised_prompt};
-use std::path::Path;
 
 fn request(provider: &str) -> RoundRequest<'_> {
     RoundRequest {
@@ -15,7 +14,6 @@ fn request(provider: &str) -> RoundRequest<'_> {
         },
         remote_name: "origin",
         remote_url: "https://example.com/o/r.git".into(),
-        seed_from: Path::new("/repo"),
     }
 }
 
@@ -23,7 +21,7 @@ fn config(body: &str) -> RepoConfig {
     RepoConfig::parse(body).unwrap()
 }
 
-const RUNNABLE: &str = "provider = \"fake\"\nverify = \"cargo test\"\nmax_duration = \"20m\"\ncopy = [\".env\"]\n\
+const RUNNABLE: &str = "provider = \"fake\"\nverify = \"cargo test\"\nmax_duration = \"20m\"\n\
 [providers.fake]\ncmd = \"agent\"\nargs = [\"-p\", \"{prompt}\"]\n";
 
 #[test]
@@ -39,7 +37,6 @@ fn a_payload_carries_everything_the_round_needs_already_resolved() {
     assert_eq!(payload.commit_message, "job 7: add a README");
     assert_eq!(payload.verify.as_deref(), Some("cargo test"));
     assert_eq!(payload.command_limit_secs, Some(20 * 60));
-    assert_eq!(payload.copy, [".env"]);
     assert_eq!(payload.start.sha, "abc123");
     assert!(
         !payload.provision_toolchain,

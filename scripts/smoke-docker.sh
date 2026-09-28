@@ -23,8 +23,7 @@ payload=$(cat <<JSON
  "start":{"name":"main","sha":"$sha"},"branch":"al/job-1",
  "command":{"program":"sh","args":["-c","echo smoke > smoke.txt"]},
  "commit_message":"job 1: smoke","verify":"test -f smoke.txt",
- "command_limit_secs":300,"copy":[],"seed_from":"/nonexistent",
- "provision_toolchain":true}
+ "command_limit_secs":300,"provision_toolchain":true}
 JSON
 )
 

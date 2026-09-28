@@ -187,19 +187,10 @@ fn passing_a_variable_assembly_line_sets_itself_is_refused() {
 const NETWORK_REMOTE: &str = "https://github.com/o/r.git";
 
 #[test]
-fn a_repository_that_declares_copy_cannot_run_in_a_container() {
-    assert_eq!(
-        reasons_a_container_cannot_run(&[".env".into()], NETWORK_REMOTE),
-        [RunnerProblem::CopyNeedsLocalRunner]
-    );
-    assert!(reasons_a_container_cannot_run(&[], NETWORK_REMOTE).is_empty());
-}
-
-#[test]
 fn a_remote_that_is_a_path_on_this_machine_cannot_run_in_a_container() {
     for url in ["/tmp/origin.git", "../origin", "file:///tmp/origin.git"] {
         assert_eq!(
-            reasons_a_container_cannot_run(&[], url),
+            reasons_a_container_cannot_run(url),
             [RunnerProblem::RemoteIsLocalPath { url: url.into() }],
             "{url}"
         );
@@ -213,19 +204,6 @@ fn a_remote_that_is_a_path_on_this_machine_cannot_run_in_a_container() {
     }
 }
 
-#[test]
-fn every_container_problem_is_reported_at_once() {
-    assert_eq!(
-        reasons_a_container_cannot_run(&[".env".into()], "/tmp/origin.git"),
-        [
-            RunnerProblem::CopyNeedsLocalRunner,
-            RunnerProblem::RemoteIsLocalPath {
-                url: "/tmp/origin.git".into()
-            },
-        ]
-    );
-}
-
 /// The host's own checkout, remote and credentials are all there for a
 /// round that runs beside them.
 #[tokio::test]
@@ -234,7 +212,6 @@ async fn a_host_runner_carries_no_secrets_and_takes_what_a_container_cannot() {
         &HostRunner {
             problems: Vec::new(),
         },
-        &[".env".into()],
         "/tmp/origin.git",
         &["ANTHROPIC_API_KEY".into()],
         |_| None,
@@ -251,7 +228,6 @@ async fn a_host_runner_is_refused_for_its_own_problems() {
         &HostRunner {
             problems: vec![unreachable_runner()],
         },
-        &[],
         NETWORK_REMOTE,
         &[],
         |_| None,
@@ -268,7 +244,6 @@ async fn a_container_runner_carries_the_git_token_from_the_host() {
         &ContainerRunner {
             problems: Vec::new(),
         },
-        &[],
         NETWORK_REMOTE,
         &[],
         host_with_only_the_git_token,
@@ -288,7 +263,6 @@ async fn every_reason_a_container_runner_cannot_run_is_reported_at_once() {
         &ContainerRunner {
             problems: vec![unreachable_runner()],
         },
-        &[".env".into()],
         "/tmp/origin.git",
         &["ANTHROPIC_API_KEY".into()],
         host_with_only_the_git_token,
@@ -300,7 +274,6 @@ async fn every_reason_a_container_runner_cannot_run_is_reported_at_once() {
         problems,
         [
             unreachable_runner(),
-            RunnerProblem::CopyNeedsLocalRunner,
             RunnerProblem::RemoteIsLocalPath {
                 url: "/tmp/origin.git".into()
             },
@@ -328,8 +301,6 @@ fn payload_cloning(remote_url: &str) -> RoundPayload {
         commit_message: "job 1: agent work".into(),
         verify: None,
         command_limit_secs: None,
-        copy: Vec::new(),
-        seed_from: "seed".into(),
         provision_toolchain: false,
     }
 }
@@ -367,7 +338,6 @@ fn every_runner_problem_says_what_to_do_about_it() {
             resource: "jobs".into(),
             namespace: "factory".into(),
         },
-        RunnerProblem::CopyNeedsLocalRunner,
         RunnerProblem::MissingEnvironment("X".into()),
         RunnerProblem::ReservedEnvironment("ASSEMBLY_JOB".into()),
         RunnerProblem::RemoteIsLocalPath {

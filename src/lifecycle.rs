@@ -271,18 +271,15 @@ pub async fn prepare_start<'r, R: Runner>(
             Ok(branches) => branches,
             Err(e) => return Prepared::refused(notes, Refusal::Unpreparable(e)),
         };
-    let secrets = match secrets_or_reasons_it_cannot_run(
-        runner,
-        &config.copy,
-        &located.remote_url,
-        pass_env,
-        |name| std::env::var(name).ok(),
-    )
-    .await
-    {
-        Ok(secrets) => secrets,
-        Err(problems) => return Prepared::refused(notes, Refusal::RunnerCannotRun(problems)),
-    };
+    let secrets =
+        match secrets_or_reasons_it_cannot_run(runner, &located.remote_url, pass_env, |name| {
+            std::env::var(name).ok()
+        })
+        .await
+        {
+            Ok(secrets) => secrets,
+            Err(problems) => return Prepared::refused(notes, Refusal::RunnerCannotRun(problems)),
+        };
 
     Prepared {
         notes,
@@ -322,18 +319,15 @@ pub async fn prepare_revision<'r, R: Runner>(
         Ok((config, _)) => config,
         Err(refusal) => return Prepared::refused(notes, refusal),
     };
-    let secrets = match secrets_or_reasons_it_cannot_run(
-        runner,
-        &config.copy,
-        &located.remote_url,
-        pass_env,
-        |name| std::env::var(name).ok(),
-    )
-    .await
-    {
-        Ok(secrets) => secrets,
-        Err(problems) => return Prepared::refused(notes, Refusal::RunnerCannotRun(problems)),
-    };
+    let secrets =
+        match secrets_or_reasons_it_cannot_run(runner, &located.remote_url, pass_env, |name| {
+            std::env::var(name).ok()
+        })
+        .await
+        {
+            Ok(secrets) => secrets,
+            Err(problems) => return Prepared::refused(notes, Refusal::RunnerCannotRun(problems)),
+        };
     let log = match EventLog::open_append(located.paths.events()) {
         Ok(log) => log,
         Err(e) => {
@@ -404,9 +398,6 @@ pub async fn run<R: Runner>(
             start,
             remote_name: DEFAULT_REMOTE,
             remote_url,
-            // `copy` is declared by the repository, so its paths resolve
-            // against the repository — not against wherever the user stands.
-            seed_from: &meta.repo,
         },
     )
     .map(payload_fitted_to::<R>)?;

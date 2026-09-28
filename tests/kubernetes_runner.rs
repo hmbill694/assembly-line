@@ -35,8 +35,6 @@ fn payload_with_command_limit(command_limit_secs: Option<u64>) -> RoundPayload {
         commit_message: "message".into(),
         verify: None,
         command_limit_secs,
-        copy: Vec::new(),
-        seed_from: "seed".into(),
         provision_toolchain: true,
     }
 }

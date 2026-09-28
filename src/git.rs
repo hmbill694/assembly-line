@@ -432,7 +432,7 @@ pub async fn current_branch(repo: impl AsRef<Path>) -> anyhow::Result<Option<Str
 ///
 /// `HEAD`, not the local `branch`: the agent is free to check out another
 /// branch, and what gets pushed must be the commit everything before the push
-/// inspected — the seeded-file check and the recorded sha both read `HEAD`.
+/// inspected — the recorded sha reads `HEAD`.
 ///
 /// Deliberately without `--set-upstream`: that would write `branch.*.remote`
 /// into the repository's config. A later round pushes the same branch name
@@ -461,51 +461,20 @@ pub async fn push_head_as(
     .map(|_| ())
 }
 
-/// Commit everything except `never_commit`, which stay on disk for the agent
-/// to read but are kept out of every commit since `since`.
-///
-/// Staging is controlled directly rather than through `info/exclude` or a
-/// `.gitignore`: both are files in the scratch clone, which the agent is free
-/// to rewrite, so an ignore rule there is only as good as the agent's
-/// restraint. Unstaging each path depends on nothing the agent can edit, and
-/// the check afterwards sees the commits a push would send. Together they
-/// keep the paths out of history by accident; they cannot stop an agent
-/// copying their contents into some other file, or pushing them itself.
-///
-/// # Errors
-///
-/// Beyond the usual git failures, an error if a commit since `since` touched
-/// a `never_commit` path — meaning the agent committed it itself, even if a
-/// later commit removed it again.
-pub async fn commit_all_except(
-    clone: impl AsRef<Path>,
-    message: &str,
-    never_commit: &[String],
-    since: &str,
-) -> anyhow::Result<Option<String>> {
+/// Stage everything in `clone` and commit it, returning the new commit, or
+/// `None` when there was nothing to commit.
+pub async fn commit_all(clone: impl AsRef<Path>, message: &str) -> anyhow::Result<Option<String>> {
     let clone = clone.as_ref();
     run_expecting_success(clone, &["add", "-A"], "add -A").await?;
-
-    // `run_allowing_failure`: unstaging a path that was never staged is a
-    // no-op worth ignoring, not an error.
-    for path in never_commit {
-        run_allowing_failure(clone, &["reset", "--quiet", "--", path]).await?;
-    }
 
     let nothing_staged = run_allowing_failure(clone, &["diff", "--cached", "--quiet"])
         .await?
         .succeeded();
-    let committed = if nothing_staged {
-        None
-    } else {
-        run_expecting_success(clone, &["commit", "--no-verify", "-m", message], "commit").await?;
-        Some(head_sha(clone).await?)
-    };
-
-    // Whether or not anything was left to commit: the agent may have
-    // committed a seeded file itself and left the tree clean.
-    ensure_never_committed_since(clone, since, never_commit).await?;
-    Ok(committed)
+    if nothing_staged {
+        return Ok(None);
+    }
+    run_expecting_success(clone, &["commit", "--no-verify", "-m", message], "commit").await?;
+    head_sha(clone).await.map(Some)
 }
 
 /// Whether `HEAD` carries any commit that `since` does not — work the round
@@ -514,72 +483,6 @@ pub async fn head_is_ahead_of(repo: impl AsRef<Path>, since: &str) -> anyhow::Re
     let range = format!("{since}..HEAD");
     let count = run_expecting_success(repo, &["rev-list", "--count", &range], "rev-list").await?;
     Ok(count != "0")
-}
-
-/// Unstaging covers the commit assembly-line makes; this catches the agent
-/// committing a seeded file itself, in any commit since `since` — one that a
-/// later commit deleted again still carries it to the remote. Fatal, because
-/// a failed round is far better than a leaked credential on a branch bound for
-/// a remote.
-///
-/// Plumbing, not `git log`: the clone's config is the agent's to write, and
-/// `log.*` settings change what a log shows — `log.diffMerges=off` hides a
-/// merge's diff, `log.showRoot=false` a root commit's. `--no-replace-objects`,
-/// because a replace ref changes what the clone shows for a commit but not
-/// what a push sends. Each commit is diffed on its own, `-m` against every
-/// parent and `--root` against nothing, so a merge or a root commit that
-/// introduces the file names it.
-async fn ensure_never_committed_since(
-    clone: &Path,
-    since: &str,
-    never_commit: &[String],
-) -> anyhow::Result<()> {
-    if never_commit.is_empty() {
-        return Ok(());
-    }
-
-    let range = format!("{since}..HEAD");
-    let commits = run_expecting_success(
-        clone,
-        &["--no-replace-objects", "rev-list", &range],
-        "rev-list",
-    )
-    .await?;
-
-    // A loop: each commit is one `git` call, and the first that touched a
-    // seeded path ends the check.
-    for commit in commits.lines() {
-        let args: Vec<&str> = [
-            "--no-replace-objects",
-            "diff-tree",
-            "-m",
-            "-r",
-            "--root",
-            "--name-only",
-            "--no-commit-id",
-            commit,
-            "--",
-        ]
-        .into_iter()
-        .chain(never_commit.iter().map(String::as_str))
-        .collect();
-        let touched: std::collections::BTreeSet<String> =
-            run_expecting_success(clone, &args, "diff-tree")
-                .await?
-                .lines()
-                .filter(|line| !line.is_empty())
-                .map(String::from)
-                .collect();
-
-        if !touched.is_empty() {
-            return Err(anyhow::anyhow!(
-                "refusing to continue: commit {commit} carries seeded file(s) the agent \
-                 committed: {}",
-                touched.into_iter().collect::<Vec<_>>().join(", ")
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

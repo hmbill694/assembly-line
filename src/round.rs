@@ -133,8 +133,6 @@ async fn round_result<W: Write + Send + 'static>(
             &payload.remote_url,
             &payload.start,
             &payload.branch,
-            &payload.seed_from,
-            &payload.copy,
             scratch_root,
             // A container runner always sends the token, having no other
             // credentials to offer; without one, git uses whatever this
@@ -416,7 +414,6 @@ mod provisioning_tests {
 
     use super::*;
     use crate::git::PinnedRef;
-    use std::path::PathBuf;
 
     fn payload_asking_for_provisioning() -> RoundPayload {
         RoundPayload {
@@ -436,8 +433,6 @@ mod provisioning_tests {
             commit_message: "job 1".to_string(),
             verify: None,
             command_limit_secs: None,
-            copy: Vec::new(),
-            seed_from: PathBuf::from("."),
             provision_toolchain: true,
         }
     }
