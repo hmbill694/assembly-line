@@ -8,6 +8,11 @@ use std::path::PathBuf;
     about = "Run one coding-agent job and keep the branch it leaves"
 )]
 pub struct Cli {
+    /// Where job state lives. Defaults to $XDG_STATE_HOME/assembly-line,
+    /// or ~/.local/state/assembly-line.
+    #[arg(long, global = true, env = "ASSEMBLY_ROOT")]
+    pub root: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -47,7 +52,7 @@ pub enum Command {
         job_id: u64,
         /// What to change about the previous round's work
         feedback: String,
-        /// The repository the job belongs to. Defaults to the enclosing one.
+        /// The repository whose jobs to look at. Defaults to the enclosing one.
         #[arg(long)]
         repo: Option<PathBuf>,
         #[command(flatten)]
@@ -58,7 +63,7 @@ pub enum Command {
     Status {
         /// Defaults to the most recent job
         job_id: Option<u64>,
-        /// The repository to look in. Defaults to the enclosing one.
+        /// The repository whose jobs to look at. Defaults to the enclosing one.
         #[arg(long)]
         repo: Option<PathBuf>,
     },
@@ -69,7 +74,7 @@ pub enum Command {
         /// Follow the log as it grows
         #[arg(short, long)]
         follow: bool,
-        /// The repository the job belongs to. Defaults to the enclosing one.
+        /// The repository whose jobs to look at. Defaults to the enclosing one.
         #[arg(long)]
         repo: Option<PathBuf>,
     },

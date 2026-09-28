@@ -10,10 +10,6 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Where a repository declares its factory settings.
-///
-/// Until a later milestone moves job state out of the repository entirely,
-/// a repository that commits this file must also ignore `.assembly/jobs/`
-/// itself — nothing else does that for it.
 pub const REPO_CONFIG_PATH: &str = ".assembly/config.toml";
 
 /// A setting that makes a repository unrunnable as it stands.

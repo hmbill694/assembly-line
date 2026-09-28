@@ -1,6 +1,7 @@
 use assembly_line::cli::{Cli, Command, RunnerArgs, RunnerKind};
 use assembly_line::frame::FrameWriter;
 use assembly_line::lifecycle::{self, Note, Prepared, Refusal, RevisionRequest, StartRequest};
+use assembly_line::paths;
 use assembly_line::payload::RoundPayload;
 use assembly_line::round::{Verdict, run_round};
 use assembly_line::runner::docker::DockerRunner;
@@ -8,7 +9,7 @@ use assembly_line::runner::kubernetes::KubernetesRunner;
 use assembly_line::runner::local::LocalRunner;
 use assembly_line::runner::{self, Runner};
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tokio_util::sync::CancellationToken;
 
@@ -20,16 +21,26 @@ const EXIT_ROUND_FAILED: u8 = 1;
 fn main() -> ExitCode {
     install_tracing();
 
-    match Cli::parse().command {
-        Command::Run {
-            prompt,
-            prompt_file,
-            repo,
-            base_ref,
-            provider,
+    let cli = Cli::parse();
+    let root = paths::state_root(cli.root, |name| std::env::var(name).ok());
+    // `job-exec` keeps no state, so a round inside a container with no
+    // `$HOME` still runs.
+    match (cli.command, root) {
+        (Command::JobExec, _) => in_async_runtime(execute_payload_from_environment()),
+        (_, Err(e)) => fail_with_usage_error(e),
+        (
+            Command::Run {
+                prompt,
+                prompt_file,
+                repo,
+                base_ref,
+                provider,
+                runner,
+            },
+            Ok(root),
+        ) => in_async_runtime(run_work_on_chosen_runner(
             runner,
-        } => in_async_runtime(run_work_on_chosen_runner(
-            runner,
+            &root,
             Work::Start(StartRequest {
                 prompt,
                 prompt_file,
@@ -38,26 +49,34 @@ fn main() -> ExitCode {
                 provider,
             }),
         )),
-        Command::Revise {
-            job_id,
-            feedback,
-            repo,
+        (
+            Command::Revise {
+                job_id,
+                feedback,
+                repo,
+                runner,
+            },
+            Ok(root),
+        ) => in_async_runtime(run_work_on_chosen_runner(
             runner,
-        } => in_async_runtime(run_work_on_chosen_runner(
-            runner,
+            &root,
             Work::Revise(RevisionRequest {
                 job_id,
                 feedback,
                 repo,
             }),
         )),
-        Command::Status { job_id, repo } => print_job_status(job_id, repo),
-        Command::Logs {
-            job_id,
-            follow,
-            repo,
-        } => print_job_log(job_id, follow, repo),
-        Command::JobExec => in_async_runtime(execute_payload_from_environment()),
+        (Command::Status { job_id, repo }, Ok(root)) => {
+            in_async_runtime(print_job_status(&root, job_id, repo))
+        }
+        (
+            Command::Logs {
+                job_id,
+                follow,
+                repo,
+            },
+            Ok(root),
+        ) => in_async_runtime(print_job_log(&root, job_id, follow, repo)),
     }
 }
 
@@ -121,7 +140,11 @@ enum Work {
 
 /// The one place flags become a concrete runner; everything after it is
 /// generic over [`Runner`].
-async fn run_work_on_chosen_runner(args: RunnerArgs, work: Work) -> Result<ExitCode, String> {
+async fn run_work_on_chosen_runner(
+    args: RunnerArgs,
+    root: &Path,
+    work: Work,
+) -> Result<ExitCode, String> {
     if let Some(inapplicable) = args.inapplicable_flags() {
         return Err(inapplicable.to_string());
     }
@@ -130,13 +153,14 @@ async fn run_work_on_chosen_runner(args: RunnerArgs, work: Work) -> Result<ExitC
             run_work(
                 &LocalRunner::current_binary().map_err(|e| e.to_string())?,
                 &[],
+                root,
                 work,
             )
             .await
         }
         RunnerKind::Docker => {
             let image = args.image.unwrap_or_else(runner::published_image);
-            run_work(&DockerRunner::new(image), &args.pass_env, work).await
+            run_work(&DockerRunner::new(image), &args.pass_env, root, work).await
         }
         RunnerKind::K8s => {
             let image = args.image.unwrap_or_else(runner::published_image);
@@ -146,6 +170,7 @@ async fn run_work_on_chosen_runner(args: RunnerArgs, work: Work) -> Result<ExitC
             run_work(
                 &KubernetesRunner::new(image, namespace, args.context),
                 &args.pass_env,
+                root,
                 work,
             )
             .await
@@ -156,11 +181,12 @@ async fn run_work_on_chosen_runner(args: RunnerArgs, work: Work) -> Result<ExitC
 async fn run_work<R: Runner>(
     runner: &R,
     pass_env: &[String],
+    root: &Path,
     work: Work,
 ) -> Result<ExitCode, String> {
     let Prepared { notes, round } = match work {
-        Work::Start(request) => lifecycle::prepare_start(runner, pass_env, request).await,
-        Work::Revise(request) => lifecycle::prepare_revision(runner, pass_env, request).await,
+        Work::Start(request) => lifecycle::prepare_start(runner, pass_env, root, request).await,
+        Work::Revise(request) => lifecycle::prepare_revision(runner, pass_env, root, request).await,
     };
     notes.iter().for_each(|note| match note {
         Note::LocalRefDiffers { .. } => println!("{note}"),
@@ -228,42 +254,45 @@ fn exit_code_for(verdict: Verdict) -> ExitCode {
     }
 }
 
-fn print_job_status(job_id: Option<u64>, repo: Option<PathBuf>) -> ExitCode {
-    match lifecycle::report_for_job(job_id, repo) {
-        Ok(report) => {
-            report
-                .to_status_lines()
-                .iter()
-                .for_each(|line| println!("{line}"));
-            ExitCode::SUCCESS
-        }
-        Err(e) => fail_with_usage_error(e),
-    }
+async fn print_job_status(
+    root: &Path,
+    job_id: Option<u64>,
+    repo: Option<PathBuf>,
+) -> Result<ExitCode, String> {
+    let report = lifecycle::report_for_job(root, job_id, repo)
+        .await
+        .map_err(|e| e.to_string())?;
+    report
+        .to_status_lines()
+        .iter()
+        .for_each(|line| println!("{line}"));
+    Ok(ExitCode::SUCCESS)
 }
 
-fn print_job_log(job_id: u64, follow: bool, repo: Option<PathBuf>) -> ExitCode {
-    let path = match lifecycle::output_log_of(job_id, repo) {
-        Ok(path) => path,
-        Err(e) => return fail_with_usage_error(e),
-    };
+async fn print_job_log(
+    root: &Path,
+    job_id: u64,
+    follow: bool,
+    repo: Option<PathBuf>,
+) -> Result<ExitCode, String> {
+    let path = lifecycle::output_log_of(root, job_id, repo)
+        .await
+        .map_err(|e| e.to_string())?;
 
     match follow {
         // Delegated to `tail` rather than reimplemented; a machine without it
         // gets the spawn error.
-        true => match std::process::Command::new("tail")
+        true => std::process::Command::new("tail")
             .arg("-f")
             .arg(&path)
             .status()
-        {
-            Ok(_) => ExitCode::SUCCESS,
-            Err(e) => fail_with_usage_error(e),
-        },
-        false => match std::fs::read_to_string(&path) {
-            Ok(body) => {
+            .map(|_| ExitCode::SUCCESS)
+            .map_err(|e| e.to_string()),
+        false => std::fs::read_to_string(&path)
+            .map(|body| {
                 print!("{body}");
                 ExitCode::SUCCESS
-            }
-            Err(e) => fail_with_usage_error(e),
-        },
+            })
+            .map_err(|e| e.to_string()),
     }
 }

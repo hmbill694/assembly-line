@@ -1,5 +1,6 @@
 use assembly_line::cli::{Cli, Command as Subcommand, InapplicableFlags};
 use assembly_line::config::REPO_CONFIG_PATH;
+use assembly_line::paths::RepoKey;
 use assert_cmd::Command;
 use clap::Parser;
 use predicates::prelude::PredicateBooleanExt;
@@ -11,7 +12,8 @@ mod support;
 fn assembly(tmp: &tempfile::TempDir) -> Command {
     let mut cmd = Command::cargo_bin("assembly").unwrap();
     cmd.current_dir(tmp.path())
-        .env("PATH", support::path_where_gh_refuses());
+        .env("PATH", support::path_where_gh_refuses())
+        .env("ASSEMBLY_ROOT", root_for(tmp));
     cmd
 }
 
@@ -35,6 +37,23 @@ fn origin_for(tmp: &tempfile::TempDir) -> std::path::PathBuf {
         "assembly-test-origin-{}",
         tmp.path().file_name().unwrap().to_string_lossy()
     ))
+}
+
+/// Where this test's job state lives: outside the repository, which a job
+/// must leave untouched.
+fn root_for(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "assembly-test-root-{}",
+        tmp.path().file_name().unwrap().to_string_lossy()
+    ))
+}
+
+/// Job `id`'s directory under this test's root.
+fn job_dir(tmp: &tempfile::TempDir, id: u64) -> std::path::PathBuf {
+    RepoKey::from_remote_url(origin_for(tmp).to_str().unwrap())
+        .unwrap()
+        .jobs_dir(&root_for(tmp))
+        .join(id.to_string())
 }
 
 /// `git` run against this test's remote, which is where a job's branch lives.
@@ -73,10 +92,11 @@ async fn repo_opted_in_with(config: &str) -> tempfile::TempDir {
     tmp
 }
 
-/// The bare remote outlives the tempdir, so a test that makes one has to take
-/// it with it.
-fn discard_origin(tmp: &tempfile::TempDir) {
+/// The bare remote and the state root outlive the tempdir, so a test that
+/// makes them has to take them with it.
+fn discard_outside_state(tmp: &tempfile::TempDir) {
     let _ = std::fs::remove_dir_all(origin_for(tmp));
+    let _ = std::fs::remove_dir_all(root_for(tmp));
 }
 
 #[tokio::test]
@@ -89,10 +109,9 @@ async fn run_exits_zero_and_records_the_job() {
         .success()
         .stdout(contains("job 1: passed"));
 
-    assert!(tmp.path().join(".assembly/jobs/1/events.jsonl").is_file());
-    assert!(tmp.path().join(".assembly/jobs/1/meta.json").is_file());
+    assert!(job_dir(&tmp, 1).join("events.jsonl").is_file());
 
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }
 
 #[tokio::test]
@@ -111,7 +130,7 @@ async fn run_exits_one_when_the_agent_fails_but_still_leaves_the_branch() {
         40
     );
 
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }
 
 /// End to end, for the rule `claim::claim_job` owns.
@@ -119,7 +138,7 @@ async fn run_exits_one_when_the_agent_fails_but_still_leaves_the_branch() {
 async fn a_job_id_already_taken_on_the_remote_is_skipped() {
     let tmp = repo_running("fake-agent.sh").await;
     // Pushed from elsewhere, and not a commit this job would fast-forward:
-    // nothing about it exists under `.assembly/jobs`.
+    // nothing about it exists under the root.
     let elsewhere = git(
         &tmp,
         &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "theirs"],
@@ -150,9 +169,9 @@ async fn a_job_id_already_taken_on_the_remote_is_skipped() {
         git_on_origin(&tmp, &["rev-parse", "--verify", "-q", "al/job-2"]).len(),
         40
     );
-    assert!(tmp.path().join(".assembly/jobs/2/events.jsonl").is_file());
+    assert!(job_dir(&tmp, 2).join("events.jsonl").is_file());
 
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }
 
 /// A merged pull request's branch is often deleted, which frees its id on
@@ -165,15 +184,15 @@ async fn a_job_whose_branch_was_deleted_keeps_its_directory_to_itself() {
         .assert()
         .success();
     git_on_origin(&tmp, &["branch", "-D", "al/job-1"]);
-    let meta = tmp.path().join(".assembly/jobs/1/meta.json");
-    let first_meta = std::fs::read_to_string(&meta).unwrap();
+    let events = job_dir(&tmp, 1).join("events.jsonl");
+    let first_events = std::fs::read_to_string(&events).unwrap();
 
     assembly(&tmp)
         .args(["run", "--prompt", "second job"])
         .assert()
         .failure()
         .stderr(contains("still holds that job").and(contains("run again")));
-    assert_eq!(std::fs::read_to_string(&meta).unwrap(), first_meta);
+    assert_eq!(std::fs::read_to_string(&events).unwrap(), first_events);
 
     assembly(&tmp)
         .args(["run", "--prompt", "second job"])
@@ -181,7 +200,7 @@ async fn a_job_whose_branch_was_deleted_keeps_its_directory_to_itself() {
         .success()
         .stdout(contains("job 2: passed"));
 
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }
 
 #[tokio::test]
@@ -199,7 +218,7 @@ async fn revising_a_job_whose_branch_was_deleted_says_there_is_nothing_to_revise
         .code(2)
         .stderr(contains("job 1 has no branch on 'origin'").and(contains("nothing to revise")));
 
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }
 
 #[tokio::test]
@@ -214,11 +233,11 @@ async fn a_repository_that_has_not_opted_in_is_told_which_file_to_write() {
         .stderr(contains(".assembly/config.toml"));
 
     assert!(
-        !tmp.path().join(".assembly/jobs/1").exists(),
+        !job_dir(&tmp, 1).exists(),
         "a repository that cannot run should not allocate a job directory"
     );
 
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }
 
 /// A job clones from the remote and pushes back to it, so a repository
@@ -255,7 +274,7 @@ async fn a_job_whose_round_changed_nothing_can_still_be_revised() {
         .assert()
         .success();
 
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }
 
 #[tokio::test]
@@ -268,9 +287,9 @@ async fn an_undeclared_provider_is_rejected_before_a_job_directory_is_allocated(
         .code(2)
         .stderr(contains("ghost").and(contains("add a block for it")));
 
-    assert!(!tmp.path().join(".assembly/jobs/1").exists());
+    assert!(!job_dir(&tmp, 1).exists());
 
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }
 
 #[tokio::test]
@@ -280,6 +299,7 @@ async fn run_outside_a_git_repo_explains_itself() {
     Command::cargo_bin("assembly")
         .unwrap()
         .current_dir(tmp.path())
+        .env("ASSEMBLY_ROOT", tmp.path().join("root"))
         .args(["run", "--prompt", "x"])
         .assert()
         .code(2)
@@ -292,7 +312,7 @@ async fn a_run_with_no_prompt_at_all_is_a_usage_error() {
 
     assembly(&tmp).arg("run").assert().code(2);
 
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }
 
 #[tokio::test]
@@ -308,7 +328,7 @@ async fn a_prompt_can_come_from_a_file_instead() {
     let on_branch = git_on_origin(&tmp, &["show", "al/job-1:agent-output.txt"]);
     assert!(on_branch.contains("Implement auth"), "{on_branch}");
 
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }
 
 #[tokio::test]
@@ -321,9 +341,9 @@ async fn a_missing_prompt_file_is_reported_before_the_job_starts() {
         .code(2)
         .stderr(contains("gone.md"));
 
-    assert!(!tmp.path().join(".assembly/jobs/1").exists());
+    assert!(!job_dir(&tmp, 1).exists());
 
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }
 
 #[tokio::test]
@@ -351,7 +371,7 @@ async fn status_and_logs_report_a_finished_job() {
         .success()
         .stdout(contains("giving up"));
 
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }
 
 /// The token is for the container runners, which have no credentials of
@@ -374,7 +394,7 @@ async fn the_local_runner_keeps_the_hosts_credentials_even_with_a_token_exported
         .stdout(contains("helpers:"))
         .stdout(contains("x-access-token").not());
 
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }
 
 /// Every command resolves the repository the same way, so a job started with
@@ -385,48 +405,48 @@ async fn a_job_started_elsewhere_is_found_by_pointing_the_read_commands_at_it() 
     let target = repo_running("fake-agent.sh").await;
     let standing_in = support::repo_with_initial_commit().await;
     let at = target.path().to_str().unwrap().to_string();
+    let assembly_standing_in = || {
+        let mut cmd = assembly(&standing_in);
+        cmd.env("ASSEMBLY_ROOT", root_for(&target));
+        cmd
+    };
 
-    assembly(&standing_in)
+    assembly_standing_in()
         .args(["run", "--repo", &at, "--prompt", "x"])
         .assert()
         .success();
 
-    // The state went to the repository named, not to the one we stood in.
-    assert!(
-        target
-            .path()
-            .join(".assembly/jobs/1/events.jsonl")
-            .is_file()
-    );
+    // The state is keyed by the repository named, not the one we stood in.
+    assert!(job_dir(&target, 1).join("events.jsonl").is_file());
     assert!(!standing_in.path().join(".assembly").exists());
 
-    // Without --repo the job is invisible from here...
-    assembly(&standing_in)
+    // Without --repo the job is out of reach from here...
+    assembly_standing_in()
         .arg("status")
         .assert()
         .code(2)
-        .stderr(contains("no jobs yet"));
+        .stderr(contains("no 'origin' remote"));
 
     // ...and found with it.
-    assembly(&standing_in)
+    assembly_standing_in()
         .args(["status", "--repo", &at])
         .assert()
         .success()
         .stdout(contains("job 1: passed"));
 
-    assembly(&standing_in)
+    assembly_standing_in()
         .args(["logs", "1", "--repo", &at])
         .assert()
         .success()
         .stdout(contains("fake-agent"));
 
-    assembly(&standing_in)
+    assembly_standing_in()
         .args(["revise", "1", "do it again", "--repo", &at])
         .assert()
         .success()
         .stdout(contains("round 2"));
 
-    discard_origin(&target);
+    discard_outside_state(&target);
 }
 
 /// A global `pushInsteadOf` — fetch over one transport, push over another —
@@ -463,7 +483,7 @@ async fn a_global_push_rewrite_is_followed_rather_than_refused() {
         "the job's push did not follow the rewrite"
     );
 
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }
 
 /// `--ref` decides what the job is cut from; with none, the checked-out
@@ -501,7 +521,7 @@ async fn a_job_branches_from_the_ref_it_is_given() {
         "the default base ref is not the checked-out branch"
     );
 
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }
 
 #[tokio::test]
@@ -515,7 +535,7 @@ async fn a_detached_head_is_asked_to_name_its_ref() {
         .code(2)
         .stderr(contains("--ref"));
 
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }
 
 #[tokio::test]
@@ -530,27 +550,35 @@ async fn unpushed_local_work_is_pointed_out_and_the_remotes_ref_is_used() {
         .success()
         .stdout(contains("push first"));
 
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }
 
 #[tokio::test]
 async fn status_with_no_jobs_explains_itself() {
     let tmp = support::repo_with_initial_commit().await;
+    publish_to_origin(&tmp).await;
+
     assembly(&tmp)
         .arg("status")
         .assert()
         .code(2)
         .stderr(contains("no jobs yet"));
+
+    discard_outside_state(&tmp);
 }
 
 #[tokio::test]
 async fn logs_for_an_unknown_job_explains_itself() {
     let tmp = support::repo_with_initial_commit().await;
+    publish_to_origin(&tmp).await;
+
     assembly(&tmp)
         .args(["logs", "42"])
         .assert()
         .code(2)
         .stderr(contains("no such job: 42"));
+
+    discard_outside_state(&tmp);
 }
 
 /// The heart of the stateless design: a revise is a new job, and the agent
@@ -589,7 +617,7 @@ async fn a_revise_round_continues_the_branch_instead_of_starting_over() {
         "round 2 never saw the feedback: {body}"
     );
 
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }
 
 /// Feedback is a required argument — clap refuses the invocation before
@@ -600,11 +628,11 @@ async fn revise_without_feedback_is_a_usage_error() {
 
     assembly(&tmp).args(["revise", "1"]).assert().code(2);
 
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }
 
 #[tokio::test]
-async fn a_job_writes_nothing_outside_dot_assembly_in_the_target_repository() {
+async fn a_job_writes_nothing_to_the_target_repositorys_working_tree() {
     let tmp = repo_running("fake-agent.sh").await;
     let before = git(&tmp, &["rev-parse", "HEAD"]);
 
@@ -614,22 +642,12 @@ async fn a_job_writes_nothing_outside_dot_assembly_in_the_target_repository() {
         .success();
 
     assert_eq!(before, git(&tmp, &["rev-parse", "HEAD"]), "HEAD moved");
+    // Full porcelain, untracked files included: nothing a job does may show
+    // up here, `.assembly/` included — its state lives under the root.
+    assert_eq!(git(&tmp, &["status", "--porcelain"]), "");
+    assert!(job_dir(&tmp, 1).join("events.jsonl").is_file());
 
-    // Full porcelain, untracked files included: job state legitimately lands
-    // under `.assembly/` (until a later milestone moves it out of the repo
-    // entirely), but nothing else in the working tree may change — tracked
-    // or not. `--untracked-files=no` would blind this to exactly the files
-    // the binary just wrote.
-    let status = git(&tmp, &["status", "--porcelain"]);
-    let stray: Vec<&str> = status
-        .lines()
-        .filter(|line| !line[3..].starts_with(".assembly/"))
-        .collect();
-    assert!(stray.is_empty(), "wrote outside .assembly/: {stray:?}");
-
-    assert!(!tmp.path().join("agent-output.txt").exists());
-
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }
 
 #[tokio::test]
@@ -640,7 +658,7 @@ async fn container_flags_are_refused_for_the_local_runner() {
         .assert()
         .code(2)
         .stderr(contains("container runners"));
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }
 
 /// The docker runner through the real binary, with a fake `docker` first on
@@ -670,8 +688,8 @@ async fn docker_preflight_reports_every_problem_before_allocating() {
         .stderr(contains("$ASSEMBLY_GIT_TOKEN is not set"))
         .stderr(contains("is a path on this machine"));
 
-    assert!(!tmp.path().join(".assembly/jobs/1").exists());
-    discard_origin(&tmp);
+    assert!(!job_dir(&tmp, 1).exists());
+    discard_outside_state(&tmp);
 }
 
 /// The test origin is a directory on this machine: fine for the local
@@ -710,8 +728,8 @@ async fn a_remote_that_is_a_local_path_is_refused_for_a_container_runner() {
         .stderr(contains("is a path on this machine").and(contains("--runner local")))
         .stderr(contains("--pass-env ASSEMBLY_JOB").and(contains("drop it")));
 
-    assert!(!tmp.path().join(".assembly/jobs/1").exists());
-    discard_origin(&tmp);
+    assert!(!job_dir(&tmp, 1).exists());
+    discard_outside_state(&tmp);
 }
 
 #[tokio::test]
@@ -722,7 +740,7 @@ async fn the_k8s_runner_requires_a_namespace() {
         .assert()
         .code(2)
         .stderr(contains("--namespace"));
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }
 
 #[tokio::test]
@@ -741,7 +759,7 @@ async fn a_namespace_is_refused_for_runners_that_have_none() {
         .assert()
         .code(2)
         .stderr(contains("k8s runner"));
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }
 
 fn inapplicable_flags_of(argv: &[&str]) -> Option<InapplicableFlags> {

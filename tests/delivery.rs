@@ -69,8 +69,18 @@ fn delivery_is_configurable_from_the_repositorys_own_config() {
 fn assembly(tmp: &tempfile::TempDir) -> Command {
     let mut cmd = Command::cargo_bin("assembly").unwrap();
     cmd.current_dir(tmp.path())
-        .env("PATH", support::path_where_gh_refuses());
+        .env("PATH", support::path_where_gh_refuses())
+        .env("ASSEMBLY_ROOT", root_for(tmp));
     cmd
+}
+
+/// Where this test's job state lives: outside the repository, which a job
+/// must leave untouched.
+fn root_for(tmp: &tempfile::TempDir) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "assembly-test-root-{}",
+        tmp.path().file_name().unwrap().to_string_lossy()
+    ))
 }
 
 /// Where this test's bare remote lives: outside the repository, so the
@@ -82,10 +92,11 @@ fn origin_for(tmp: &tempfile::TempDir) -> PathBuf {
     ))
 }
 
-/// The bare remote lives outside the tempdir, so a test that makes one has to
-/// take it with it.
-fn discard_origin(tmp: &tempfile::TempDir) {
+/// The bare remote and the state root live outside the tempdir, so a test
+/// that makes them has to take them with it.
+fn discard_outside_state(tmp: &tempfile::TempDir) {
     let _ = std::fs::remove_dir_all(origin_for(tmp));
+    let _ = std::fs::remove_dir_all(root_for(tmp));
 }
 
 /// A repository opted in with `verify` set to `verify`, running the given
@@ -163,7 +174,7 @@ async fn a_failed_round_is_not_delivered() {
         .code(1)
         .stdout(contains("not delivered"));
 
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }
 
 /// A passing revise round must deliver just as a passing `run` does. Both
@@ -201,7 +212,7 @@ async fn a_passing_revise_round_is_delivered() {
         "the remote's branch does not carry both rounds: {rounds}"
     );
 
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }
 
 /// `config.base` is consulted at exactly one place — `lifecycle::hand_off`
@@ -241,7 +252,7 @@ async fn configured_base_reaches_the_pull_request_and_the_divergence_is_reported
         "gh was not asked to deliver the job's own branch: {invocation}"
     );
 
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }
 
 /// `gh pr create --fill` works out a title from the branch's commits in the
@@ -270,5 +281,5 @@ async fn a_pull_request_is_titled_and_described_from_the_job_not_from_local_comm
     );
     assert!(!invocation.contains("--fill"), "{invocation}");
 
-    discard_origin(&tmp);
+    discard_outside_state(&tmp);
 }

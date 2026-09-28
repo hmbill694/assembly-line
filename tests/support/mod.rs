@@ -128,6 +128,8 @@ pub struct Harness {
     /// The bare remote the repository's `main` is published to, which every
     /// job clones from and pushes its branch back to.
     pub origin: PathBuf,
+    /// The state root this harness's jobs keep their state under.
+    pub root: PathBuf,
     runner: LocalRunner,
 }
 
@@ -157,9 +159,6 @@ impl Harness {
             .await
             .unwrap()
             .unwrap();
-        // Job state lives in the repository, and a test asserts its working
-        // tree stays clean, the way an opted-in repository's own ignore does.
-        std::fs::write(repo.join(".git/info/exclude"), ".assembly/jobs/\n").unwrap();
 
         let origin = tmp.path().join("origin.git");
         add_origin(&repo, &origin).await;
@@ -170,6 +169,7 @@ impl Harness {
             &tmp.path().join("assembly-bin"),
         );
         Harness {
+            root: tmp.path().join("root"),
             tmp,
             repo,
             origin,
@@ -203,22 +203,38 @@ impl Harness {
     /// A job directory outside the repository, for tests that drive a runner
     /// or `job-exec` directly rather than through the lifecycle.
     pub fn job_paths(&self) -> JobPaths {
-        let jobs_root = paths::jobs_root(self.tmp.path());
-        paths::open_job(&jobs_root, THE_JOB.into())
-            .or_else(|_| paths::create_job(&jobs_root, THE_JOB.into()))
+        let jobs_dir = self.tmp.path().join("jobs");
+        paths::open_job(&jobs_dir, THE_JOB.into())
+            .or_else(|_| paths::create_job(&jobs_dir, THE_JOB.into()))
             .unwrap()
     }
 
     /// Run one job against this repository, with `prompt`, from `main`.
     pub async fn run_job(&self, prompt: &str) -> Outcome {
-        self.run(prepare_start(&self.runner, &[], self.start(prompt, None, None)).await)
-            .await
+        self.run(
+            prepare_start(
+                &self.runner,
+                &[],
+                &self.root,
+                self.start(prompt, None, None),
+            )
+            .await,
+        )
+        .await
     }
 
     /// Run one job cut from a named ref rather than `main`.
     pub async fn run_job_from(&self, prompt: &str, base_ref: &str) -> Outcome {
-        self.run(prepare_start(&self.runner, &[], self.start(prompt, None, Some(base_ref))).await)
-            .await
+        self.run(
+            prepare_start(
+                &self.runner,
+                &[],
+                &self.root,
+                self.start(prompt, None, Some(base_ref)),
+            )
+            .await,
+        )
+        .await
     }
 
     /// Another round on job `job_id`, continuing its branch.
@@ -228,14 +244,20 @@ impl Harness {
             feedback: feedback.to_string(),
             repo: Some(self.repo.clone()),
         };
-        self.run(prepare_revision(&self.runner, &[], request).await)
+        self.run(prepare_revision(&self.runner, &[], &self.root, request).await)
             .await
     }
 
     /// Why a job with `provider` would not start: the refusals that stop a
     /// job before it has a directory, as distinct from a job that failed.
     pub async fn refusal_to_start(&self, prompt: &str, provider: Option<&str>) -> Refusal {
-        let prepared = prepare_start(&self.runner, &[], self.start(prompt, provider, None)).await;
+        let prepared = prepare_start(
+            &self.runner,
+            &[],
+            &self.root,
+            self.start(prompt, provider, None),
+        )
+        .await;
         match prepared.round {
             Ok(_) => panic!("the job was ready to run, not refused"),
             Err(refusal) => refusal,
