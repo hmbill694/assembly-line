@@ -271,12 +271,12 @@ Where a type owns a sink or source, make it generic with a sensible default
   stay pure. Anything that cannot be reconstructed from `events.jsonl` does
   not belong in `JobState` or `JobReport`.
 - Job ids are never user input, so there is nothing to validate. A job's id is
-  a `u64` that `paths::next_job_id` allocates one past the max of both the
+  a `JobId` that `paths::next_job_id` allocates one past the max of both the
   existing job directories and the remote's `al/job-*` branches — job
   branches are shared on the remote, so a second clone, a teammate, or a
   deleted `.assembly/jobs` must not restart at 1 and push onto a branch
   somebody else already published. Its branch name is derived
-  from that id alone (`al/job-{id}`, `workspace::job_branch_name`) — always a
+  from that id alone (`al/job-{id}`, `JobId::branch_name` in `src/job.rs`) — always a
   well-formed git ref, with no pattern check needed because nothing
   user-authored ever reaches it.
 - The target repository's working tree is never modified beyond

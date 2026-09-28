@@ -1,3 +1,4 @@
+use assembly_line::job::JobId;
 use assembly_line::paths::{
     JobMeta, create_job, git_root, job_id_past, jobs_root, latest_job_id, next_job_id, open_job,
     read_meta, write_meta,
@@ -27,16 +28,16 @@ fn allocates_monotonic_job_ids() {
     let tmp = tempfile::tempdir().unwrap();
     let root = jobs_root(tmp.path());
 
-    assert_eq!(next_job_id(&root, &[]).unwrap(), 1);
+    assert_eq!(next_job_id(&root, &[]).unwrap(), JobId::from(1));
     assert_eq!(latest_job_id(&root).unwrap(), None);
 
-    create_job(&root, 1).unwrap();
-    assert_eq!(next_job_id(&root, &[]).unwrap(), 2);
-    assert_eq!(latest_job_id(&root).unwrap(), Some(1));
+    create_job(&root, JobId::from(1)).unwrap();
+    assert_eq!(next_job_id(&root, &[]).unwrap(), JobId::from(2));
+    assert_eq!(latest_job_id(&root).unwrap(), Some(JobId::from(1)));
 
-    create_job(&root, 2).unwrap();
-    assert_eq!(next_job_id(&root, &[]).unwrap(), 3);
-    assert_eq!(latest_job_id(&root).unwrap(), Some(2));
+    create_job(&root, JobId::from(2)).unwrap();
+    assert_eq!(next_job_id(&root, &[]).unwrap(), JobId::from(3));
+    assert_eq!(latest_job_id(&root).unwrap(), Some(JobId::from(2)));
 }
 
 #[test]
@@ -44,8 +45,8 @@ fn ignores_non_numeric_directories_when_allocating() {
     let tmp = tempfile::tempdir().unwrap();
     let root = jobs_root(tmp.path());
     fs::create_dir_all(root.join("scratch")).unwrap();
-    create_job(&root, 7).unwrap();
-    assert_eq!(next_job_id(&root, &[]).unwrap(), 8);
+    create_job(&root, JobId::from(7)).unwrap();
+    assert_eq!(next_job_id(&root, &[]).unwrap(), JobId::from(8));
 }
 
 /// Job branches are shared on the remote, so a fresh clone — or a deleted
@@ -53,9 +54,12 @@ fn ignores_non_numeric_directories_when_allocating() {
 #[test]
 fn a_new_job_id_is_past_the_remotes_job_branches_too() {
     let remote = ["al/job-4".to_string(), "al/job-12".to_string()];
-    assert_eq!(job_id_past([], &remote), Some(13));
-    assert_eq!(job_id_past([20], &remote), Some(21));
-    assert_eq!(job_id_past([], &[]), Some(1));
+    assert_eq!(job_id_past([], &remote), Some(JobId::from(13)));
+    assert_eq!(
+        job_id_past([JobId::from(20)], &remote),
+        Some(JobId::from(21))
+    );
+    assert_eq!(job_id_past([], &[]), Some(JobId::from(1)));
 }
 
 /// Anyone who can push can make a branch at the very last id; that is a
@@ -78,44 +82,51 @@ fn branches_that_are_not_a_jobs_are_ignored_when_allocating() {
         "al/jobs-9".to_string(),
         "feature/al/job-50".to_string(),
     ];
-    assert_eq!(job_id_past([2], &remote), Some(3));
+    assert_eq!(job_id_past([JobId::from(2)], &remote), Some(JobId::from(3)));
 }
 
 #[test]
 fn the_jobs_directory_and_the_remote_together_decide_the_next_id() {
     let tmp = tempfile::tempdir().unwrap();
     let root = jobs_root(tmp.path());
-    create_job(&root, 3).unwrap();
+    create_job(&root, JobId::from(3)).unwrap();
 
-    assert_eq!(next_job_id(&root, &["al/job-5".to_string()]).unwrap(), 6);
-    assert_eq!(next_job_id(&root, &["al/job-1".to_string()]).unwrap(), 4);
+    assert_eq!(
+        next_job_id(&root, &["al/job-5".to_string()]).unwrap(),
+        JobId::from(6)
+    );
+    assert_eq!(
+        next_job_id(&root, &["al/job-1".to_string()]).unwrap(),
+        JobId::from(4)
+    );
 }
 
 #[test]
 fn create_job_lays_out_the_directory() {
     let tmp = tempfile::tempdir().unwrap();
     let root = jobs_root(tmp.path());
-    let p = create_job(&root, 42).unwrap();
+    let p = create_job(&root, JobId::from(42)).unwrap();
 
-    assert_eq!(p.id, 42);
+    assert_eq!(p.id, JobId::from(42));
+    assert_eq!(p.dir, root.join("42"));
     assert!(p.dir.is_dir());
     assert_eq!(p.events(), p.dir.join("events.jsonl"));
     assert_eq!(p.meta(), p.dir.join("meta.json"));
     assert_eq!(p.log(), p.dir.join("job.log"), "one job, one log");
 
-    assert_eq!(open_job(&root, 42).unwrap().dir, p.dir);
+    assert_eq!(open_job(&root, JobId::from(42)).unwrap().dir, p.dir);
 }
 
 #[test]
 fn open_job_fails_for_a_missing_job() {
     let tmp = tempfile::tempdir().unwrap();
-    assert!(open_job(&jobs_root(tmp.path()), 99).is_err());
+    assert!(open_job(&jobs_root(tmp.path()), JobId::from(99)).is_err());
 }
 
 #[test]
 fn meta_round_trips() {
     let tmp = tempfile::tempdir().unwrap();
-    let p = create_job(&jobs_root(tmp.path()), 1).unwrap();
+    let p = create_job(&jobs_root(tmp.path()), JobId::from(1)).unwrap();
     write_meta(
         &p,
         &JobMeta {
@@ -139,7 +150,7 @@ fn meta_round_trips() {
 #[test]
 fn meta_written_by_an_older_version_still_loads() {
     let tmp = tempfile::tempdir().unwrap();
-    let job = create_job(&jobs_root(tmp.path()), 1).unwrap();
+    let job = create_job(&jobs_root(tmp.path()), JobId::from(1)).unwrap();
     fs::write(
         job.meta(),
         r#"{"repo":"/work/acme","base_ref":"main","prompt":"go","provider":"claude","branch":"al/job-1"}"#,

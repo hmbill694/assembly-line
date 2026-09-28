@@ -19,7 +19,7 @@ mod support;
 /// A payload whose only meaningful field is its command limit.
 fn payload_with_command_limit(command_limit_secs: Option<u64>) -> RoundPayload {
     RoundPayload {
-        job_id: 1,
+        job_id: 1.into(),
         round: 1,
         remote_url: "remote-url".into(),
         remote_name: "origin".into(),

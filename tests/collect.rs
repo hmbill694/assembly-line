@@ -32,7 +32,7 @@ async fn a_round_run_by_job_exec_is_collected_into_the_same_log_as_before() {
     assert!(verdict.passed());
     let events = EventLog::read(paths.events()).unwrap();
     assert_eq!(
-        JobReport::from_events(paths.id, &events).state,
+        JobReport::from_events(paths.id.into(), &events).state,
         JobState::Passed
     );
     assert!(

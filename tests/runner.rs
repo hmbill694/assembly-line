@@ -312,7 +312,7 @@ async fn every_reason_a_container_runner_cannot_run_is_reported_at_once() {
 /// A payload as the host builds it, cloning from `remote_url`.
 fn payload_cloning(remote_url: &str) -> RoundPayload {
     RoundPayload {
-        job_id: 1,
+        job_id: 1.into(),
         round: 1,
         remote_url: remote_url.into(),
         remote_name: "origin".into(),

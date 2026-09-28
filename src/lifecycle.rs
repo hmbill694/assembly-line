@@ -10,6 +10,7 @@ use crate::config::{self, ConfigError, RepoConfig, Warning};
 use crate::delivery::{self, Delivered, PullRequestText};
 use crate::event::{Event, EventLog};
 use crate::git::{self, PinnedRef};
+use crate::job::JobId;
 use crate::paths::{self, JobMeta, JobPaths};
 use crate::payload::{self, RoundPayload, RoundRequest};
 use crate::report::JobReport;
@@ -17,7 +18,7 @@ use crate::round::Verdict;
 use crate::runner::{
     JobSecrets, Runner, RunnerProblem, payload_fitted_to, secrets_or_reasons_it_cannot_run,
 };
-use crate::workspace::{DEFAULT_REMOTE, JOB_BRANCH_PATTERN, job_branch_name};
+use crate::workspace::DEFAULT_REMOTE;
 use anyhow::anyhow;
 use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
@@ -263,16 +264,13 @@ pub async fn prepare_start<'r, R: Runner>(
         Ok(runnable) => runnable,
         Err(refusal) => return Prepared::refused(notes, refusal),
     };
-    let remote_job_branches = match git::remote_branches_matching(
-        &located.repo,
-        DEFAULT_REMOTE,
-        JOB_BRANCH_PATTERN,
-    )
-    .await
-    {
-        Ok(branches) => branches,
-        Err(e) => return Prepared::refused(notes, Refusal::Unpreparable(e)),
-    };
+    let remote_job_branches =
+        match git::remote_branches_matching(&located.repo, DEFAULT_REMOTE, JobId::BRANCH_PATTERN)
+            .await
+        {
+            Ok(branches) => branches,
+            Err(e) => return Prepared::refused(notes, Refusal::Unpreparable(e)),
+        };
     let secrets = match secrets_or_reasons_it_cannot_run(
         runner,
         &config.copy,
@@ -345,7 +343,7 @@ pub async fn prepare_revision<'r, R: Runner>(
             );
         }
     };
-    let round = JobReport::from_events(located.paths.id, &located.events).rounds + 1;
+    let round = JobReport::from_events(located.paths.id.into(), &located.events).rounds + 1;
     let round_prompt = payload::revised_prompt(&located.meta.prompt, &request.feedback);
 
     Prepared {
@@ -416,7 +414,7 @@ pub async fn run<R: Runner>(
 
     let report = events_of(&paths)
         .ok()
-        .map(|events| JobReport::from_events(paths.id, &events));
+        .map(|events| JobReport::from_events(paths.id.into(), &events));
     let branch = report.as_ref().and_then(|report| report.branch.clone());
     let handoff = hand_off(
         &meta.repo,
@@ -447,7 +445,7 @@ fn locate_job(job_id: Option<u64>, repo: Option<PathBuf>) -> anyhow::Result<(Job
     let jobs_root = paths::jobs_root(&repo_root);
 
     let id = match job_id {
-        Some(id) => id,
+        Some(id) => JobId::from(id),
         None => paths::latest_job_id(&jobs_root)?.ok_or_else(|| anyhow!("no jobs yet"))?,
     };
 
@@ -465,7 +463,7 @@ fn locate_job(job_id: Option<u64>, repo: Option<PathBuf>) -> anyhow::Result<(Job
 /// When the job cannot be found, or its event log cannot be read.
 pub fn report_for_job(job_id: Option<u64>, repo: Option<PathBuf>) -> anyhow::Result<JobReport> {
     let (paths, _) = locate_job(job_id, repo)?;
-    events_of(&paths).map(|events| JobReport::from_events(paths.id, &events))
+    events_of(&paths).map(|events| JobReport::from_events(paths.id.into(), &events))
 }
 
 /// Where job `job_id` in `repo` captured its output.
@@ -561,7 +559,7 @@ async fn locate_revision(job_id: u64, repo: Option<PathBuf>) -> anyhow::Result<R
 
     let remote_url = payload::remote_to_clone(&meta.repo, DEFAULT_REMOTE).await?;
     let base = git::pinned(&meta.repo, DEFAULT_REMOTE, &meta.base_ref).await?;
-    let tip = job_branch_tip(&meta.repo, job_id).await?;
+    let tip = job_branch_tip(&meta.repo, paths.id).await?;
     // `base`, not the job's own branch: the previous round is not allowed to
     // have changed the settings that govern this one.
     let declared = RepoConfig::from_ref(&meta.repo, &base.sha).await?;
@@ -703,8 +701,8 @@ async fn hand_off(
 /// A job whose earlier rounds committed nothing pushed nothing, so its branch
 /// is absent rather than unpushed, and "push it first" would be the wrong
 /// advice.
-async fn job_branch_tip(repo: &Path, job_id: u64) -> anyhow::Result<PinnedRef> {
-    let branch = job_branch_name(job_id);
+async fn job_branch_tip(repo: &Path, job_id: JobId) -> anyhow::Result<PinnedRef> {
+    let branch = job_id.branch_name();
     match git::pinned(repo, DEFAULT_REMOTE, &branch).await {
         Ok(tip) => Ok(tip),
         Err(e) => match git::remote_lacks_ref(repo, DEFAULT_REMOTE, &branch).await {

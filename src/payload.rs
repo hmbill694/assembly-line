@@ -7,8 +7,8 @@
 
 use crate::config::{ConfigError, RepoConfig, parse_duration};
 use crate::git::{self, PinnedRef};
+use crate::job::JobId;
 use crate::provider::{CommandSpec, render_command};
-use crate::workspace::job_branch_name;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -57,7 +57,7 @@ pub fn is_path_on_this_machine(url: &str) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoundPayload {
-    pub job_id: u64,
+    pub job_id: JobId,
     pub round: u32,
     /// Where the round clones from and pushes to.
     pub remote_url: String,
@@ -86,7 +86,7 @@ pub struct RoundPayload {
 /// What the host knows about a round before config has been applied to it.
 #[derive(Debug, Clone)]
 pub struct RoundRequest<'a> {
-    pub job_id: u64,
+    pub job_id: JobId,
     pub round: u32,
     pub prompt: &'a str,
     pub provider: &'a str,
@@ -124,7 +124,7 @@ impl RoundPayload {
             remote_url: request.remote_url,
             remote_name: request.remote_name.to_string(),
             start: request.start,
-            branch: job_branch_name(request.job_id),
+            branch: request.job_id.branch_name(),
             command: render_command(provider, request.prompt),
             commit_message: commit_message(request.job_id, request.prompt),
             verify: config.verify.clone(),
@@ -160,7 +160,7 @@ impl RoundPayload {
 
 /// A commit subject a human can scan in `git log`: the job, then the first
 /// non-blank line of what it was asked to do.
-fn commit_message(job_id: u64, prompt: &str) -> String {
+fn commit_message(job_id: JobId, prompt: &str) -> String {
     match prompt.lines().find(|line| !line.trim().is_empty()) {
         Some(first) => format!("job {job_id}: {}", first.trim()),
         None => format!("job {job_id}: agent work"),

@@ -33,26 +33,6 @@ pub const DEFAULT_REMOTE: &str = "origin";
 /// the repository itself calls that remote.
 const CLONE_REMOTE: &str = "origin";
 
-/// A job's branch name. Git refs are paths, so this must never nest under
-/// another ref assembly-line creates.
-#[must_use]
-pub fn job_branch_name(job_id: u64) -> String {
-    format!("al/job-{job_id}")
-}
-
-/// Matches every name [`job_branch_name`] makes, for asking a remote which
-/// jobs it already carries.
-pub const JOB_BRANCH_PATTERN: &str = "al/job-*";
-
-/// The job a branch name was made for by [`job_branch_name`], or `None` for
-/// any branch that is not a job's — including near misses like `al/job-007`,
-/// which that function never makes.
-#[must_use]
-pub fn job_id_from_branch_name(branch: &str) -> Option<u64> {
-    let id = branch.strip_prefix("al/job-")?.parse().ok()?;
-    (job_branch_name(id) == branch).then_some(id)
-}
-
 /// Clone `remote_url` into a fresh directory under `scratch_root`, with
 /// `branch` checked out at `start`, and seed it. A `credential_helper`
 /// authenticates both the clone and the eventual push.
