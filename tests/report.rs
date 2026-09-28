@@ -145,7 +145,7 @@ fn a_job_with_no_events_is_pending() {
     let report = JobReport::from_events(1, &[]);
 
     assert_eq!(report.state, JobState::Pending);
-    assert_eq!(report.rounds, 1);
+    assert_eq!(report.rounds, 0);
     assert!(report.duration.is_none());
     assert!(report.diff.is_none());
     assert!(report.branch.is_none());
@@ -318,7 +318,41 @@ fn the_summary_line_names_the_round_the_diff_and_the_reason() {
 fn the_summary_line_of_an_untouched_job_says_pending() {
     assert_eq!(
         JobReport::from_events(1, &[]).to_summary_line(),
-        "job 1: pending (round 1)"
+        "job 1: pending"
+    );
+}
+
+/// `run` numbers no rounds, so a report folded from its events alone has
+/// seen none — and must not claim round 1 of a job it may be revising.
+#[test]
+fn a_report_that_saw_no_round_start_names_no_round() {
+    let events = timeline(vec![(0, EventKind::RoundPassed)]);
+
+    assert_eq!(
+        JobReport::from_events(3, &events).to_summary_line(),
+        "job 3: passed"
+    );
+}
+
+#[test]
+fn a_job_reports_the_pull_request_it_opened() {
+    let events = timeline(vec![(
+        0,
+        EventKind::PullRequestOpened {
+            url: "https://github.com/o/r/pull/7".into(),
+        },
+    )]);
+
+    let report = JobReport::from_events(7, &events);
+
+    assert_eq!(
+        report.pull_request.as_deref(),
+        Some("https://github.com/o/r/pull/7")
+    );
+    assert!(
+        report
+            .to_status_lines()
+            .contains(&"pull request: https://github.com/o/r/pull/7".to_string())
     );
 }
 
@@ -351,7 +385,7 @@ fn status_of_a_finished_job_names_its_timing_and_branch() {
 fn status_of_an_untouched_job_is_its_summary_alone() {
     assert_eq!(
         JobReport::from_events(1, &[]).to_status_lines(),
-        ["job 1: pending (round 1)"]
+        ["job 1: pending"]
     );
 }
 

@@ -17,6 +17,7 @@ use crate::paths::{self, JobPaths, RepoKey};
 use crate::payload::{self, RoundPayload, RoundRequest};
 use crate::report::JobReport;
 use crate::round::Verdict;
+use crate::run::{BaseDiffers, prompt_text};
 use crate::runner::{
     JobSecrets, Runner, RunnerProblem, payload_fitted_to, secrets_or_reasons_it_cannot_run,
 };
@@ -229,26 +230,6 @@ pub enum Handoff {
         base_differs: Option<BaseDiffers>,
         delivered: Delivered,
     },
-}
-
-/// The pull request targets a different branch from the one the job was cut
-/// from, so its diff carries more than the job's work.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BaseDiffers {
-    pub base: String,
-    pub base_ref: String,
-}
-
-impl std::fmt::Display for BaseDiffers {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "this pull request will target '{}', but the job was cut from '{}' — review the \
-             diff before merging, since it carries everything separating the two, not just this \
-             job's work",
-            self.base, self.base_ref
-        )
-    }
 }
 
 impl RoundConclusion {
@@ -619,17 +600,6 @@ async fn locate_revision(
         tip,
         declared,
     })
-}
-
-fn prompt_text(prompt: Option<String>, prompt_file: Option<PathBuf>) -> anyhow::Result<String> {
-    match (prompt, prompt_file) {
-        (Some(text), _) => Ok(text),
-        (None, Some(path)) => {
-            std::fs::read_to_string(&path).map_err(|e| anyhow!("reading {}: {e}", path.display()))
-        }
-        // clap refuses this combination before we are reached.
-        (None, None) => Err(anyhow!("a job needs --prompt or --prompt-file")),
-    }
 }
 
 /// What a job is cut from when the command line does not say: the branch the

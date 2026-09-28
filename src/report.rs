@@ -34,7 +34,7 @@ pub struct JobReport {
     pub id: u64,
     pub state: JobState,
     /// How many rounds this job has had: the highest round any
-    /// `RoundStarted` records, and at least 1.
+    /// `RoundStarted` records; 0 when none does.
     pub rounds: u32,
     /// Wall time of the most recent round.
     pub duration: Option<Duration>,
@@ -56,6 +56,8 @@ pub struct JobReport {
     pub first_prompt: Option<String>,
     /// The provider its latest round was asked to use.
     pub provider: Option<String>,
+    /// The URL of the branch's pull request, once one is open.
+    pub pull_request: Option<String>,
 }
 
 /// A job's facts, accumulated as its event stream is folded.
@@ -72,6 +74,7 @@ struct JobProgress {
     base: Option<PinnedRef>,
     first_prompt: Option<String>,
     provider: Option<String>,
+    pull_request: Option<String>,
 }
 
 impl JobProgress {
@@ -116,6 +119,10 @@ impl JobProgress {
                 branch: Some(branch.clone()),
                 ..self
             },
+            EventKind::PullRequestOpened { url } => JobProgress {
+                pull_request: Some(url.clone()),
+                ..self
+            },
             // The `RoundFailed` that follows carries the reason, worded by
             // `round.rs`.
             EventKind::VerifyRejected { .. } => self,
@@ -142,7 +149,7 @@ impl JobProgress {
 impl JobReport {
     /// Fold a job's event stream into the account `status` prints.
     ///
-    /// A job with no events yet reports as `Pending` with one round, which is
+    /// A job with no events yet reports as `Pending` with no rounds, which is
     /// what a directory allocated but not yet run looks like.
     pub fn from_events<'a>(id: u64, events: impl IntoIterator<Item = &'a Event>) -> Self {
         let progress = events
@@ -152,7 +159,7 @@ impl JobReport {
         JobReport {
             id,
             state: progress.state,
-            rounds: progress.rounds.max(1),
+            rounds: progress.rounds,
             duration: progress.last_round_duration,
             diff: progress.committed_diff,
             detail: progress.detail,
@@ -161,24 +168,29 @@ impl JobReport {
             base: progress.base,
             first_prompt: progress.first_prompt,
             provider: progress.provider,
+            pull_request: progress.pull_request,
         }
     }
 
     /// The single line printed at the end of a round:
-    /// `job 7: failed (round 2, 3 files +40/-2) — verify failed`.
+    /// `job 7: failed (round 2, 3 files +40/-2) — verify failed`. A report
+    /// that saw no round start names no round.
     #[must_use]
     pub fn to_summary_line(&self) -> String {
-        let facts = [
-            Some(format!("round {}", self.rounds)),
+        let facts: Vec<String> = [
+            (self.rounds > 0).then(|| format!("round {}", self.rounds)),
             self.diff.map(|d| d.to_string()),
         ]
         .into_iter()
         .flatten()
-        .collect::<Vec<_>>()
-        .join(", ");
+        .collect();
+        let facts = match facts.is_empty() {
+            true => String::new(),
+            false => format!(" ({})", facts.join(", ")),
+        };
 
         format!(
-            "job {}: {} ({facts}){}",
+            "job {}: {}{facts}{}",
             self.id,
             self.state.label(),
             self.detail
@@ -197,7 +209,8 @@ impl JobReport {
     }
 
     /// Everything `status` prints: the summary, how long the last round
-    /// took once it has ended, and the branch once there is one.
+    /// took once it has ended, and the branch and its pull request once
+    /// there are any.
     #[must_use]
     pub fn to_status_lines(&self) -> Vec<String> {
         std::iter::once(self.to_summary_line())
@@ -206,6 +219,11 @@ impl JobReport {
                 self.branch
                     .as_ref()
                     .map(|branch| format!("branch: {branch}")),
+            )
+            .chain(
+                self.pull_request
+                    .as_ref()
+                    .map(|url| format!("pull request: {url}")),
             )
             .collect()
     }

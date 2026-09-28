@@ -3,7 +3,7 @@ use assembly_line::delivery::{Delivered, PullRequestText, deliver};
 use assembly_line::git;
 use assert_cmd::Command;
 use predicates::str::contains;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use support::commit_all;
 
 mod support;
@@ -139,6 +139,11 @@ async fn repo_running_with_base(script: &str, verify: &str, base: &str) -> tempf
 /// than inferring it from which `Delivered` variant came back. Returns the
 /// directory to prepend to `PATH` and the file its invocation is recorded
 /// to.
+///
+/// `gh pr view` finds a pull request only when `$FAKE_GH_EXISTING` names
+/// one. It is open unless `$FAKE_GH_EXISTING_STATE` says otherwise, and like
+/// the real `gh`, a `--jq` that selects open pull requests prints nothing for
+/// any other.
 fn fake_gh_capturing_args(tmp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
     let bin_dir = tmp.path().join("fake-bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
@@ -147,7 +152,15 @@ fn fake_gh_capturing_args(tmp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\necho \"$@\" >> {}\necho https://example.invalid/pr/1\n",
+            "#!/bin/sh\necho \"$@\" >> {}\n\
+             if [ \"$1 $2\" = \"pr view\" ]; then\n\
+               [ -n \"${{FAKE_GH_EXISTING:-}}\" ] || exit 1\n\
+               case \"$*\" in\n\
+                 *'.state == \"OPEN\"'*) [ \"${{FAKE_GH_EXISTING_STATE:-OPEN}}\" = OPEN ] || exit 0 ;;\n\
+               esac\n\
+               echo \"$FAKE_GH_EXISTING\"; exit 0\n\
+             fi\n\
+             echo https://example.invalid/pr/1\n",
             capture.display()
         ),
     )
@@ -156,6 +169,14 @@ fn fake_gh_capturing_args(tmp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
     std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
     std::fs::set_permissions(&script, perms).unwrap();
     (bin_dir, capture)
+}
+
+fn path_with(dir: &Path) -> String {
+    format!(
+        "{}:{}",
+        dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
 }
 
 /// Delivery is gated on `verify`: a job's branch is real work either way, but
@@ -227,14 +248,9 @@ async fn a_passing_revise_round_is_delivered() {
 async fn configured_base_reaches_the_pull_request_and_the_divergence_is_reported() {
     let tmp = repo_running_with_base("fake-agent.sh", "true", "release").await;
     let (fake_bin, gh_capture) = fake_gh_capturing_args(&tmp);
-    let path_with_fake_gh = format!(
-        "{}:{}",
-        fake_bin.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
 
     assembly(&tmp)
-        .env("PATH", path_with_fake_gh)
+        .env("PATH", path_with(&fake_bin))
         .args(["submit", "--prompt", "write a file"])
         .assert()
         .success()
@@ -262,14 +278,9 @@ async fn configured_base_reaches_the_pull_request_and_the_divergence_is_reported
 async fn a_pull_request_is_titled_and_described_from_the_job_not_from_local_commits() {
     let tmp = repo_running("fake-agent.sh", "true").await;
     let (fake_bin, gh_capture) = fake_gh_capturing_args(&tmp);
-    let path_with_fake_gh = format!(
-        "{}:{}",
-        fake_bin.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
 
     assembly(&tmp)
-        .env("PATH", path_with_fake_gh)
+        .env("PATH", path_with(&fake_bin))
         .args(["submit", "--prompt", "write a file"])
         .assert()
         .success();
@@ -280,6 +291,126 @@ async fn a_pull_request_is_titled_and_described_from_the_job_not_from_local_comm
         "{invocation}"
     );
     assert!(!invocation.contains("--fill"), "{invocation}");
+
+    discard_outside_state(&tmp);
+}
+
+#[tokio::test]
+async fn run_opens_the_pull_request_from_inside_its_clone() {
+    let tmp = repo_running("fake-agent.sh", "true").await;
+    let (gh_dir, args_log) = fake_gh_capturing_args(&tmp);
+
+    assembly(&tmp)
+        .env("PATH", path_with(&gh_dir))
+        .args(["run", "--prompt", "add auth"])
+        .assert()
+        .success()
+        .stdout(contains("pull request: https://example.invalid/pr/1"));
+
+    let args = std::fs::read_to_string(&args_log).unwrap();
+    assert!(
+        args.contains("pr create --base main --head al/job-1"),
+        "{args}"
+    );
+
+    discard_outside_state(&tmp);
+}
+
+/// A revise's commits land on the pull request its job already has, so
+/// asking for another would only fail.
+#[tokio::test]
+async fn a_revise_reports_the_pull_request_it_already_has() {
+    let tmp = repo_running("fake-agent.sh", "true").await;
+    let (gh_dir, args_log) = fake_gh_capturing_args(&tmp);
+    assembly(&tmp)
+        .env("PATH", path_with(&gh_dir))
+        .args(["run", "--prompt", "a"])
+        .assert()
+        .success();
+    std::fs::write(&args_log, "").unwrap();
+
+    assembly(&tmp)
+        .env("PATH", path_with(&gh_dir))
+        .env("FAKE_GH_EXISTING", "https://example.invalid/pr/1")
+        .args(["run", "--job", "1", "--prompt", "b"])
+        .assert()
+        .success()
+        .stdout(contains("pull request: https://example.invalid/pr/1"));
+
+    let args = std::fs::read_to_string(&args_log).unwrap();
+    assert!(args.contains("pr view al/job-1"), "{args}");
+    assert!(!args.contains("pr create"), "{args}");
+
+    discard_outside_state(&tmp);
+}
+
+/// A merged or closed pull request is not one the revise's commits land on,
+/// so the revise asks for a new one.
+#[tokio::test]
+async fn a_revise_whose_pull_request_was_merged_opens_another() {
+    let tmp = repo_running("fake-agent.sh", "true").await;
+    let (gh_dir, args_log) = fake_gh_capturing_args(&tmp);
+    assembly(&tmp)
+        .env("PATH", path_with(&gh_dir))
+        .args(["run", "--prompt", "a"])
+        .assert()
+        .success();
+
+    assembly(&tmp)
+        .env("PATH", path_with(&gh_dir))
+        .env("FAKE_GH_EXISTING", "https://example.invalid/pr/1")
+        .env("FAKE_GH_EXISTING_STATE", "MERGED")
+        .args(["run", "--job", "1", "--prompt", "b"])
+        .assert()
+        .success();
+
+    let args = std::fs::read_to_string(&args_log).unwrap();
+    assert_eq!(args.matches("pr create").count(), 2, "{args}");
+
+    discard_outside_state(&tmp);
+}
+
+/// An earlier round pushed work that `verify` rejected; this round changes
+/// nothing and passes. The branch still holds work its base does not, so it
+/// is delivered.
+#[tokio::test]
+async fn a_revise_that_passes_without_new_commits_delivers_the_earlier_work() {
+    let tmp = repo_running("fake-agent.sh", "true").await;
+    let accepted = tmp.path().join("accepted");
+    std::fs::write(
+        tmp.path().join(assembly_line::config::REPO_CONFIG_PATH),
+        format!(
+            "verify = \"test -f '{}'\"\n{}",
+            accepted.display(),
+            support::config_running("fake-agent.sh")
+        ),
+    )
+    .unwrap();
+    commit_all(tmp.path(), "verify reads a flag")
+        .await
+        .unwrap()
+        .unwrap();
+    support::publish_main(tmp.path()).await;
+    let (gh_dir, args_log) = fake_gh_capturing_args(&tmp);
+    assembly(&tmp)
+        .env("PATH", path_with(&gh_dir))
+        .args(["run", "--prompt", "same"])
+        .assert()
+        .code(1);
+    std::fs::write(&accepted, "").unwrap();
+
+    assembly(&tmp)
+        .env("PATH", path_with(&gh_dir))
+        .args(["run", "--job", "1", "--prompt", "same"])
+        .assert()
+        .success()
+        .stdout(contains("pull request: https://example.invalid/pr/1"));
+
+    let args = std::fs::read_to_string(&args_log).unwrap();
+    assert!(
+        args.contains("pr create --base main --head al/job-1"),
+        "{args}"
+    );
 
     discard_outside_state(&tmp);
 }

@@ -1,9 +1,10 @@
 use assembly_line::cli::{Cli, Command, RunnerArgs, RunnerKind};
-use assembly_line::frame::FrameWriter;
+use assembly_line::frame::{FrameWriter, ReadableFrames};
 use assembly_line::lifecycle::{self, Note, Prepared, Refusal, Work};
 use assembly_line::paths;
 use assembly_line::payload::RoundPayload;
 use assembly_line::round::{Verdict, run_round};
+use assembly_line::run::{self, RunRefused, RunRequest};
 use assembly_line::runner::docker::DockerRunner;
 use assembly_line::runner::kubernetes::KubernetesRunner;
 use assembly_line::runner::local::LocalRunner;
@@ -23,10 +24,34 @@ fn main() -> ExitCode {
 
     let cli = Cli::parse();
     let root = paths::state_root(cli.root, |name| std::env::var(name).ok());
-    // `job-exec` keeps no state, so a round inside a container with no
-    // `$HOME` still runs.
+    // `job-exec` and `run` keep no state, so a round inside a container with
+    // no `$HOME` still runs.
     match (cli.command, root) {
         (Command::JobExec, _) => in_async_runtime(execute_payload_from_environment()),
+        (
+            Command::Run {
+                prompt,
+                prompt_file,
+                repo,
+                base_ref,
+                job,
+                provider,
+                frames,
+                provision_toolchain,
+            },
+            _,
+        ) => in_async_runtime(run_whole_job(
+            RunRequest {
+                repo,
+                base_ref,
+                job,
+                prompt,
+                prompt_file,
+                provider,
+                provision_toolchain,
+            },
+            frames,
+        )),
         (_, Err(e)) => fail_with_usage_error(e),
         (
             Command::Submit {
@@ -85,6 +110,48 @@ async fn execute_payload_from_environment() -> Result<ExitCode, String> {
         .await
         .map(exit_code_for)
         .map_err(|e| e.to_string())
+}
+
+/// `run`: prepare, announce, run, conclude. With frames, stdout carries them
+/// and everything a person reads goes to stderr; without, a person reads
+/// stdout.
+async fn run_whole_job(request: RunRequest, as_frames: bool) -> Result<ExitCode, String> {
+    let cancel = CancellationToken::new();
+    cancel_on_termination_signal(cancel.clone());
+    let ready = run::prepare_run(request, &std::env::temp_dir(), &cancel)
+        .await
+        .map_err(|refused| report_run_refusal(&refused))?;
+
+    let conclusion = if as_frames {
+        eprintln!("{}", ready.to_announcement_line());
+        ready
+            .run(&FrameWriter::new(std::io::stdout()), cancel)
+            .await
+    } else {
+        println!("{}", ready.to_announcement_line());
+        ready
+            .run(
+                &FrameWriter::new(ReadableFrames::new(std::io::stdout())),
+                cancel,
+            )
+            .await
+    }
+    .map_err(|e| e.to_string())?;
+
+    let lines = conclusion.to_lines();
+    match as_frames {
+        true => lines.iter().for_each(|line| eprintln!("{line}")),
+        false => lines.iter().for_each(|line| println!("{line}")),
+    }
+    Ok(exit_code_for(conclusion.verdict))
+}
+
+fn report_run_refusal(refused: &RunRefused) -> String {
+    refused
+        .itemized_reasons()
+        .iter()
+        .for_each(|reason| eprintln!("error: {reason}"));
+    refused.to_string()
 }
 
 /// SIGTERM is how the local runner cancels, SIGINT is Ctrl-C reaching the

@@ -5,11 +5,24 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
 
+/// A scratch clone of the remote, with nothing checked out yet.
+#[derive(Debug)]
+pub struct ScratchClone {
+    /// Deleted when the clone is dropped, which is what makes the checkout
+    /// scratch whatever becomes of the round.
+    dir: tempfile::TempDir,
+}
+
+impl ScratchClone {
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
 #[derive(Debug)]
 pub struct RoundWorkspace {
-    /// Deleted when the workspace is dropped, which is what makes the
-    /// checkout scratch whatever becomes of the round.
-    dir: tempfile::TempDir,
+    scratch: ScratchClone,
     pub branch: String,
     /// The commit the branch was checked out at — every commit since is
     /// this round's.
@@ -19,7 +32,7 @@ pub struct RoundWorkspace {
 impl RoundWorkspace {
     #[must_use]
     pub fn path(&self) -> &Path {
-        self.dir.path()
+        self.scratch.path()
     }
 }
 
@@ -45,20 +58,104 @@ pub async fn create(
     scratch_root: impl AsRef<Path>,
     credential_helper: Option<&str>,
 ) -> anyhow::Result<RoundWorkspace> {
+    let clone = clone_scratch(remote_url, scratch_root, credential_helper).await?;
+    // A tag, or a commit reachable only from the ref the job names, is not
+    // guaranteed by a plain clone.
+    git::run_allowing_failure(
+        clone.path(),
+        &["fetch", "--quiet", CLONE_REMOTE, &start.name],
+    )
+    .await?;
+    start_round(clone, start, branch).await
+}
+
+/// Clone `remote_url` into a fresh directory under `scratch_root`, checking
+/// nothing out. A `credential_helper` authenticates both the clone and every
+/// later fetch and push from it.
+///
+/// # Errors
+///
+/// A clone that fails midway leaves nothing: the directory is removed as
+/// the error propagates.
+pub async fn clone_scratch(
+    remote_url: &str,
+    scratch_root: impl AsRef<Path>,
+    credential_helper: Option<&str>,
+) -> anyhow::Result<ScratchClone> {
     std::fs::create_dir_all(scratch_root.as_ref())?;
     let dir = tempfile::Builder::new()
         .prefix("assembly-round-")
         .tempdir_in(scratch_root)?;
-
     git::clone_into(remote_url, dir.path(), credential_helper).await?;
-    // A tag, or a commit reachable only from the ref the job names, is not
-    // guaranteed by a plain clone.
-    git::run_allowing_failure(dir.path(), &["fetch", "--quiet", CLONE_REMOTE, &start.name]).await?;
-    git::check_out_new_branch(dir.path(), branch, &start.sha).await?;
-    git::commit_as_assembly_line(dir.path()).await?;
+    Ok(ScratchClone { dir })
+}
 
+/// `git_ref` as the clone's remote has it, pinned to `pinned_sha` when one
+/// is given — a commit validated earlier, which the ref may have moved past
+/// since.
+///
+/// # Errors
+///
+/// When the remote does not carry `git_ref`, or `pinned_sha` is not a
+/// commit the remote can supply.
+pub async fn pin_in_clone(
+    clone: &ScratchClone,
+    git_ref: &str,
+    pinned_sha: Option<&str>,
+) -> anyhow::Result<PinnedRef> {
+    let tip = git::pinned(clone.path(), CLONE_REMOTE, git_ref).await?;
+    let Some(sha) = pinned_sha else {
+        return Ok(tip);
+    };
+    // A ref that moved on past the pin still has it in its history; one that
+    // was rewritten may not, so ask the remote for the commit itself.
+    if !git::has_commit(clone.path(), sha).await? {
+        git::run_allowing_failure(clone.path(), &["fetch", "--quiet", CLONE_REMOTE, sha]).await?;
+    }
+    match git::has_commit(clone.path(), sha).await? {
+        true => Ok(PinnedRef {
+            name: git_ref.to_string(),
+            sha: sha.to_string(),
+        }),
+        false => Err(anyhow::anyhow!(
+            "'{sha}' is not a commit '{CLONE_REMOTE}' can supply for '{git_ref}'"
+        )),
+    }
+}
+
+/// The tip of job branch `branch` on the clone's remote, or `None` when the
+/// remote has no such branch.
+///
+/// # Errors
+///
+/// When the remote cannot be asked.
+pub async fn job_branch_in_clone(
+    clone: &ScratchClone,
+    branch: &str,
+) -> anyhow::Result<Option<PinnedRef>> {
+    match git::remote_lacks_ref(clone.path(), CLONE_REMOTE, branch).await? {
+        true => Ok(None),
+        false => git::pinned(clone.path(), CLONE_REMOTE, branch)
+            .await
+            .map(Some),
+    }
+}
+
+/// Check `branch` out at `start` in `clone`, committing as assembly-line,
+/// and make it the round's workspace.
+///
+/// # Errors
+///
+/// When the checkout or the identity cannot be set.
+pub async fn start_round(
+    clone: ScratchClone,
+    start: &PinnedRef,
+    branch: &str,
+) -> anyhow::Result<RoundWorkspace> {
+    git::check_out_new_branch(clone.path(), branch, &start.sha).await?;
+    git::commit_as_assembly_line(clone.path()).await?;
     Ok(RoundWorkspace {
-        dir,
+        scratch: clone,
         branch: branch.to_string(),
         started_at: start.sha.clone(),
     })
@@ -127,7 +224,7 @@ pub async fn publish(ws: &RoundWorkspace) -> anyhow::Result<()> {
 /// Returns an error if the directory cannot be removed.
 pub fn discard(ws: RoundWorkspace) -> std::io::Result<()> {
     restore_owner_permissions(ws.path())?;
-    ws.dir.close()
+    ws.scratch.dir.close()
 }
 
 /// Give the owner full permission on `dir` and every directory below it,

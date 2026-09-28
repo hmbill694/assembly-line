@@ -17,6 +17,7 @@ pub mod payload;
 pub mod provider;
 pub mod report;
 pub mod round;
+pub mod run;
 pub mod runner;
 pub mod state;
 pub mod workspace;
