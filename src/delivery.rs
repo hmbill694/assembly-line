@@ -18,6 +18,11 @@ pub enum Delivered {
     Opened {
         url: String,
     },
+    /// The branch already had a pull request — a revise, whose new commits
+    /// land on it by themselves.
+    AlreadyOpen {
+        url: String,
+    },
 }
 
 impl std::fmt::Display for Delivered {
@@ -28,6 +33,7 @@ impl std::fmt::Display for Delivered {
                 write!(f, "pushed {branch} — no pull request opened: {because}")
             }
             Self::Opened { url } => write!(f, "opened {url}"),
+            Self::AlreadyOpen { url } => write!(f, "updated {url}"),
         }
     }
 }
@@ -58,13 +64,17 @@ pub async fn deliver(
     }
 }
 
-/// Ask `gh` for a pull request. Never fatal — the branch is already pushed.
+/// Ask `gh` for a pull request, unless the branch already has one. Never
+/// fatal — the branch is already pushed.
 async fn open_pull_request(
     repo: &Path,
     job_branch: &str,
     base: &str,
     text: PullRequestText<'_>,
 ) -> Delivered {
+    if let Some(url) = open_pull_request_of(repo, job_branch).await {
+        return Delivered::AlreadyOpen { url };
+    }
     let attempt = Command::new("gh")
         .args([
             "pr", "create", "--base", base, "--head", job_branch, "--title", text.title, "--body",
@@ -87,4 +97,26 @@ async fn open_pull_request(
             url: String::from_utf8_lossy(&out.stdout).trim().to_string(),
         },
     }
+}
+
+/// The URL of `job_branch`'s open pull request. `None` covers no pull
+/// request, no `gh` and a `gh` that refuses alike: each falls through to
+/// `gh pr create`, which reports its own failure.
+async fn open_pull_request_of(repo: &Path, job_branch: &str) -> Option<String> {
+    let out = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            job_branch,
+            "--json",
+            "url,state",
+            "--jq",
+            "select(.state == \"OPEN\") | .url",
+        ])
+        .current_dir(repo)
+        .output()
+        .await
+        .ok()?;
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !url.is_empty()).then_some(url)
 }

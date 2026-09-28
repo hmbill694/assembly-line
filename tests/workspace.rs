@@ -164,6 +164,56 @@ async fn publishing_runs_no_hook_from_the_clone() {
 }
 
 #[tokio::test]
+async fn a_pinned_commit_is_used_even_after_its_ref_moves() {
+    let fx = Fixture::new().await;
+    let pinned = fx.main().await;
+    std::fs::write(fx.repo.join("later.txt"), "later\n").unwrap();
+    support::commit_all(&fx.repo, "later")
+        .await
+        .unwrap()
+        .unwrap();
+    support::publish_main(&fx.repo).await;
+
+    let clone = workspace::clone_scratch(fx.url(), fx.scratch(), None)
+        .await
+        .unwrap();
+    let base = workspace::pin_in_clone(&clone, "main", Some(&pinned.sha))
+        .await
+        .unwrap();
+
+    assert_eq!(base, pinned);
+}
+
+#[tokio::test]
+async fn a_pin_the_remote_cannot_supply_is_an_error() {
+    let fx = Fixture::new().await;
+    let clone = workspace::clone_scratch(fx.url(), fx.scratch(), None)
+        .await
+        .unwrap();
+
+    let err = workspace::pin_in_clone(&clone, "main", Some(&"0".repeat(40)))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not a commit"), "{err}");
+}
+
+#[tokio::test]
+async fn a_job_branch_the_remote_lacks_is_none_not_an_error() {
+    let fx = Fixture::new().await;
+    let clone = workspace::clone_scratch(fx.url(), fx.scratch(), None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        workspace::job_branch_in_clone(&clone, "al/job-9")
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
 async fn a_refused_publish_names_the_branch_and_what_was_lost() {
     let fx = Fixture::new().await;
     let ws = fx.workspace().await.unwrap();

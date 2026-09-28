@@ -22,6 +22,10 @@ pub const PAYLOAD_VAR: &str = "ASSEMBLY_JOB";
 /// process environment; the spec lists that as an accepted risk.
 pub const GIT_TOKEN_VAR: &str = "ASSEMBLY_GIT_TOKEN";
 
+/// The forge credential `gh` opens a pull request with. Withheld from the
+/// agent's environment like [`GIT_TOKEN_VAR`], and within its reach like it.
+pub const FORGE_TOKEN_VAR: &str = "GH_TOKEN";
+
 /// The HTTPS form of an SSH remote URL, which is what a token can
 /// authenticate. Anything else — HTTPS already, a local path, `file://` —
 /// comes back unchanged.

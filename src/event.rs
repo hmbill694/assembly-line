@@ -40,6 +40,11 @@ pub enum EventKind {
         branch: String,
         pushed_to: String,
     },
+    /// The job's branch has a pull request, opened by the round that just
+    /// passed or already open from an earlier one.
+    PullRequestOpened {
+        url: String,
+    },
     /// `verify` ran to completion and rejected the work. Recorded before
     /// [`EventKind::RoundFailed`], so a reader can tell a rejected round from
     /// one whose agent crashed.

@@ -1,5 +1,7 @@
 use assembly_line::event::{Event, EventKind};
-use assembly_line::frame::{FrameWriter, Routed, StreamPosition, verdict_missing_from};
+use assembly_line::frame::{
+    FrameWriter, ReadableFrames, Routed, StreamPosition, verdict_missing_from,
+};
 
 fn lines_of(frames: &FrameWriter<Vec<u8>>) -> Vec<String> {
     String::from_utf8(frames.copy_of_sink())
@@ -150,6 +152,27 @@ fn a_round_that_ended_without_a_verdict_is_failed_with_the_runners_reason() {
         }
         other => panic!("expected a RoundFailed, got {other:?}"),
     }
+}
+
+#[test]
+fn a_frame_writer_remembers_the_events_it_sent() {
+    let frames = FrameWriter::new(Vec::new());
+    frames.append_output("hello").unwrap();
+    frames.append_event(EventKind::RoundPassed).unwrap();
+
+    let kinds: Vec<EventKind> = frames.events_so_far().into_iter().map(|e| e.kind).collect();
+    assert_eq!(kinds, [EventKind::RoundPassed]);
+}
+
+#[test]
+fn a_person_reads_the_output_and_none_of_the_frames() {
+    let frames = FrameWriter::new(ReadableFrames::new(Vec::new()));
+    frames.append_output("agent: working").unwrap();
+    frames.append_event(EventKind::RoundPassed).unwrap();
+    frames.append_output("agent: done").unwrap();
+
+    let text = String::from_utf8(frames.into_sink().unwrap().into_text()).unwrap();
+    assert_eq!(text, "agent: working\nagent: done\n");
 }
 
 #[test]

@@ -132,6 +132,14 @@ pub async fn sha_at_ref(repo: impl AsRef<Path>, git_ref: &str) -> anyhow::Result
     .await
 }
 
+/// Whether `repo` has `sha` as a commit.
+pub async fn has_commit(repo: impl AsRef<Path>, sha: &str) -> anyhow::Result<bool> {
+    let spec = format!("{sha}^{{commit}}");
+    Ok(run_allowing_failure(repo, &["cat-file", "-e", &spec])
+        .await?
+        .succeeded())
+}
+
 /// One file's contents as of `git_ref`, or `None` when that ref does not carry
 /// it.
 ///
@@ -545,7 +553,16 @@ pub async fn commit_all(clone: impl AsRef<Path>, message: &str) -> anyhow::Resul
 /// Whether `HEAD` carries any commit that `since` does not — work the round
 /// made, whoever committed it.
 pub async fn head_is_ahead_of(repo: impl AsRef<Path>, since: &str) -> anyhow::Result<bool> {
-    let range = format!("{since}..HEAD");
+    commit_is_ahead_of(repo, "HEAD", since).await
+}
+
+/// Whether `commit` carries any commit that `since` does not.
+pub async fn commit_is_ahead_of(
+    repo: impl AsRef<Path>,
+    commit: &str,
+    since: &str,
+) -> anyhow::Result<bool> {
+    let range = format!("{since}..{commit}");
     let count = run_expecting_success(repo, &["rev-list", "--count", &range], "rev-list").await?;
     Ok(count != "0")
 }

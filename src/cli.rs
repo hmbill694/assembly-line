@@ -19,6 +19,42 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Do one whole job, here, in this process: clone, agent, verify, push,
+    /// pull request. What every runner launches.
+    Run {
+        /// What the agent is asked to do. Give it as --prompt=TEXT when it
+        /// begins with '-'.
+        #[arg(
+            long,
+            conflicts_with = "prompt_file",
+            required_unless_present = "prompt_file"
+        )]
+        prompt: Option<String>,
+        /// Read the prompt from a file instead
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
+        /// A checkout, or a remote URL. Defaults to the enclosing checkout.
+        #[arg(long)]
+        repo: Option<String>,
+        /// What to start from: a ref, or REF@SHA to pin it. Defaults to the
+        /// checkout's branch.
+        #[arg(long = "ref")]
+        base_ref: Option<String>,
+        /// Work on this job's branch instead of claiming a new job
+        #[arg(long)]
+        job: Option<u64>,
+        /// Overrides the repository's declared provider
+        #[arg(long)]
+        provider: Option<String>,
+        /// Report as NDJSON frames on stdout, for a collector
+        #[arg(long)]
+        frames: bool,
+        /// Install the repository's toolchain with mise first. Set by
+        /// container runners.
+        #[arg(long, hide = true)]
+        provision_toolchain: bool,
+    },
+
     /// Hand a job to a runner: a new job, or with --job, another round of
     /// an existing one
     Submit {
