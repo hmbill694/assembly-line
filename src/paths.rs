@@ -46,47 +46,18 @@ fn existing_job_ids(jobs_root: &Path) -> io::Result<Vec<JobId>> {
     }
 }
 
-/// The id a new job should claim: one past every id already taken, whether
-/// by a job directory here or by a job branch on the remote.
-///
-/// The remote counts because job branches are shared there — a second clone,
-/// a teammate, or a deleted `.assembly/jobs` would otherwise restart at 1 and
-/// push onto somebody else's branch. Branches that are not a job's are
-/// ignored. `None` when a branch has already taken the last id there is.
+/// One past the highest job branch `remote_branches` carries. Branches that
+/// are not a job's are ignored. `None` when a branch has already taken the
+/// last id there is.
 #[must_use]
-pub fn job_id_past(
-    local_ids: impl IntoIterator<Item = JobId>,
-    remote_branches: &[String],
-) -> Option<JobId> {
-    local_ids
-        .into_iter()
-        .chain(
-            remote_branches
-                .iter()
-                .filter_map(|branch| JobId::from_branch_name(branch)),
-        )
+pub fn job_id_past(remote_branches: &[String]) -> Option<JobId> {
+    remote_branches
+        .iter()
+        .filter_map(|branch| JobId::from_branch_name(branch))
         .max()
         .map_or(0, u64::from)
         .checked_add(1)
         .map(JobId::from)
-}
-
-/// [`job_id_past`] the job directories under `jobs_root` and
-/// `remote_branches`. A missing jobs directory is not an error — it means
-/// this is the first job here.
-///
-/// # Errors
-///
-/// Also fails when a job branch has taken the last id there is.
-pub fn next_job_id(jobs_root: &Path, remote_branches: &[String]) -> io::Result<JobId> {
-    existing_job_ids(jobs_root).and_then(|ids| {
-        job_id_past(ids, remote_branches).ok_or_else(|| {
-            io::Error::other(format!(
-                "a job branch has taken the last job id — delete {} from the remote",
-                JobId::from(u64::MAX).branch_name()
-            ))
-        })
-    })
 }
 
 /// The most recent job, or `None` when there have been none.
@@ -119,10 +90,12 @@ impl JobPaths {
     }
 }
 
-/// Create the directory layout for a new job.
+/// Create the directory layout for a new job. `AlreadyExists` when the job
+/// has one: its id came from the remote, and a directory left by a job whose
+/// branch has since gone must not be taken over.
 pub fn create_job(jobs_root: &Path, id: JobId) -> io::Result<JobPaths> {
     let dir = jobs_root.join(id.to_string());
-    std::fs::create_dir_all(&dir)?;
+    std::fs::create_dir_all(jobs_root).and_then(|()| std::fs::create_dir(&dir))?;
     Ok(JobPaths { id, dir })
 }
 

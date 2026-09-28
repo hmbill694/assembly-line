@@ -301,37 +301,18 @@ async fn a_hangup_cancels_the_round_rather_than_orphaning_the_agent() {
 #[tokio::test]
 async fn a_refused_push_fails_the_round_and_says_the_work_is_lost() {
     let h = Harness::new().await;
-    let prepared = h.prepare_job("write a file").await;
-
-    // Someone else publishes an unrelated `al/job-1` after this job looked at
-    // the remote's branches but before it pushes, so its push is a
-    // non-fast-forward and git refuses it.
+    // The remote lets a branch be created — the job's claim — and refuses
+    // every update after that, so the round's push is the one refused.
+    support::fake_cli(
+        &h.origin.join("hooks"),
+        "pre-receive",
+        "while read -r old _ _; do\n  \
+           [[ \"$old\" =~ ^0+$ ]] || { echo 'only new branches here' >&2; exit 1; }\n\
+         done\n",
+    );
     let base = head_sha(&h.repo).await.unwrap();
-    let tree = git::run_allowing_failure(&h.repo, &["rev-parse", &format!("{base}^{{tree}}")])
-        .await
-        .unwrap()
-        .stdout
-        .trim()
-        .to_string();
-    let unrelated = git::run_allowing_failure(&h.repo, &["commit-tree", &tree, "-m", "theirs"])
-        .await
-        .unwrap()
-        .stdout
-        .trim()
-        .to_string();
-    let pushed = git::run_allowing_failure(
-        &h.repo,
-        &[
-            "push",
-            &h.origin.to_string_lossy(),
-            &format!("{unrelated}:refs/heads/al/job-1"),
-        ],
-    )
-    .await
-    .unwrap();
-    assert!(pushed.succeeded(), "{}", pushed.stderr);
 
-    let outcome = h.run(prepared).await;
+    let outcome = h.run_job("write a file").await;
 
     assert!(!outcome.passed);
     assert!(
@@ -354,7 +335,7 @@ async fn a_refused_push_fails_the_round_and_says_the_work_is_lost() {
         .unwrap();
     assert_eq!(
         on_remote.stdout.trim(),
-        unrelated,
+        base,
         "the push was not refused, so this test proves nothing"
     );
 }

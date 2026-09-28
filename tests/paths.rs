@@ -1,7 +1,7 @@
 use assembly_line::job::JobId;
 use assembly_line::paths::{
-    JobMeta, create_job, git_root, job_id_past, jobs_root, latest_job_id, next_job_id, open_job,
-    read_meta, write_meta,
+    JobMeta, create_job, git_root, job_id_past, jobs_root, latest_job_id, open_job, read_meta,
+    write_meta,
 };
 use std::fs;
 
@@ -24,54 +24,17 @@ fn returns_none_outside_a_repo() {
 }
 
 #[test]
-fn allocates_monotonic_job_ids() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = jobs_root(tmp.path());
-
-    assert_eq!(next_job_id(&root, &[]).unwrap(), JobId::from(1));
-    assert_eq!(latest_job_id(&root).unwrap(), None);
-
-    create_job(&root, JobId::from(1)).unwrap();
-    assert_eq!(next_job_id(&root, &[]).unwrap(), JobId::from(2));
-    assert_eq!(latest_job_id(&root).unwrap(), Some(JobId::from(1)));
-
-    create_job(&root, JobId::from(2)).unwrap();
-    assert_eq!(next_job_id(&root, &[]).unwrap(), JobId::from(3));
-    assert_eq!(latest_job_id(&root).unwrap(), Some(JobId::from(2)));
-}
-
-#[test]
-fn ignores_non_numeric_directories_when_allocating() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = jobs_root(tmp.path());
-    fs::create_dir_all(root.join("scratch")).unwrap();
-    create_job(&root, JobId::from(7)).unwrap();
-    assert_eq!(next_job_id(&root, &[]).unwrap(), JobId::from(8));
-}
-
-/// Job branches are shared on the remote, so a fresh clone — or a deleted
-/// `.assembly/jobs` — must not restart at 1 and collide with them.
-#[test]
-fn a_new_job_id_is_past_the_remotes_job_branches_too() {
+fn a_new_job_id_is_past_the_remotes_job_branches() {
     let remote = ["al/job-4".to_string(), "al/job-12".to_string()];
-    assert_eq!(job_id_past([], &remote), Some(JobId::from(13)));
-    assert_eq!(
-        job_id_past([JobId::from(20)], &remote),
-        Some(JobId::from(21))
-    );
-    assert_eq!(job_id_past([], &[]), Some(JobId::from(1)));
+    assert_eq!(job_id_past(&remote), Some(JobId::from(13)));
+    assert_eq!(job_id_past(&[]), Some(JobId::from(1)));
 }
 
 /// Anyone who can push can make a branch at the very last id; that is a
 /// refusal to allocate, not an overflow.
 #[test]
 fn a_branch_at_the_last_id_leaves_none_to_allocate() {
-    let tmp = tempfile::tempdir().unwrap();
-    let last = [format!("al/job-{}", u64::MAX)];
-
-    assert_eq!(job_id_past([], &last), None);
-    let err = next_job_id(&jobs_root(tmp.path()), &last).unwrap_err();
-    assert!(err.to_string().contains(&last[0]), "{err}");
+    assert_eq!(job_id_past(&[JobId::from(u64::MAX).branch_name()]), None);
 }
 
 #[test]
@@ -81,24 +44,30 @@ fn branches_that_are_not_a_jobs_are_ignored_when_allocating() {
         "al/job-x".to_string(),
         "al/jobs-9".to_string(),
         "feature/al/job-50".to_string(),
+        "al/job-2".to_string(),
     ];
-    assert_eq!(job_id_past([JobId::from(2)], &remote), Some(JobId::from(3)));
+    assert_eq!(job_id_past(&remote), Some(JobId::from(3)));
 }
 
 #[test]
-fn the_jobs_directory_and_the_remote_together_decide_the_next_id() {
+fn the_latest_job_is_the_highest_job_directory() {
     let tmp = tempfile::tempdir().unwrap();
     let root = jobs_root(tmp.path());
-    create_job(&root, JobId::from(3)).unwrap();
+    assert_eq!(latest_job_id(&root).unwrap(), None);
 
-    assert_eq!(
-        next_job_id(&root, &["al/job-5".to_string()]).unwrap(),
-        JobId::from(6)
-    );
-    assert_eq!(
-        next_job_id(&root, &["al/job-1".to_string()]).unwrap(),
-        JobId::from(4)
-    );
+    create_job(&root, JobId::from(1)).unwrap();
+    create_job(&root, JobId::from(2)).unwrap();
+    assert_eq!(latest_job_id(&root).unwrap(), Some(JobId::from(2)));
+}
+
+#[test]
+fn the_latest_job_ignores_directories_that_are_not_a_jobs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = jobs_root(tmp.path());
+    create_job(&root, JobId::from(7)).unwrap();
+    fs::create_dir_all(root.join("notes")).unwrap();
+
+    assert_eq!(latest_job_id(&root).unwrap(), Some(JobId::from(7)));
 }
 
 #[test]
@@ -115,6 +84,16 @@ fn create_job_lays_out_the_directory() {
     assert_eq!(p.log(), p.dir.join("job.log"), "one job, one log");
 
     assert_eq!(open_job(&root, JobId::from(42)).unwrap().dir, p.dir);
+}
+
+#[test]
+fn a_job_directory_that_exists_is_not_created_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = jobs_root(tmp.path());
+    create_job(&root, JobId::from(1)).unwrap();
+
+    let err = create_job(&root, JobId::from(1)).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
 }
 
 #[test]

@@ -461,6 +461,71 @@ pub async fn push_head_as(
     .map(|_| ())
 }
 
+/// Create `branch` on `remote` at `sha`, only if `remote` has no such branch.
+/// `false` means somebody already has it.
+///
+/// Neither the exit code nor the lease decides this alone. A push of the
+/// commit a branch already points at exits 0 as "up to date", lease or not,
+/// so only the porcelain line's `*` (a new branch) counts as created. The
+/// lease — `--force-with-lease=<ref>:`, expecting no such ref — stops the
+/// push fast-forwarding a branch that sits at an ancestor of `sha`. And a
+/// push that lost its race on the remote itself, after both sides saw the
+/// ref absent, reports "reference already exists" rather than a lost lease.
+/// No hooks run, as for [`push_head_as`].
+pub async fn create_branch_if_absent(
+    repo: impl AsRef<Path>,
+    remote: &str,
+    sha: &str,
+    branch: &str,
+) -> anyhow::Result<bool> {
+    let target = format!("refs/heads/{branch}");
+    let lease = format!("--force-with-lease={target}:");
+    let refspec = format!("{sha}:{target}");
+    let pushed = run_allowing_failure(
+        repo,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "push",
+            "--porcelain",
+            &lease,
+            remote,
+            &refspec,
+        ],
+    )
+    .await?;
+    // "<flag>\t<from>:<to>\t<summary>" per ref.
+    let flag_and_summary = pushed.stdout.lines().find_map(|line| {
+        let mut fields = line.split('\t');
+        let (flag, refs, summary) = (fields.next()?, fields.next()?, fields.next()?);
+        refs.strip_suffix(target.as_str())?
+            .ends_with(':')
+            .then_some((flag, summary))
+    });
+    match flag_and_summary {
+        Some(("*", _)) => Ok(true),
+        Some(("=", _)) => Ok(false),
+        Some(("!", summary))
+            if summary.starts_with("[rejected]")
+                || summary.ends_with("(reference already exists)") =>
+        {
+            Ok(false)
+        }
+        refused => Err(anyhow::anyhow!(
+            "creating {branch} on '{remote}' failed (exit {}): {}",
+            pushed.exit_code,
+            [
+                refused.map_or("", |(_, summary)| summary),
+                pushed.stderr.trim()
+            ]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+        )),
+    }
+}
+
 /// Stage everything in `clone` and commit it, returning the new commit, or
 /// `None` when there was nothing to commit.
 pub async fn commit_all(clone: impl AsRef<Path>, message: &str) -> anyhow::Result<Option<String>> {
