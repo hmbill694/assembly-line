@@ -1,6 +1,6 @@
 use assembly_line::cli::{Cli, Command, RunnerArgs, RunnerKind};
 use assembly_line::frame::FrameWriter;
-use assembly_line::lifecycle::{self, Note, Prepared, Refusal, RevisionRequest, StartRequest};
+use assembly_line::lifecycle::{self, Note, Prepared, Refusal, Work};
 use assembly_line::paths;
 use assembly_line::payload::RoundPayload;
 use assembly_line::round::{Verdict, run_round};
@@ -29,42 +29,20 @@ fn main() -> ExitCode {
         (Command::JobExec, _) => in_async_runtime(execute_payload_from_environment()),
         (_, Err(e)) => fail_with_usage_error(e),
         (
-            Command::Run {
+            Command::Submit {
                 prompt,
                 prompt_file,
                 repo,
                 base_ref,
                 provider,
+                job,
                 runner,
             },
             Ok(root),
         ) => in_async_runtime(run_work_on_chosen_runner(
             runner,
             &root,
-            Work::Start(StartRequest {
-                prompt,
-                prompt_file,
-                repo,
-                base_ref,
-                provider,
-            }),
-        )),
-        (
-            Command::Revise {
-                job_id,
-                feedback,
-                repo,
-                runner,
-            },
-            Ok(root),
-        ) => in_async_runtime(run_work_on_chosen_runner(
-            runner,
-            &root,
-            Work::Revise(RevisionRequest {
-                job_id,
-                feedback,
-                repo,
-            }),
+            Work::from_submission(prompt, prompt_file, repo, base_ref, provider, job),
         )),
         (Command::Status { job_id, repo }, Ok(root)) => {
             in_async_runtime(print_job_status(&root, job_id, repo))
@@ -130,12 +108,6 @@ fn cancel_on_termination_signal(cancel: CancellationToken) {
         }
         cancel.cancel();
     });
-}
-
-/// What `run` and `revise` do, independent of where the round runs.
-enum Work {
-    Start(StartRequest),
-    Revise(RevisionRequest),
 }
 
 /// The one place flags become a concrete runner; everything after it is

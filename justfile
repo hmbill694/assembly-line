@@ -121,7 +121,7 @@ demo:
     args = ["$fake", "{prompt}", "demo"]
     EOF
     git add -A && git commit -qm "opt in to the factory"
-    "$bin" run --prompt "make a change" || true
+    "$bin" submit --prompt "make a change" || true
     echo
     "$bin" status
     echo "demo job left in $dir"

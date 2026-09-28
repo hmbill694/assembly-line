@@ -195,7 +195,8 @@ async fn revising_a_job_that_does_not_exist_cannot_be_prepared() {
         &h.root,
         RevisionRequest {
             job_id: 9,
-            feedback: "more".into(),
+            prompt: Some("more".into()),
+            prompt_file: None,
             repo: Some(h.repo.clone()),
         },
     )
@@ -226,7 +227,8 @@ async fn a_revise_is_numbered_past_the_highest_round_recorded() {
         &h.root,
         RevisionRequest {
             job_id: first.job_id.into(),
-            feedback: "more".into(),
+            prompt: Some("more".into()),
+            prompt_file: None,
             repo: Some(h.repo.clone()),
         },
     )
@@ -302,7 +304,8 @@ async fn a_job_with_no_recorded_request_cannot_be_revised() {
         &h.root,
         RevisionRequest {
             job_id: 1,
-            feedback: "more".into(),
+            prompt: Some("more".into()),
+            prompt_file: None,
             repo: Some(h.repo.clone()),
         },
     )

@@ -25,7 +25,44 @@ use anyhow::anyhow;
 use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
-/// What `assembly run` was asked for, as given on the command line.
+/// What `submit` was asked for: a new job, or another round of one.
+#[derive(Debug, Clone)]
+pub enum Work {
+    Start(StartRequest),
+    Revise(RevisionRequest),
+}
+
+impl Work {
+    /// `submit`'s flags as the work they describe. clap has already kept
+    /// `--ref` and `--provider` away from `--job`.
+    #[must_use]
+    pub fn from_submission(
+        prompt: Option<String>,
+        prompt_file: Option<PathBuf>,
+        repo: Option<PathBuf>,
+        base_ref: Option<String>,
+        provider: Option<String>,
+        job: Option<u64>,
+    ) -> Work {
+        match job {
+            None => Work::Start(StartRequest {
+                prompt,
+                prompt_file,
+                repo,
+                base_ref,
+                provider,
+            }),
+            Some(job_id) => Work::Revise(RevisionRequest {
+                job_id,
+                prompt,
+                prompt_file,
+                repo,
+            }),
+        }
+    }
+}
+
+/// A new job, as `submit` was asked for it.
 #[derive(Debug, Clone)]
 pub struct StartRequest {
     pub prompt: Option<String>,
@@ -35,11 +72,12 @@ pub struct StartRequest {
     pub provider: Option<String>,
 }
 
-/// What `assembly revise` was asked for, as given on the command line.
+/// Another round of job `job_id`, as `submit --job` was asked for it.
 #[derive(Debug, Clone)]
 pub struct RevisionRequest {
     pub job_id: u64,
-    pub feedback: String,
+    pub prompt: Option<String>,
+    pub prompt_file: Option<PathBuf>,
     pub repo: Option<PathBuf>,
 }
 
@@ -242,7 +280,7 @@ impl RoundConclusion {
     }
 }
 
-/// Everything `assembly run` checks before a job directory is allocated.
+/// Everything `submit` checks before a job directory is allocated.
 pub async fn prepare_start<'r, R: Runner>(
     runner: &'r R,
     pass_env: &[String],
@@ -310,13 +348,17 @@ pub async fn prepare_start<'r, R: Runner>(
     }
 }
 
-/// Everything `assembly revise` checks before the job's next round runs.
+/// Everything `submit --job` checks before the job's next round runs.
 pub async fn prepare_revision<'r, R: Runner>(
     runner: &'r R,
     pass_env: &[String],
     root: &Path,
     request: RevisionRequest,
 ) -> Prepared<'r, R> {
+    let feedback = match prompt_text(request.prompt, request.prompt_file) {
+        Ok(feedback) => feedback,
+        Err(e) => return Prepared::refused(Vec::new(), Refusal::Unpreparable(e)),
+    };
     let located = match locate_revision(root, request.job_id, request.repo).await {
         Ok(located) => located,
         Err(e) => return Prepared::refused(Vec::new(), Refusal::Unpreparable(e)),
@@ -346,7 +388,7 @@ pub async fn prepare_revision<'r, R: Runner>(
         }
     };
     let round = located.rounds + 1;
-    let round_prompt = payload::revised_prompt(&located.original_prompt, &request.feedback);
+    let round_prompt = payload::revised_prompt(&located.original_prompt, &feedback);
 
     Prepared {
         notes,
@@ -647,7 +689,7 @@ async fn allocate_job(
     let paths = paths::create_job(jobs_dir, id).map_err(|e| match e.kind() {
         std::io::ErrorKind::AlreadyExists => anyhow!(
             "job {id}'s branch was gone from '{DEFAULT_REMOTE}', so its id was claimed again, \
-             but {} still holds that job — run again, and the next id will be claimed",
+             but {} still holds that job — submit again, and the next id will be claimed",
             jobs_dir.join(id.to_string()).display()
         ),
         _ => anyhow!("preparing the job directory: {e}"),
