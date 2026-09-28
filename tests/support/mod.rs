@@ -203,18 +203,16 @@ impl Harness {
     /// A job directory outside the repository, for tests that drive a runner
     /// or `job-exec` directly rather than through the lifecycle.
     pub fn job_paths(&self) -> JobPaths {
-        paths::create_job(&paths::jobs_root(self.tmp.path()), THE_JOB.into()).unwrap()
+        let jobs_root = paths::jobs_root(self.tmp.path());
+        paths::open_job(&jobs_root, THE_JOB.into())
+            .or_else(|_| paths::create_job(&jobs_root, THE_JOB.into()))
+            .unwrap()
     }
 
     /// Run one job against this repository, with `prompt`, from `main`.
     pub async fn run_job(&self, prompt: &str) -> Outcome {
-        self.run(self.prepare_job(prompt).await).await
-    }
-
-    /// A new job with `prompt`, checked but not yet run, so a test can change
-    /// the world between the two.
-    pub async fn prepare_job(&self, prompt: &str) -> Prepared<'_, LocalRunner> {
-        prepare_start(&self.runner, &[], self.start(prompt, None, None)).await
+        self.run(prepare_start(&self.runner, &[], self.start(prompt, None, None)).await)
+            .await
     }
 
     /// Run one job cut from a named ref rather than `main`.

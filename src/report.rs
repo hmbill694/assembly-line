@@ -42,8 +42,9 @@ pub struct JobReport {
     pub diff: Option<DiffSummary>,
     /// Failure reason, when there is one.
     pub detail: Option<String>,
-    /// The branch the job's work is on, once it has been pushed. `None` is
-    /// a job that has not produced anything yet.
+    /// The branch the job's work is on, once a round has pushed some. `None`
+    /// is a job that has not produced anything yet, even though its claimed
+    /// branch exists.
     pub branch: Option<String>,
 }
 

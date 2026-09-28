@@ -5,6 +5,7 @@
 //! to refuse is known before a job directory exists. Running allocates, runs
 //! the round and hands its branch on.
 
+use crate::claim;
 use crate::collect::{collect, record_launch_failure};
 use crate::config::{self, ConfigError, RepoConfig, Warning};
 use crate::delivery::{self, Delivered, PullRequestText};
@@ -133,9 +134,7 @@ pub struct ReadyRound<'r, R> {
 }
 
 enum Destination {
-    NewJob {
-        remote_job_branches: Vec<String>,
-    },
+    NewJob,
     ExistingJob {
         paths: JobPaths,
         round: u32,
@@ -149,7 +148,7 @@ impl<R> ReadyRound<'_, R> {
     #[must_use]
     pub fn to_announcement_line(&self) -> Option<String> {
         match &self.destination {
-            Destination::NewJob { .. } => None,
+            Destination::NewJob => None,
             Destination::ExistingJob { paths, round, .. } => {
                 Some(format!("revising job {} (round {round})", paths.id))
             }
@@ -170,7 +169,8 @@ pub struct RoundConclusion {
 /// What became of a finished round's branch.
 #[derive(Debug)]
 pub enum Handoff {
-    /// The agent changed nothing, so there is nothing to deliver.
+    /// The round pushed nothing — its branch, if any, holds no work of its
+    /// own — so there is nothing to deliver.
     NoBranch,
     /// A failed round still leaves a real branch, but opening a pull request
     /// for work that did not pass is noise.
@@ -264,13 +264,6 @@ pub async fn prepare_start<'r, R: Runner>(
         Ok(runnable) => runnable,
         Err(refusal) => return Prepared::refused(notes, refusal),
     };
-    let remote_job_branches =
-        match git::remote_branches_matching(&located.repo, DEFAULT_REMOTE, JobId::BRANCH_PATTERN)
-            .await
-        {
-            Ok(branches) => branches,
-            Err(e) => return Prepared::refused(notes, Refusal::Unpreparable(e)),
-        };
     let secrets =
         match secrets_or_reasons_it_cannot_run(runner, &located.remote_url, pass_env, |name| {
             std::env::var(name).ok()
@@ -291,9 +284,7 @@ pub async fn prepare_start<'r, R: Runner>(
                 prompt: located.prompt.clone(),
                 provider,
             },
-            destination: Destination::NewJob {
-                remote_job_branches,
-            },
+            destination: Destination::NewJob,
             start: located.start,
             remote_url: located.remote_url,
             round_prompt: located.prompt,
@@ -364,8 +355,8 @@ pub async fn prepare_revision<'r, R: Runner>(
 ///
 /// # Errors
 ///
-/// When the job directory cannot be allocated, or the round's event log
-/// cannot be written.
+/// When a new job cannot claim its id on the remote, its directory cannot be
+/// allocated, or the round's event log cannot be written.
 pub async fn run<R: Runner>(
     ready: ReadyRound<'_, R>,
     cancel: CancellationToken,
@@ -380,11 +371,11 @@ pub async fn run<R: Runner>(
         config,
         secrets,
     } = ready;
-    let started_the_job = matches!(destination, Destination::NewJob { .. });
+    let started_the_job = matches!(destination, Destination::NewJob);
     let (paths, mut log, round) = match destination {
-        Destination::NewJob {
-            remote_job_branches,
-        } => allocate_job(&meta, &remote_job_branches).map(|(paths, log)| (paths, log, 1))?,
+        Destination::NewJob => allocate_job(&meta, &start.sha)
+            .await
+            .map(|(paths, log)| (paths, log, 1))?,
         Destination::ExistingJob { paths, round, log } => (paths, log, round),
     };
 
@@ -619,20 +610,22 @@ fn runnable_config_and_provider(
     (warnings, runnable)
 }
 
-/// A new job's directory, its `meta.json` and its open event log.
+/// A new job's directory, its `meta.json` and its open event log, under the
+/// id it claimed on the remote.
 ///
 /// Called only once the round is known good, so a repository that has not
-/// opted in leaves no litter. Its id is past every job branch the remote
-/// already carries, whoever's they are.
-fn allocate_job(
-    meta: &JobMeta,
-    remote_job_branches: &[String],
-) -> anyhow::Result<(JobPaths, EventLog)> {
+/// opted in leaves no litter and burns no id.
+async fn allocate_job(meta: &JobMeta, base_sha: &str) -> anyhow::Result<(JobPaths, EventLog)> {
+    let id = claim::claim_job(&meta.repo, DEFAULT_REMOTE, base_sha).await?;
     let jobs_root = paths::jobs_root(&meta.repo);
-
-    let paths = paths::next_job_id(&jobs_root, remote_job_branches)
-        .and_then(|id| paths::create_job(&jobs_root, id))
-        .map_err(|e| anyhow!("preparing the job directory: {e}"))?;
+    let paths = paths::create_job(&jobs_root, id).map_err(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => anyhow!(
+            "job {id}'s branch was gone from '{DEFAULT_REMOTE}', so its id was claimed again, \
+             but {} still holds that job — run again, and the next id will be claimed",
+            jobs_root.join(id.to_string()).display()
+        ),
+        _ => anyhow!("preparing the job directory: {e}"),
+    })?;
 
     paths::write_meta(&paths, meta).map_err(|e| anyhow!("writing meta.json: {e}"))?;
 
@@ -689,17 +682,17 @@ async fn hand_off(
 
 /// Where a revise round starts: the remote's copy of the job's branch.
 ///
-/// A job whose earlier rounds committed nothing pushed nothing, so its branch
-/// is absent rather than unpushed, and "push it first" would be the wrong
-/// advice.
+/// A job's branch can be absent rather than unpushed — deleted once its pull
+/// request merged, or never pushed by a job from before ids were claimed on
+/// the remote — and "push it first" would be the wrong advice.
 async fn job_branch_tip(repo: &Path, job_id: JobId) -> anyhow::Result<PinnedRef> {
     let branch = job_id.branch_name();
     match git::pinned(repo, DEFAULT_REMOTE, &branch).await {
         Ok(tip) => Ok(tip),
         Err(e) => match git::remote_lacks_ref(repo, DEFAULT_REMOTE, &branch).await {
             Ok(true) => Err(anyhow!(
-                "job {job_id} has no branch on '{DEFAULT_REMOTE}' — its first round committed \
-                 nothing, so there is nothing to revise"
+                "job {job_id} has no branch on '{DEFAULT_REMOTE}' — it was deleted, or the job \
+                 never pushed one, so there is nothing to revise"
             )),
             Ok(false) | Err(_) => Err(e),
         },

@@ -1,5 +1,6 @@
 //! assembly-line: run one coding-agent job and keep the branch it leaves.
 
+pub mod claim;
 pub mod cli;
 pub mod collect;
 pub mod config;

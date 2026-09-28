@@ -196,6 +196,84 @@ async fn pushing_a_branch_again_after_another_commit_fast_forwards() {
     assert_eq!(on_remote.stdout.trim(), second);
 }
 
+/// Pushing the commit a branch already points at exits 0 as "up to date",
+/// lease or not — which must still read as taken.
+#[tokio::test]
+async fn a_branch_already_at_the_commit_is_not_created_again() {
+    let fx = Fixture::new().await;
+    let _origin = fx.with_origin().await;
+    let base = fx.base().await;
+
+    assert!(
+        git::create_branch_if_absent(&fx.repo, "origin", &base, "al/job-1")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !git::create_branch_if_absent(&fx.repo, "origin", &base, "al/job-1")
+            .await
+            .unwrap()
+    );
+}
+
+/// A plain push would fast-forward a branch sitting at an ancestor — taking
+/// over somebody else's job.
+#[tokio::test]
+async fn a_branch_at_an_ancestor_is_taken_not_fast_forwarded() {
+    let fx = Fixture::new().await;
+    let origin = fx.with_origin().await;
+    let ancestor = fx.base().await;
+    git::push_head_as(&fx.repo, "origin", "al/job-1")
+        .await
+        .unwrap();
+    let descendant = write_and_commit(&fx.repo, "more.txt", "more\n", "more").await;
+
+    assert!(
+        !git::create_branch_if_absent(&fx.repo, "origin", &descendant, "al/job-1")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        git::sha_at_ref(&origin, "al/job-1").await.unwrap(),
+        ancestor
+    );
+}
+
+/// Pushes that all saw the branch absent lose on the remote itself, which
+/// reports "reference already exists" rather than a lost lease.
+#[tokio::test]
+async fn of_pushes_racing_to_create_one_branch_exactly_one_creates_it() {
+    let fx = Fixture::new().await;
+    let _origin = fx.with_origin().await;
+    let base = fx.base().await;
+
+    let pushes: Vec<_> = (0..12)
+        .map(|_| {
+            let (repo, base) = (fx.repo.clone(), base.clone());
+            tokio::spawn(async move {
+                git::create_branch_if_absent(&repo, "origin", &base, "al/job-1").await
+            })
+        })
+        .collect();
+    let mut created = 0;
+    for push in pushes {
+        created += usize::from(push.await.unwrap().unwrap());
+    }
+
+    assert_eq!(created, 1);
+}
+
+#[tokio::test]
+async fn creating_a_branch_on_a_missing_remote_is_an_error() {
+    let fx = Fixture::new().await;
+    let base = fx.base().await;
+
+    let err = git::create_branch_if_absent(&fx.repo, "origin", &base, "al/job-1")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("al/job-1"), "{err}");
+}
+
 #[tokio::test]
 async fn a_remotes_branches_are_listed_by_pattern_without_their_prefix() {
     let fx = Fixture::new().await;

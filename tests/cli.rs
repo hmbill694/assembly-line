@@ -114,7 +114,7 @@ async fn run_exits_one_when_the_agent_fails_but_still_leaves_the_branch() {
     discard_origin(&tmp);
 }
 
-/// End to end, for the rule `paths::job_id_past` owns.
+/// End to end, for the rule `claim::claim_job` owns.
 #[tokio::test]
 async fn a_job_id_already_taken_on_the_remote_is_skipped() {
     let tmp = repo_running("fake-agent.sh").await;
@@ -155,6 +155,53 @@ async fn a_job_id_already_taken_on_the_remote_is_skipped() {
     discard_origin(&tmp);
 }
 
+/// A merged pull request's branch is often deleted, which frees its id on
+/// the remote — but not the job's directory here.
+#[tokio::test]
+async fn a_job_whose_branch_was_deleted_keeps_its_directory_to_itself() {
+    let tmp = repo_running("fake-agent.sh").await;
+    assembly(&tmp)
+        .args(["run", "--prompt", "first job"])
+        .assert()
+        .success();
+    git_on_origin(&tmp, &["branch", "-D", "al/job-1"]);
+    let meta = tmp.path().join(".assembly/jobs/1/meta.json");
+    let first_meta = std::fs::read_to_string(&meta).unwrap();
+
+    assembly(&tmp)
+        .args(["run", "--prompt", "second job"])
+        .assert()
+        .failure()
+        .stderr(contains("still holds that job").and(contains("run again")));
+    assert_eq!(std::fs::read_to_string(&meta).unwrap(), first_meta);
+
+    assembly(&tmp)
+        .args(["run", "--prompt", "second job"])
+        .assert()
+        .success()
+        .stdout(contains("job 2: passed"));
+
+    discard_origin(&tmp);
+}
+
+#[tokio::test]
+async fn revising_a_job_whose_branch_was_deleted_says_there_is_nothing_to_revise() {
+    let tmp = repo_running("fake-agent.sh").await;
+    assembly(&tmp)
+        .args(["run", "--prompt", "x"])
+        .assert()
+        .success();
+    git_on_origin(&tmp, &["branch", "-D", "al/job-1"]);
+
+    assembly(&tmp)
+        .args(["revise", "1", "try again"])
+        .assert()
+        .code(2)
+        .stderr(contains("job 1 has no branch on 'origin'").and(contains("nothing to revise")));
+
+    discard_origin(&tmp);
+}
+
 #[tokio::test]
 async fn a_repository_that_has_not_opted_in_is_told_which_file_to_write() {
     let tmp = support::repo_with_initial_commit().await;
@@ -188,21 +235,25 @@ async fn a_repository_with_no_remote_is_told_to_add_one() {
         .stderr(contains("push it first").not());
 }
 
-/// A first round that committed nothing pushed nothing, so there is no
-/// branch on the remote to continue.
+/// A job's branch is claimed before its round, so even a round that changed
+/// nothing leaves one to revise.
 #[tokio::test]
-async fn revising_a_job_that_left_no_branch_says_there_is_nothing_to_revise() {
+async fn a_job_whose_round_changed_nothing_can_still_be_revised() {
     let tmp = repo_running("noop-agent.sh").await;
     assembly(&tmp)
         .args(["run", "--prompt", "x"])
         .assert()
         .success();
+    assert_eq!(
+        git_on_origin(&tmp, &["rev-parse", "al/job-1"]),
+        git(&tmp, &["rev-parse", "main"]),
+        "the claimed branch should sit at the base"
+    );
 
     assembly(&tmp)
         .args(["revise", "1", "try again"])
         .assert()
-        .code(2)
-        .stderr(contains("job 1 has no branch on 'origin'").and(contains("nothing to revise")));
+        .success();
 
     discard_origin(&tmp);
 }
