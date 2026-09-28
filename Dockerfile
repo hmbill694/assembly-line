@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # The job image: everything a round needs except the repository's own
-# toolchain, which `job-exec` provisions with mise at the start of the round.
+# toolchain, which `assembly run` provisions with mise at the start of the round.
 
 # rust-toolchain.toml pins channel 1.98.1, not the crate's MSRV — match it
 # here so rustup does not try to fetch a second toolchain mid-build.
@@ -17,7 +17,7 @@ FROM debian:bookworm-slim
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl git xz-utils unzip \
+ && apt-get install -y --no-install-recommends ca-certificates curl gh git xz-utils unzip \
  && rm -rf /var/lib/apt/lists/*
 
 # Claude Code refuses to skip permission prompts as root, and an agent has
@@ -26,7 +26,7 @@ RUN useradd --create-home --uid 1000 agent \
  && mkdir -p /mise \
  && chown agent:agent /mise
 
-# /mise is where job-exec, running as agent, installs the round's toolchain.
+# /mise is where `run`, running as agent, installs the round's toolchain.
 #
 # opencode's installer puts its binary at ~/.opencode/bin regardless of
 # --no-modify-path, so that directory joins ~/.local/bin (Claude Code's and
@@ -81,8 +81,8 @@ RUN curl -fsSL https://claude.ai/install.sh | bash -s -- ${CLAUDE_CODE_VERSION} 
  && mv /home/agent/.local/bin/codex-* /home/agent/.local/bin/codex
 
 # Fail the build, not the first job, if anything above is missing.
-RUN assembly --version && git --version && mise --version \
+RUN assembly --version && git --version && gh --version && mise --version \
  && claude --version && codex --version && opencode --version
 
 ENTRYPOINT []
-CMD ["assembly", "job-exec"]
+CMD ["assembly", "--help"]

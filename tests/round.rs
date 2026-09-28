@@ -1,8 +1,11 @@
 use assembly_line::config::{ConfigError, REPO_CONFIG_PATH};
 use assembly_line::event::EventKind;
 use assembly_line::git::{self, head_sha};
+use assembly_line::job::JobId;
 use assembly_line::lifecycle::Refusal;
 use assembly_line::payload;
+use assembly_line::runner::LaunchSpec;
+use assembly_line::runner::local::LocalRunner;
 use assembly_line::state::JobState;
 use support::{Harness, commit_all, config_running, provider_block};
 
@@ -226,13 +229,86 @@ async fn a_checkout_the_agent_write_protected_is_still_discarded_and_its_work_ke
     );
 }
 
+/// Review focus 1, end to end: a prompt shaped like a flag, with quotes and
+/// a newline in it, reaches the agent exactly.
+#[tokio::test]
+async fn a_prompt_that_looks_like_a_flag_reaches_the_agent_intact() {
+    let h = Harness::new().await;
+    let prompt = "--frames --job=9\nsay \"hi\" and 'bye'";
+
+    let outcome = h.run_job(prompt).await;
+
+    assert!(outcome.passed, "{:?}", outcome.events);
+    assert_eq!(
+        h.file_on_remote_branch(&outcome.job_id.branch_name(), "agent-output.txt")
+            .await
+            .as_deref(),
+        Some(format!("{prompt}\n").as_str())
+    );
+}
+
+/// A remote that is itself a checkout, with a remote of its own, is where
+/// the job goes — not that checkout's remote.
+#[tokio::test]
+async fn a_remote_that_is_a_checkout_is_used_rather_than_its_own_remote() {
+    let h = Harness::new().await;
+    let checkout_remote = h.scratch_root().with_file_name("checkout-remote");
+    let cloned = git::run_allowing_failure(
+        &h.repo,
+        &[
+            "clone",
+            "--quiet",
+            h.origin.to_str().unwrap(),
+            checkout_remote.to_str().unwrap(),
+        ],
+    )
+    .await
+    .unwrap();
+    assert!(cloned.succeeded(), "{}", cloned.stderr);
+    let repointed = git::run_allowing_failure(
+        &h.repo,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            checkout_remote.to_str().unwrap(),
+        ],
+    )
+    .await
+    .unwrap();
+    assert!(repointed.succeeded(), "{}", repointed.stderr);
+
+    let outcome = h.run_job("write a file").await;
+
+    assert!(outcome.passed, "{:?} {}", outcome.events, outcome.output);
+    let branch = outcome.job_id.branch_name();
+    assert!(
+        git::file_at_ref(&checkout_remote, &branch, "agent-output.txt")
+            .await
+            .unwrap()
+            .is_some(),
+        "the job's work is not on the remote it was given"
+    );
+    assert_eq!(
+        h.file_on_remote_branch(&branch, "agent-output.txt").await,
+        None,
+        "the job went to its remote's remote"
+    );
+}
+
 /// The branch is pushed before `verify` runs, so a `verify` that cannot even
 /// start must not take the round's record of that branch down with it.
 #[tokio::test]
 async fn a_verify_that_cannot_start_still_records_the_pushed_branch() {
-    let h = Harness::new().await;
-    // No `sh` on PATH, so `verify` cannot be spawned; the agent runs under
-    // an absolute `/bin/bash` and git is found through its own link.
+    // The agent runs under an absolute `/bin/bash`, so it needs no PATH.
+    let h = Harness::with_config(&format!(
+        "provider = \"fake\"\nverify = \"true\"\n\
+         [providers.fake]\ncmd = \"/bin/bash\"\nargs = [\"{}\", \"{{prompt}}\", \"a\"]\n",
+        support::fixture("fake-agent.sh").display()
+    ))
+    .await;
+    // No `sh` on PATH, so `verify` cannot be spawned; git is found through
+    // its own link.
     let only_git = h.scratch_root().with_file_name("only-git");
     std::fs::create_dir_all(&only_git).unwrap();
     let git_binary = std::env::var("PATH")
@@ -242,27 +318,10 @@ async fn a_verify_that_cannot_start_still_records_the_pushed_branch() {
         .find(|candidate| candidate.is_file())
         .unwrap();
     std::os::unix::fs::symlink(git_binary, only_git.join("git")).unwrap();
-    let base = h.payload_for("x").await;
-    let command = assembly_line::provider::CommandSpec {
-        program: "/bin/bash".into(),
-        ..base.command.clone()
-    };
-    let payload = payload::RoundPayload {
-        command,
-        verify: Some("true".into()),
-        ..base
-    };
 
-    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin("assembly"))
-        .arg("job-exec")
-        .env(
-            payload::PAYLOAD_VAR,
-            serde_json::to_string(&payload).unwrap(),
-        )
-        .env("PATH", &only_git)
-        .env("TMPDIR", h.scratch_root())
-        .output()
-        .unwrap();
+    let output = h
+        .run_frames("x", &[("PATH", only_git.to_str().unwrap())])
+        .await;
 
     let frames = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -274,38 +333,33 @@ async fn a_verify_that_cannot_start_still_records_the_pushed_branch() {
 }
 
 /// The agent leads a session of its own, so a terminal's hangup never
-/// reaches it: `job-exec` has to cancel the round itself, or the agent runs
-/// on with nothing left to stop it.
+/// reaches it: `run` has to cancel the round itself, or the agent runs on
+/// with nothing left to stop it.
 #[tokio::test]
 async fn a_hangup_cancels_the_round_rather_than_orphaning_the_agent() {
     use std::io::BufRead;
 
     let h = Harness::with_config(&config_running("sleeping-agent.sh")).await;
-    let payload = h.payload_for("x").await;
 
-    let mut job_exec = std::process::Command::new(assert_cmd::cargo::cargo_bin("assembly"))
-        .arg("job-exec")
-        .env(
-            payload::PAYLOAD_VAR,
-            serde_json::to_string(&payload).unwrap(),
-        )
+    let mut run = std::process::Command::new(assert_cmd::cargo::cargo_bin("assembly"))
+        .args(h.launch_spec_for("x").await.args)
         .env("TMPDIR", h.scratch_root())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let mut frames = std::io::BufReader::new(job_exec.stdout.take().unwrap()).lines();
+    let mut frames = std::io::BufReader::new(run.stdout.take().unwrap()).lines();
     let before_hangup: Vec<String> = frames
         .by_ref()
         .map(Result::unwrap)
         .take_while(|line| !line.contains("sleeping-agent:"))
         .collect();
     nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(i32::try_from(job_exec.id()).unwrap()),
+        nix::unistd::Pid::from_raw(i32::try_from(run.id()).unwrap()),
         nix::sys::signal::Signal::SIGHUP,
     )
     .unwrap();
     let after_hangup: String = frames.map(Result::unwrap).collect();
-    job_exec.wait().unwrap();
+    run.wait().unwrap();
 
     assert!(
         after_hangup.contains("\"reason\":\"cancelled\""),
@@ -510,45 +564,49 @@ async fn a_revise_round_continues_the_branch_instead_of_starting_over() {
 
 /// `git` leads a session of its own, so no terminal signal reaches a clone
 /// in progress: only the round's cancel can stop it. SIGTERM is what the
-/// local runner sends `job-exec` on Ctrl-C.
+/// local runner sends `run` on Ctrl-C.
 #[tokio::test]
 async fn cancelling_a_round_stops_a_clone_in_progress() {
     let h = Harness::new().await;
     let fakes = h.scratch_root().with_file_name("fakes");
     support::fake_cli(&fakes, "git-remote-hang", "sleep 60\n");
-    let payload = payload::RoundPayload {
-        remote_url: "hang::nowhere".into(),
-        ..h.payload_for("x").await
-    };
+    let spec = LaunchSpec::for_round::<LocalRunner>(
+        JobId::from(1),
+        1,
+        "hang::nowhere",
+        &git::pinned(&h.repo, "origin", "main").await.unwrap(),
+        "x",
+        "fake",
+        None,
+    );
 
     let started = std::time::Instant::now();
-    let job_exec = std::process::Command::new(assert_cmd::cargo::cargo_bin("assembly"))
-        .arg("job-exec")
-        .env(
-            payload::PAYLOAD_VAR,
-            serde_json::to_string(&payload).unwrap(),
-        )
+    let run = std::process::Command::new(assert_cmd::cargo::cargo_bin("assembly"))
+        .args(&spec.args)
         .env(
             "PATH",
             format!("{}:{}", fakes.display(), std::env::var("PATH").unwrap()),
         )
         .env("TMPDIR", h.scratch_root())
         .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
     std::thread::sleep(std::time::Duration::from_secs(1));
     nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(i32::try_from(job_exec.id()).unwrap()),
+        nix::unistd::Pid::from_raw(i32::try_from(run.id()).unwrap()),
         nix::sys::signal::Signal::SIGTERM,
     )
     .unwrap();
-    let output = job_exec.wait_with_output().unwrap();
+    let output = run.wait_with_output().unwrap();
 
     assert!(
         started.elapsed() < std::time::Duration::from_secs(20),
         "the clone ran on past its cancel: {:?}",
         started.elapsed()
     );
-    let frames = String::from_utf8_lossy(&output.stdout);
-    assert!(frames.contains("\"reason\":\"cancelled\""), "{frames}");
+    // The clone is `run`'s preparation, so a cancel there is a refusal,
+    // reported on stderr, rather than a round.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("error: cancelled"), "{stderr}");
 }

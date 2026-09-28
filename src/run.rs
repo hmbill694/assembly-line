@@ -192,8 +192,6 @@ pub async fn prepare_run(
         &config,
         RoundRequest {
             job_id,
-            // `run` numbers no rounds; the field goes with `job-exec`.
-            round: 0,
             prompt: &prompt,
             provider: &provider,
             start,

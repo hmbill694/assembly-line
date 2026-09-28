@@ -228,7 +228,7 @@ pub struct StreamPosition {
 impl StreamPosition {
     /// Where `line` goes, and where the stream stands after it.
     ///
-    /// A line that is not a frame is output: `job-exec`'s own stderr, or a
+    /// A line that is not a frame is output: `run`'s own stderr, or a
     /// crash backtrace, merged into the stream by a runner that cannot keep
     /// the two apart. It does not move the position.
     #[must_use]
@@ -249,7 +249,7 @@ impl StreamPosition {
 
 /// The failure a collector records itself when a round's stream ended
 /// without saying how it went — a pod OOM-killed, a runner that never
-/// started it, a `job-exec` that panicked. `None` when the round reported its
+/// started it, a `run` that panicked. `None` when the round reported its
 /// own verdict.
 ///
 /// `collected` is this round's events only: an earlier round's verdict says

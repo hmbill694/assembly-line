@@ -1,12 +1,12 @@
 use assembly_line::git::PinnedRef;
+use assembly_line::job::JobId;
 use assembly_line::payload::{
-    GIT_TOKEN_VAR, PAYLOAD_VAR, RoundPayload, https_equivalent, is_path_on_this_machine,
+    FORGE_TOKEN_VAR, GIT_TOKEN_VAR, https_equivalent, is_path_on_this_machine,
 };
-use assembly_line::provider::CommandSpec;
 use assembly_line::runner::docker::docker_run_args;
 use assembly_line::runner::local::LocalRound;
 use assembly_line::runner::{
-    JobSecrets, Runner, RunnerProblem, payload_fitted_to, reasons_a_container_cannot_run,
+    JobSecrets, LaunchSpec, Runner, RunnerProblem, reasons_a_container_cannot_run,
     secrets_or_reasons_it_cannot_run,
 };
 use tokio_util::sync::CancellationToken;
@@ -27,7 +27,7 @@ impl<const IN_A_CONTAINER: bool> Runner for RunnerReporting<IN_A_CONTAINER> {
 
     fn launch(
         &self,
-        _payload: &RoundPayload,
+        _spec: &LaunchSpec,
         _secrets: &JobSecrets,
         _cancel: &CancellationToken,
     ) -> impl Future<Output = anyhow::Result<LocalRound>> + Send {
@@ -45,8 +45,10 @@ fn unreachable_runner() -> RunnerProblem {
     }
 }
 
-fn host_with_only_the_git_token(name: &str) -> Option<String> {
-    (name == GIT_TOKEN_VAR).then(|| "t0ken".to_string())
+fn host_with_both_tokens(name: &str) -> Option<String> {
+    [GIT_TOKEN_VAR, FORGE_TOKEN_VAR]
+        .contains(&name)
+        .then(|| "t0ken".to_string())
 }
 
 #[test]
@@ -99,9 +101,9 @@ fn urls_a_token_already_works_with_are_left_alone() {
 }
 
 #[test]
-fn a_container_always_receives_the_git_token_and_only_the_named_extras() {
+fn a_container_always_receives_both_tokens_and_only_the_named_extras() {
     let host = |name: &str| match name {
-        "ASSEMBLY_GIT_TOKEN" => Some("t0ken".to_string()),
+        "ASSEMBLY_GIT_TOKEN" | "GH_TOKEN" => Some("t0ken".to_string()),
         "ANTHROPIC_API_KEY" => Some("sk".to_string()),
         "AWS_SECRET_ACCESS_KEY" => Some("never".to_string()),
         _ => None,
@@ -113,7 +115,7 @@ fn a_container_always_receives_the_git_token_and_only_the_named_extras() {
     // Sorted: `names` is a set.
     assert_eq!(
         secrets.names().into_iter().collect::<Vec<_>>(),
-        ["ANTHROPIC_API_KEY", GIT_TOKEN_VAR]
+        ["ANTHROPIC_API_KEY", GIT_TOKEN_VAR, FORGE_TOKEN_VAR]
     );
 }
 
@@ -124,6 +126,7 @@ fn every_missing_variable_is_reported_at_once() {
         problems,
         [
             RunnerProblem::MissingEnvironment(GIT_TOKEN_VAR.into()),
+            RunnerProblem::MissingEnvironment(FORGE_TOKEN_VAR.into()),
             RunnerProblem::MissingEnvironment("ANTHROPIC_API_KEY".into()),
         ]
     );
@@ -147,40 +150,39 @@ fn a_name_passed_twice_is_one_problem_not_two() {
         &[
             "X".into(),
             "X".into(),
-            PAYLOAD_VAR.into(),
-            PAYLOAD_VAR.into(),
+            FORGE_TOKEN_VAR.into(),
+            FORGE_TOKEN_VAR.into(),
         ],
-        |name| (name == GIT_TOKEN_VAR).then(|| "t".to_string()),
+        host_with_both_tokens,
     );
 
     assert_eq!(
         problems,
         [
-            RunnerProblem::ReservedEnvironment(PAYLOAD_VAR.into()),
+            RunnerProblem::ReservedEnvironment(FORGE_TOKEN_VAR.into()),
             RunnerProblem::MissingEnvironment("X".into()),
         ]
     );
 }
 
-/// `ASSEMBLY_JOB` would override the payload itself; the git token is sent
-/// whatever `--pass-env` says.
+/// Both tokens are sent whatever `--pass-env` says.
 #[test]
 fn passing_a_variable_assembly_line_sets_itself_is_refused() {
     let (secrets, problems) = JobSecrets::from_lookup(
-        &[PAYLOAD_VAR.into(), GIT_TOKEN_VAR.into(), "EXTRA".into()],
+        &[FORGE_TOKEN_VAR.into(), GIT_TOKEN_VAR.into(), "EXTRA".into()],
         |name| Some(format!("value of {name}")),
     );
 
     assert_eq!(
         problems,
         [
-            RunnerProblem::ReservedEnvironment(PAYLOAD_VAR.into()),
+            RunnerProblem::ReservedEnvironment(FORGE_TOKEN_VAR.into()),
             RunnerProblem::ReservedEnvironment(GIT_TOKEN_VAR.into()),
         ]
     );
     assert_eq!(
         secrets.names().into_iter().collect::<Vec<_>>(),
-        [GIT_TOKEN_VAR, "EXTRA"]
+        [GIT_TOKEN_VAR, "EXTRA", FORGE_TOKEN_VAR]
     );
 }
 
@@ -239,21 +241,21 @@ async fn a_host_runner_is_refused_for_its_own_problems() {
 }
 
 #[tokio::test]
-async fn a_container_runner_carries_the_git_token_from_the_host() {
+async fn a_container_runner_carries_both_tokens_from_the_host() {
     let secrets = secrets_or_reasons_it_cannot_run(
         &ContainerRunner {
             problems: Vec::new(),
         },
         NETWORK_REMOTE,
         &[],
-        host_with_only_the_git_token,
+        host_with_both_tokens,
     )
     .await
     .unwrap();
 
     assert_eq!(
         secrets.names().into_iter().collect::<Vec<_>>(),
-        [GIT_TOKEN_VAR]
+        [GIT_TOKEN_VAR, FORGE_TOKEN_VAR]
     );
 }
 
@@ -265,7 +267,7 @@ async fn every_reason_a_container_runner_cannot_run_is_reported_at_once() {
         },
         "/tmp/origin.git",
         &["ANTHROPIC_API_KEY".into()],
-        host_with_only_the_git_token,
+        host_with_both_tokens,
     )
     .await
     .unwrap_err();
@@ -282,48 +284,100 @@ async fn every_reason_a_container_runner_cannot_run_is_reported_at_once() {
     );
 }
 
-/// A payload as the host builds it, cloning from `remote_url`.
-fn payload_cloning(remote_url: &str) -> RoundPayload {
-    RoundPayload {
-        job_id: 1.into(),
-        round: 1,
-        remote_url: remote_url.into(),
-        remote_name: "origin".into(),
-        start: PinnedRef {
-            name: "main".into(),
-            sha: "sha".into(),
-        },
-        branch: "al/job-1".into(),
-        command: CommandSpec {
-            program: "agent".into(),
-            args: Vec::new(),
-        },
-        commit_message: "job 1: agent work".into(),
-        verify: None,
-        command_limit_secs: None,
-        provision_toolchain: false,
+fn base() -> PinnedRef {
+    PinnedRef {
+        name: "main".into(),
+        sha: "a".repeat(40),
     }
 }
 
 #[test]
-fn a_container_provisions_its_toolchain_and_clones_over_https() {
-    let fitted = payload_fitted_to::<ContainerRunner>(payload_cloning("git@github.com:o/r.git"));
+fn a_container_round_runs_assembly_run_over_https_and_provisions_first() {
+    let spec = LaunchSpec::for_round::<ContainerRunner>(
+        JobId::from(7),
+        2,
+        "git@github.com:o/r.git",
+        &base(),
+        "fix it",
+        "claude",
+        Some(60),
+    );
 
     assert_eq!(
-        fitted,
-        RoundPayload {
-            remote_url: "https://github.com/o/r.git".into(),
-            provision_toolchain: true,
-            ..payload_cloning("git@github.com:o/r.git")
-        }
+        spec.args,
+        [
+            "run".to_string(),
+            "--repo=https://github.com/o/r.git".into(),
+            format!("--ref=main@{}", "a".repeat(40)),
+            "--job=7".into(),
+            "--prompt=fix it".into(),
+            "--provider=claude".into(),
+            "--frames".into(),
+            "--provision-toolchain".into(),
+        ]
     );
+    assert_eq!(spec.command_limit_secs, Some(60));
+    assert!(spec.name.starts_with("al-7-2-"), "{}", spec.name);
 }
 
 #[test]
-fn a_host_runner_uses_the_hosts_toolchain_and_remote_as_they_are() {
-    let payload = payload_cloning("git@github.com:o/r.git");
+fn a_host_round_runs_assembly_run_with_the_remote_and_toolchain_as_they_are() {
+    let spec = LaunchSpec::for_round::<HostRunner>(
+        JobId::from(7),
+        1,
+        "git@github.com:o/r.git",
+        &base(),
+        "x",
+        "claude",
+        None,
+    );
 
-    assert_eq!(payload_fitted_to::<HostRunner>(payload.clone()), payload);
+    assert!(
+        spec.args
+            .contains(&"--repo=git@github.com:o/r.git".to_string())
+    );
+    assert!(!spec.args.contains(&"--provision-toolchain".to_string()));
+}
+
+/// A remote that is a path could be read by `run` as a checkout whose own
+/// remote is somewhere else; a URL cannot.
+#[test]
+fn a_host_round_names_a_remote_on_this_machine_by_its_file_url() {
+    let spec = LaunchSpec::for_round::<HostRunner>(
+        JobId::from(7),
+        1,
+        "/srv/origin",
+        &base(),
+        "x",
+        "claude",
+        None,
+    );
+
+    assert!(
+        spec.args.contains(&"--repo=file:///srv/origin".to_string()),
+        "{:?}",
+        spec.args
+    );
+}
+
+/// Review focus 1, at the seam: every value rides after `=`, so no prompt
+/// can be mistaken for a flag.
+#[test]
+fn every_value_on_the_command_line_is_attached_to_its_flag() {
+    let spec = LaunchSpec::for_round::<HostRunner>(
+        JobId::from(1),
+        1,
+        "/o.git",
+        &base(),
+        "--frames\n\"quoted\"",
+        "p",
+        None,
+    );
+
+    assert!(
+        spec.args
+            .contains(&"--prompt=--frames\n\"quoted\"".to_string())
+    );
 }
 
 #[test]
@@ -339,7 +393,7 @@ fn every_runner_problem_says_what_to_do_about_it() {
             namespace: "factory".into(),
         },
         RunnerProblem::MissingEnvironment("X".into()),
-        RunnerProblem::ReservedEnvironment("ASSEMBLY_JOB".into()),
+        RunnerProblem::ReservedEnvironment("GH_TOKEN".into()),
         RunnerProblem::RemoteIsLocalPath {
             url: "/tmp/origin.git".into(),
         },
@@ -351,15 +405,18 @@ fn every_runner_problem_says_what_to_do_about_it() {
 }
 
 #[test]
-fn docker_run_names_its_secrets_and_runs_job_exec() {
+fn docker_run_names_its_secrets_and_runs_assembly_run() {
     let args = docker_run_args(
         "img:1",
-        "al-1-1-abc",
-        &["ASSEMBLY_JOB", "ASSEMBLY_GIT_TOKEN"],
+        "al-1-1-x",
+        &["ASSEMBLY_GIT_TOKEN", "GH_TOKEN"],
+        &["run".into(), "--job=1".into()],
     );
     let joined = args.join(" ");
 
-    assert!(joined.contains("-e ASSEMBLY_JOB"), "{joined}");
-    assert!(joined.contains("-e ASSEMBLY_GIT_TOKEN"), "{joined}");
-    assert!(joined.ends_with("img:1 assembly job-exec"), "{joined}");
+    assert!(
+        joined.starts_with("run --name al-1-1-x -e ASSEMBLY_GIT_TOKEN -e GH_TOKEN"),
+        "{joined}"
+    );
+    assert!(joined.ends_with("img:1 assembly run --job=1"), "{joined}");
 }

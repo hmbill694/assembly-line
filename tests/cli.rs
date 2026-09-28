@@ -460,6 +460,10 @@ async fn a_job_started_elsewhere_is_found_by_pointing_the_read_commands_at_it() 
 /// A global `pushInsteadOf` — fetch over one transport, push over another —
 /// is the user's own config, which the job's clone reads too: the job runs,
 /// and its branch goes where the user's own push would.
+///
+/// The two URLs name one repository, as two transports do: what is pushed
+/// to the one is mirrored into the other, where the round's `run` fetches
+/// the job's claimed branch from.
 #[tokio::test]
 async fn a_global_push_rewrite_is_followed_rather_than_refused() {
     let tmp = repo_running("fake-agent.sh").await;
@@ -468,6 +472,18 @@ async fn a_global_push_rewrite_is_followed_rather_than_refused() {
     git_in(
         elsewhere.path(),
         &["init", "--quiet", "--bare", pushed_to.to_str().unwrap()],
+    );
+    support::fake_cli(
+        &pushed_to.join("hooks"),
+        "post-receive",
+        &format!(
+            // The mirror pushes without the rewrite, which would send it
+            // straight back here.
+            "while read -r _ new ref; do\n  \
+               GIT_CONFIG_GLOBAL=/dev/null git push --quiet '{}' \"$new:$ref\"\n\
+             done\n",
+            origin_for(&tmp).display()
+        ),
     );
     let global_config = elsewhere.path().join("gitconfig");
     std::fs::write(
@@ -744,11 +760,13 @@ async fn docker_preflight_reports_every_problem_before_allocating() {
             ),
         )
         .env_remove("ASSEMBLY_GIT_TOKEN")
+        .env_remove("GH_TOKEN")
         .args(["submit", "--prompt", "x", "--runner", "docker"])
         .assert()
         .code(2)
         .stderr(contains("`docker` cannot be reached"))
         .stderr(contains("$ASSEMBLY_GIT_TOKEN is not set"))
+        .stderr(contains("$GH_TOKEN is not set"))
         .stderr(contains("is a path on this machine"));
 
     assert!(!job_dir(&tmp, 1).exists());
@@ -757,8 +775,8 @@ async fn docker_preflight_reports_every_problem_before_allocating() {
 
 /// The test origin is a directory on this machine: fine for the local
 /// runner, but no container can clone it. The docker runner says so before
-/// anything is allocated, even with a daemon and a token to hand — and
-/// refuses a `--pass-env` that would override the payload in the same
+/// anything is allocated, even with a daemon and both tokens to hand — and
+/// refuses a `--pass-env` naming a token it always sends, in the same
 /// breath.
 #[tokio::test]
 async fn a_remote_that_is_a_local_path_is_refused_for_a_container_runner() {
@@ -777,6 +795,7 @@ async fn a_remote_that_is_a_local_path_is_refused_for_a_container_runner() {
             ),
         )
         .env("ASSEMBLY_GIT_TOKEN", "t0ken")
+        .env("GH_TOKEN", "t0ken")
         .args([
             "submit",
             "--prompt",
@@ -784,12 +803,12 @@ async fn a_remote_that_is_a_local_path_is_refused_for_a_container_runner() {
             "--runner",
             "docker",
             "--pass-env",
-            "ASSEMBLY_JOB",
+            "GH_TOKEN",
         ])
         .assert()
         .code(2)
         .stderr(contains("is a path on this machine").and(contains("--runner local")))
-        .stderr(contains("--pass-env ASSEMBLY_JOB").and(contains("drop it")));
+        .stderr(contains("--pass-env GH_TOKEN").and(contains("drop it")));
 
     assert!(!job_dir(&tmp, 1).exists());
     discard_outside_state(&tmp);

@@ -1,7 +1,7 @@
 //! A child process's stdout and stderr, merged into one stream of lines.
 //!
 //! k8s merges the two anyway, so every runner treats them as one stream and
-//! lets the frame parser tell `job-exec`'s frames from anything else.
+//! lets the frame parser tell `run`'s frames from anything else.
 
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;

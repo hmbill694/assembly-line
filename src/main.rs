@@ -2,8 +2,7 @@ use assembly_line::cli::{Cli, Command, RunnerArgs, RunnerKind};
 use assembly_line::frame::{FrameWriter, ReadableFrames};
 use assembly_line::lifecycle::{self, Note, Prepared, Refusal, Work};
 use assembly_line::paths;
-use assembly_line::payload::RoundPayload;
-use assembly_line::round::{Verdict, run_round};
+use assembly_line::round::Verdict;
 use assembly_line::run::{self, RunRefused, RunRequest};
 use assembly_line::runner::docker::DockerRunner;
 use assembly_line::runner::kubernetes::KubernetesRunner;
@@ -24,10 +23,9 @@ fn main() -> ExitCode {
 
     let cli = Cli::parse();
     let root = paths::state_root(cli.root, |name| std::env::var(name).ok());
-    // `job-exec` and `run` keep no state, so a round inside a container with
-    // no `$HOME` still runs.
+    // `run` keeps no state, so a round inside a container with no `$HOME`
+    // still runs.
     match (cli.command, root) {
-        (Command::JobExec, _) => in_async_runtime(execute_payload_from_environment()),
         (
             Command::Run {
                 prompt,
@@ -95,26 +93,10 @@ fn install_tracing() {
         .init();
 }
 
-/// `job-exec`: read the payload, run the round, report it on stdout.
-///
-/// The exit code mirrors the round, but the collector decides from the
-/// frames — the code only matters when the frames never said.
-async fn execute_payload_from_environment() -> Result<ExitCode, String> {
-    let payload = RoundPayload::from_environment().map_err(|e| e.to_string())?;
-
-    let frames = FrameWriter::new(std::io::stdout());
-    let cancel = CancellationToken::new();
-    cancel_on_termination_signal(cancel.clone());
-
-    run_round(&payload, &frames, &std::env::temp_dir(), cancel)
-        .await
-        .map(exit_code_for)
-        .map_err(|e| e.to_string())
-}
-
 /// `run`: prepare, announce, run, conclude. With frames, stdout carries them
 /// and everything a person reads goes to stderr; without, a person reads
-/// stdout.
+/// stdout. The exit code mirrors the job, but a collector decides from the
+/// frames — the code only matters when the frames never said.
 async fn run_whole_job(request: RunRequest, as_frames: bool) -> Result<ExitCode, String> {
     let cancel = CancellationToken::new();
     cancel_on_termination_signal(cancel.clone());

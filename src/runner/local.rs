@@ -2,8 +2,8 @@
 //! toolchain and credentials.
 
 use super::child::ChildLines;
-use super::{JobSecrets, Runner, RunnerProblem, RunningRound, Termination};
-use crate::payload::{PAYLOAD_VAR, RoundPayload};
+use super::{JobSecrets, LaunchSpec, Runner, RunnerProblem, RunningRound, Termination};
+use crate::payload::GIT_TOKEN_VAR;
 use std::path::PathBuf;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -14,7 +14,7 @@ pub struct LocalRunner {
 }
 
 impl LocalRunner {
-    /// This very binary, which is what `job-exec` is.
+    /// This very binary, which is what `assembly run` is.
     ///
     /// # Errors
     ///
@@ -45,24 +45,22 @@ impl Runner for LocalRunner {
     /// launch is ready at once, with nothing for `cancel` to interrupt.
     fn launch(
         &self,
-        payload: &RoundPayload,
+        spec: &LaunchSpec,
         _secrets: &JobSecrets,
         _cancel: &CancellationToken,
     ) -> impl Future<Output = anyhow::Result<LocalRound>> + Send {
-        std::future::ready(self.spawn_job_exec(payload))
+        std::future::ready(self.spawn_run(spec))
     }
 }
 
 impl LocalRunner {
-    fn spawn_job_exec(&self, payload: &RoundPayload) -> anyhow::Result<LocalRound> {
+    fn spawn_run(&self, spec: &LaunchSpec) -> anyhow::Result<LocalRound> {
         let mut command = Command::new(&self.program);
         command
-            .arg("job-exec")
-            .env(PAYLOAD_VAR, serde_json::to_string(payload)?)
-            // Exported for a container runner, the token would make
-            // `job-exec` authenticate with it instead of the host's own
-            // credentials.
-            .env_remove(crate::payload::GIT_TOKEN_VAR);
+            .args(&spec.args)
+            // Exported for a container runner, the token would make `run`
+            // authenticate with it instead of the host's own credentials.
+            .env_remove(GIT_TOKEN_VAR);
         ChildLines::spawn(command).map(|lines| LocalRound { lines })
     }
 }
@@ -77,7 +75,7 @@ impl RunningRound for LocalRound {
         self.lines.next_line().await
     }
 
-    /// SIGTERM, which `job-exec` answers by cancelling its agent and
+    /// SIGTERM, which `run` answers by cancelling its agent and
     /// reporting the round. Returns at once; the round's end arrives on the
     /// stream.
     async fn cancel(&mut self) {

@@ -1,5 +1,5 @@
 use crate::frame::FrameWriter;
-use crate::payload::{FORGE_TOKEN_VAR, GIT_TOKEN_VAR, PAYLOAD_VAR};
+use crate::payload::{FORGE_TOKEN_VAR, GIT_TOKEN_VAR};
 use crate::provider::CommandSpec;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
@@ -99,11 +99,9 @@ async fn supervise<W: Write + Send + 'static>(
 ) -> anyhow::Result<ShellOutcome> {
     let mut child = detach_from_terminal(&mut command)
         .current_dir(cwd.as_ref())
-        // The payload names the round's plan; the agent has no use for it. The
-        // git and forge tokens are the job's to push and open its pull
+        // The git and forge tokens are the job's to push and open its pull
         // request with, so they are kept out of the agent's environment —
         // though not out of its reach; see `GIT_TOKEN_VAR`.
-        .env_remove(PAYLOAD_VAR)
         .env_remove(GIT_TOKEN_VAR)
         .env_remove(FORGE_TOKEN_VAR)
         .stdin(Stdio::null())

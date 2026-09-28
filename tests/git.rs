@@ -48,8 +48,8 @@ impl Fixture {
 }
 
 /// Clone `source` into a fresh directory under `into`, and check `branch` out
-/// at `at`. The same two calls `workspace::create` makes to build a job's
-/// scratch checkout.
+/// at `at`. The same two steps `run` takes to build a job's scratch
+/// checkout.
 async fn clone_checked_out(
     source: &Path,
     into: &Path,
@@ -153,7 +153,7 @@ async fn remote_carries(origin: &Path, branch: &str) -> bool {
 
 /// A push happens from a job's own clone, not from the repository it was cut
 /// from — so this pushes from a clone of `origin`, exactly as
-/// `workspace::create` builds one.
+/// `run` builds one.
 #[tokio::test]
 async fn pushing_a_branch_puts_it_on_the_remote() {
     let fx = Fixture::new().await;

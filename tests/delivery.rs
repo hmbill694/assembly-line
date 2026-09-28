@@ -2,6 +2,7 @@ use assembly_line::config::{Delivery, DeliveryMode, RepoConfig};
 use assembly_line::delivery::{Delivered, PullRequestText, deliver};
 use assembly_line::git;
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use std::path::{Path, PathBuf};
 use support::commit_all;
@@ -180,70 +181,78 @@ fn path_with(dir: &Path) -> String {
 }
 
 /// Delivery is gated on `verify`: a job's branch is real work either way, but
-/// a pull request for work that failed `verify` is noise. If delivery were
-/// not gated on `failed`, this job's branch would reach `deliver` in `Pr`
-/// mode; the `gh` on this test's `PATH` refuses, so that prints "pushed ...
-/// no pull request opened", never "not delivered" — so this assertion only
-/// passes when the gate is in place.
+/// a pull request for work that failed `verify` is noise. The `gh` here
+/// records every call, so a skipped gate would leave a record behind.
 #[tokio::test]
 async fn a_failed_round_is_not_delivered() {
     let tmp = repo_running("fake-agent.sh", "exit 1").await;
+    let (fake_bin, gh_capture) = fake_gh_capturing_args(&tmp);
 
     assembly(&tmp)
+        .env("PATH", path_with(&fake_bin))
         .args(["submit", "--prompt", "write a file"])
         .assert()
         .code(1)
-        .stdout(contains("not delivered"));
+        .stdout(contains("branch: al/job-1"))
+        .stdout(contains("pull request:").not());
 
+    assert!(
+        !gh_capture.exists(),
+        "a failed round reached gh: {:?}",
+        std::fs::read_to_string(&gh_capture)
+    );
     discard_outside_state(&tmp);
 }
 
-/// A passing revise round must deliver just as a passing new job does. Both
-/// reach the gate through `lifecycle::run`, but a revise gets there from
-/// `prepare_revision`, which nothing else here exercises.
-///
-/// The `gh` on this test's `PATH` always refuses, so reaching delivery prints
-/// "no pull request opened"; a skipped gate would print "not delivered".
+/// A passing revise round must deliver just as a passing new job does, and
+/// `submit` reports the pull request its `run` recorded.
 #[tokio::test]
 async fn a_passing_revise_round_is_delivered() {
     let tmp = repo_running("revising-agent.sh", "true").await;
+    let (fake_bin, gh_capture) = fake_gh_capturing_args(&tmp);
 
     assembly(&tmp)
+        .env("PATH", path_with(&fake_bin))
         .args(["submit", "--prompt", "hi"])
         .assert()
         .success();
 
     assembly(&tmp)
+        .env("PATH", path_with(&fake_bin))
         .args(["submit", "--job", "1", "--prompt", "add error handling"])
         .assert()
         .success()
         .stdout(contains("round 2"))
-        .stdout(contains(
-            "no pull request opened: gh is not available to tests",
-        ));
+        .stdout(contains("pull request: https://example.invalid/pr/1"));
+
+    let creates = std::fs::read_to_string(&gh_capture)
+        .unwrap()
+        .lines()
+        .filter(|call| call.starts_with("pr create"))
+        .count();
+    assert_eq!(creates, 2, "the revise round never reached delivery");
 
     let rounds = git::file_at_ref(origin_for(&tmp), "al/job-1", "rounds.txt")
         .await
         .unwrap()
         .unwrap_or_default();
-    // The revise prompt is several lines itself, so both rounds show as the
-    // first round's line followed by the feedback, not as a line count.
-    assert!(
-        rounds.starts_with("hi\n") && rounds.contains("add error handling"),
-        "the remote's branch does not carry both rounds: {rounds}"
+    assert_eq!(
+        rounds, "hi\nadd error handling\n",
+        "the remote's branch does not carry both rounds"
     );
 
     discard_outside_state(&tmp);
 }
 
-/// `config.base` is consulted at exactly one place — `lifecycle::hand_off`
+/// `config.base` is consulted at exactly one place — `run::deliver`
 /// choosing the pull request's base. This drives the real binary with a fake
 /// `gh` standing in for the real one, so the `--base` a pull request would
 /// open with is captured directly instead of inferred from which `Delivered`
 /// variant printed.
 ///
 /// It also proves the divergence note fires: `base = "release"` here while
-/// the job is cut from the default checked-out branch, `main`.
+/// the job is cut from the default checked-out branch, `main`. `run` prints
+/// it with the rest of the round's output, which is the job's log.
 #[tokio::test]
 async fn configured_base_reaches_the_pull_request_and_the_divergence_is_reported() {
     let tmp = repo_running_with_base("fake-agent.sh", "true", "release").await;
@@ -252,6 +261,10 @@ async fn configured_base_reaches_the_pull_request_and_the_divergence_is_reported
     assembly(&tmp)
         .env("PATH", path_with(&fake_bin))
         .args(["submit", "--prompt", "write a file"])
+        .assert()
+        .success();
+    assembly(&tmp)
+        .args(["logs", "1"])
         .assert()
         .success()
         .stdout(contains("will target 'release'"))

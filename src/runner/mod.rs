@@ -5,27 +5,83 @@ pub mod docker;
 pub mod kubernetes;
 pub mod local;
 
-use crate::payload::{
-    GIT_TOKEN_VAR, PAYLOAD_VAR, RoundPayload, https_equivalent, is_path_on_this_machine,
-};
+use crate::git::PinnedRef;
+use crate::job::JobId;
+use crate::payload::{FORGE_TOKEN_VAR, GIT_TOKEN_VAR, https_equivalent, is_path_on_this_machine};
 use std::collections::{BTreeMap, BTreeSet};
 use tokio_util::sync::CancellationToken;
 
 /// Where the image a container runner launches is published.
 pub const PUBLISHED_IMAGE_REPOSITORY: &str = "ghcr.io/hmbill694/assembly-line";
 
-/// A name unique to this round, for the container or Job that runs it, so
-/// two repositories' job 1 never collide.
-fn job_resource_name(payload: &RoundPayload) -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    format!("al-{}-{}-{nanos:x}", payload.job_id, payload.round)
+/// What a runner launches: `assembly` with `args`, for one round of one job.
+/// The arguments are the round's whole instruction — the command line a
+/// person types to reproduce it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchSpec {
+    /// Unique to this round, for the container or Job that runs it, so two
+    /// repositories' job 1 never collide.
+    pub name: String,
+    /// `assembly`'s arguments, `run` first.
+    pub args: Vec<String>,
+    /// The repository's `max_duration`, for a runner that enforces a
+    /// backstop of its own behind `run`'s.
+    pub command_limit_secs: Option<u64>,
 }
 
-/// The image published for this binary's version. For a release, its
-/// `job-exec` is built from the same tag, so the collector and the job agree
+impl LaunchSpec {
+    /// Round `round` of job `job`, fitted to where `R` runs it: a container
+    /// has neither the host's toolchain nor its SSH keys, so it provisions
+    /// the one and reaches the remote over HTTPS, with a token, in place of
+    /// the other. Every value is attached with `=`, so none can be read as
+    /// a flag.
+    ///
+    /// An absolute path is passed as a `file://` URL: `run --repo` reads a
+    /// path holding `.git` as a checkout and clones that checkout's own
+    /// remote, and a remote that is a non-bare repository holds one.
+    #[must_use]
+    pub fn for_round<R: Runner>(
+        job: JobId,
+        round: u32,
+        remote_url: &str,
+        base: &PinnedRef,
+        prompt: &str,
+        provider: &str,
+        command_limit_secs: Option<u64>,
+    ) -> LaunchSpec {
+        let remote_url = match (
+            R::RUNS_IN_A_CONTAINER,
+            std::path::Path::new(remote_url).is_absolute(),
+        ) {
+            (true, _) => https_equivalent(remote_url),
+            (false, true) => format!("file://{remote_url}"),
+            (false, false) => remote_url.to_string(),
+        };
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        LaunchSpec {
+            name: format!("al-{job}-{round}-{nanos:x}"),
+            args: [
+                "run".to_string(),
+                format!("--repo={remote_url}"),
+                format!("--ref={}@{}", base.name, base.sha),
+                format!("--job={job}"),
+                format!("--prompt={prompt}"),
+                format!("--provider={provider}"),
+                "--frames".to_string(),
+            ]
+            .into_iter()
+            .chain(R::RUNS_IN_A_CONTAINER.then(|| "--provision-toolchain".to_string()))
+            .collect(),
+            command_limit_secs,
+        }
+    }
+}
+
+/// The image published for this binary's version. For a release, the `run`
+/// inside is built from the same tag, so the collector and the round agree
 /// about the frame format; a build between releases carries the last version
 /// number and may have moved past that image — `--image` names a closer one.
 #[must_use]
@@ -33,13 +89,13 @@ pub fn published_image() -> String {
     format!("{PUBLISHED_IMAGE_REPOSITORY}:{}", env!("CARGO_PKG_VERSION"))
 }
 
-/// One way of running `job-exec` somewhere.
+/// One way of running `assembly run` somewhere.
 pub trait Runner {
     type Running: RunningRound + Send;
 
     /// Whether rounds run somewhere sharing nothing with the host. What that
     /// implies is decided in [`secrets_or_reasons_it_cannot_run`] and
-    /// [`payload_fitted_to`], so no caller branches on it.
+    /// [`LaunchSpec::for_round`], so no caller branches on it.
     const RUNS_IN_A_CONTAINER: bool;
 
     /// Every reason this runner cannot launch a round right now, checked
@@ -51,7 +107,7 @@ pub trait Runner {
     /// it had already created, so Ctrl-C reaches a round still starting.
     fn launch(
         &self,
-        payload: &RoundPayload,
+        spec: &LaunchSpec,
         secrets: &JobSecrets,
         cancel: &CancellationToken,
     ) -> impl Future<Output = anyhow::Result<Self::Running>> + Send;
@@ -102,7 +158,7 @@ pub enum RunnerProblem {
         namespace: String,
     },
     MissingEnvironment(String),
-    /// `--pass-env` named a variable assembly-line sets for the round itself.
+    /// `--pass-env` named a variable every round's container receives anyway.
     ReservedEnvironment(String),
     /// The remote is a path on this machine, which a container cannot see.
     RemoteIsLocalPath {
@@ -133,7 +189,7 @@ impl std::fmt::Display for RunnerProblem {
             ),
             Self::ReservedEnvironment(name) => write!(
                 f,
-                "--pass-env {name} names a variable assembly-line sets for the round itself — \
+                "--pass-env {name} names a variable every round's container receives anyway — \
                  drop it from --pass-env"
             ),
             Self::RemoteIsLocalPath { url } => write!(
@@ -146,8 +202,8 @@ impl std::fmt::Display for RunnerProblem {
 }
 
 /// Names a round's container environment carries whatever `--pass-env` says:
-/// the payload, and the git credential that is always sent.
-const RESERVED_ENVIRONMENT: [&str; 2] = [PAYLOAD_VAR, GIT_TOKEN_VAR];
+/// the git and forge credentials, which are always sent.
+const RESERVED_ENVIRONMENT: [&str; 2] = [GIT_TOKEN_VAR, FORGE_TOKEN_VAR];
 
 /// Environment a round's container receives, by name. Read from the host once,
 /// here, and only for names the host chose.
@@ -167,10 +223,9 @@ impl std::fmt::Debug for JobSecrets {
 }
 
 impl JobSecrets {
-    /// The git credential, always, plus each name in `pass_env`, looked up
-    /// with `lookup`. Every name that has no value is a problem, and so is
-    /// every name assembly-line reserves — a user's `ASSEMBLY_JOB` would
-    /// override the payload itself.
+    /// Both tokens, always, plus each name in `pass_env`, looked up with
+    /// `lookup`. Every name that has no value is a problem, and so is every
+    /// name assembly-line reserves, which `--pass-env` has no need to name.
     pub fn from_lookup(
         pass_env: &[String],
         lookup: impl Fn(&str) -> Option<String>,
@@ -183,7 +238,7 @@ impl JobSecrets {
             .filter(|(i, name)| !pass_env[..*i].contains(name))
             .map(|(_, name)| name.as_str())
             .partition(|name| RESERVED_ENVIRONMENT.contains(name));
-        let names: Vec<&str> = std::iter::once(GIT_TOKEN_VAR).chain(chosen).collect();
+        let names: Vec<&str> = RESERVED_ENVIRONMENT.into_iter().chain(chosen).collect();
         let (found, missing): (Vec<_>, Vec<_>) = names
             .into_iter()
             .map(|name| (name, lookup(name)))
@@ -233,7 +288,7 @@ pub fn reasons_a_container_cannot_run(remote_url: &str) -> Vec<RunnerProblem> {
 
 /// The secrets a round on `runner` carries, once nothing stands in the way.
 /// A runner sharing the host's environment carries none; a container carries
-/// the git credential and every `pass_env` name, read with
+/// the git and forge tokens and every `pass_env` name, read with
 /// `host_environment`, and cannot take a repository that needs the host.
 ///
 /// # Errors
@@ -267,23 +322,5 @@ pub async fn secrets_or_reasons_it_cannot_run<R: Runner>(
     match problems.is_empty() {
         true => Ok(secrets),
         false => Err(problems),
-    }
-}
-
-/// A round's payload, fitted to where `R` runs it. A container has neither
-/// the host's toolchain nor its SSH keys, so it provisions the one and
-/// reaches the remote over HTTPS, with a token, in place of the other.
-#[must_use]
-pub fn payload_fitted_to<R: Runner>(payload: RoundPayload) -> RoundPayload {
-    match R::RUNS_IN_A_CONTAINER {
-        true => RoundPayload {
-            remote_url: https_equivalent(&payload.remote_url),
-            provision_toolchain: true,
-            ..payload
-        },
-        false => RoundPayload {
-            provision_toolchain: false,
-            ..payload
-        },
     }
 }
