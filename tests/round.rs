@@ -152,6 +152,24 @@ async fn the_prompt_reaches_the_agent_intact() {
     assert_eq!(content.trim_end_matches('\n'), prompt);
 }
 
+#[tokio::test]
+async fn the_branch_remembers_what_its_round_was_asked() {
+    let h = Harness::new().await;
+    let prompt = "write a file\n\nin the root, please";
+
+    let outcome = h.run_job(prompt).await;
+    assert!(outcome.passed);
+
+    let body = git::run_allowing_failure(
+        &h.origin,
+        &["log", "-1", "--format=%B", &outcome.job_id.branch_name()],
+    )
+    .await
+    .unwrap()
+    .stdout;
+    assert!(body.contains("in the root, please"), "{body}");
+}
+
 /// A half-finished failure is exactly the case where the diff is worth
 /// reading, so the work is committed before the failure is judged.
 #[tokio::test]

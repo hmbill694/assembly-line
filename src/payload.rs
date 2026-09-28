@@ -151,11 +151,13 @@ impl RoundPayload {
     }
 }
 
-/// A commit subject a human can scan in `git log`: the job, then the first
-/// non-blank line of what it was asked to do.
-fn commit_message(job_id: JobId, prompt: &str) -> String {
+/// A commit message a human can scan in `git log` and an agent can learn
+/// from: the job and the first non-blank line of what it was asked, then
+/// the whole of what it was asked.
+#[must_use]
+pub fn commit_message(job_id: JobId, prompt: &str) -> String {
     match prompt.lines().find(|line| !line.trim().is_empty()) {
-        Some(first) => format!("job {job_id}: {}", first.trim()),
+        Some(first) => format!("job {job_id}: {}\n\n{}", first.trim(), prompt.trim()),
         None => format!("job {job_id}: agent work"),
     }
 }
