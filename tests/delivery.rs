@@ -169,7 +169,7 @@ async fn a_failed_round_is_not_delivered() {
     let tmp = repo_running("fake-agent.sh", "exit 1").await;
 
     assembly(&tmp)
-        .args(["run", "--prompt", "write a file"])
+        .args(["submit", "--prompt", "write a file"])
         .assert()
         .code(1)
         .stdout(contains("not delivered"));
@@ -177,7 +177,7 @@ async fn a_failed_round_is_not_delivered() {
     discard_outside_state(&tmp);
 }
 
-/// A passing revise round must deliver just as a passing `run` does. Both
+/// A passing revise round must deliver just as a passing new job does. Both
 /// reach the gate through `lifecycle::run`, but a revise gets there from
 /// `prepare_revision`, which nothing else here exercises.
 ///
@@ -188,12 +188,12 @@ async fn a_passing_revise_round_is_delivered() {
     let tmp = repo_running("revising-agent.sh", "true").await;
 
     assembly(&tmp)
-        .args(["run", "--prompt", "hi"])
+        .args(["submit", "--prompt", "hi"])
         .assert()
         .success();
 
     assembly(&tmp)
-        .args(["revise", "1", "add error handling"])
+        .args(["submit", "--job", "1", "--prompt", "add error handling"])
         .assert()
         .success()
         .stdout(contains("round 2"))
@@ -235,7 +235,7 @@ async fn configured_base_reaches_the_pull_request_and_the_divergence_is_reported
 
     assembly(&tmp)
         .env("PATH", path_with_fake_gh)
-        .args(["run", "--prompt", "write a file"])
+        .args(["submit", "--prompt", "write a file"])
         .assert()
         .success()
         .stdout(contains("will target 'release'"))
@@ -270,7 +270,7 @@ async fn a_pull_request_is_titled_and_described_from_the_job_not_from_local_comm
 
     assembly(&tmp)
         .env("PATH", path_with_fake_gh)
-        .args(["run", "--prompt", "write a file"])
+        .args(["submit", "--prompt", "write a file"])
         .assert()
         .success();
 

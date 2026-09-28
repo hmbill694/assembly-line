@@ -19,9 +19,10 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Run one job: an agent, a prompt, and the branch it leaves
-    Run {
-        /// What the agent is asked to do
+    /// Hand a job to a runner: a new job, or with --job, another round of
+    /// an existing one
+    Submit {
+        /// What the agent is asked to do — for a revise, what to change
         #[arg(
             long,
             conflicts_with = "prompt_file",
@@ -35,26 +36,17 @@ pub enum Command {
         #[arg(long)]
         repo: Option<PathBuf>,
         /// What to branch from. Defaults to the checked-out branch.
-        #[arg(long = "ref")]
+        #[arg(long = "ref", conflicts_with = "job")]
         base_ref: Option<String>,
         /// Overrides the repository's declared provider
-        #[arg(long)]
+        #[arg(long, conflicts_with = "job")]
         provider: Option<String>,
-        #[command(flatten)]
-        runner: RunnerArgs,
-    },
-
-    /// Run another round of a job, based on its own branch, with feedback
-    ///
-    /// A new round, not a resumption: the agent's prior work arrives as files
-    /// on disk, and this round appends to the job's branch.
-    Revise {
-        job_id: u64,
-        /// What to change about the previous round's work
-        feedback: String,
-        /// The repository whose jobs to look at. Defaults to the enclosing one.
+        /// Another round of this job, on its own branch, instead of a new job
+        ///
+        /// A new round, not a resumption: the agent's prior work arrives as
+        /// files on disk, and this round appends to the job's branch.
         #[arg(long)]
-        repo: Option<PathBuf>,
+        job: Option<u64>,
         #[command(flatten)]
         runner: RunnerArgs,
     },
@@ -96,8 +88,8 @@ pub enum RunnerKind {
     K8s,
 }
 
-/// Where a round runs. Shared by `run` and `revise`: a revise is a new round
-/// cut from the job's branch, so it may run somewhere the first round did not.
+/// Where a round runs. A revise is a new round cut from the job's branch, so
+/// it may run somewhere the first round did not.
 #[derive(Debug, clap::Args)]
 pub struct RunnerArgs {
     #[arg(long, value_enum, default_value_t = RunnerKind::Local)]

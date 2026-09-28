@@ -222,7 +222,7 @@ pub fn create_job(jobs_dir: &Path, id: JobId) -> io::Result<JobPaths> {
 }
 
 /// Locate an existing job. `NotFound` rather than an empty result, so
-/// `revise` and `status` can report a wrong job id.
+/// `submit --job` and `status` can report a wrong job id.
 pub fn open_job(jobs_dir: &Path, id: JobId) -> io::Result<JobPaths> {
     let dir = jobs_dir.join(id.to_string());
     match dir.is_dir() {

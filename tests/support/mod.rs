@@ -241,7 +241,8 @@ impl Harness {
     pub async fn revise_job(&self, job_id: JobId, feedback: &str) -> Outcome {
         let request = RevisionRequest {
             job_id: job_id.into(),
-            feedback: feedback.to_string(),
+            prompt: Some(feedback.to_string()),
+            prompt_file: None,
             repo: Some(self.repo.clone()),
         };
         self.run(prepare_revision(&self.runner, &[], &self.root, request).await)

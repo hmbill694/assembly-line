@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 /// the user is standing in.
 ///
 /// Every command resolves it the same way, so a job started with `--repo` is
-/// findable by `status`, `logs` and `revise` with the same `--repo`.
+/// findable by `status`, `logs` and `submit --job` with the same `--repo`.
 ///
 /// # Errors
 ///

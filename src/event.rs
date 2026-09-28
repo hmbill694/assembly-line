@@ -20,7 +20,7 @@ pub enum EventKind {
         prompt: String,
         provider: String,
     },
-    /// A round began. Round 1 is the job's `run`; each revise adds one.
+    /// A round began. Round 1 starts the job; each revise adds one.
     RoundStarted {
         round: u32,
     },

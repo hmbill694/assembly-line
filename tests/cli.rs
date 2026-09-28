@@ -104,7 +104,7 @@ async fn run_exits_zero_and_records_the_job() {
     let tmp = repo_running("fake-agent.sh").await;
 
     assembly(&tmp)
-        .args(["run", "--prompt", "do the thing"])
+        .args(["submit", "--prompt", "do the thing"])
         .assert()
         .success()
         .stdout(contains("job 1: passed"));
@@ -119,7 +119,7 @@ async fn run_exits_one_when_the_agent_fails_but_still_leaves_the_branch() {
     let tmp = repo_running("failing-agent.sh").await;
 
     assembly(&tmp)
-        .args(["run", "--prompt", "x"])
+        .args(["submit", "--prompt", "x"])
         .assert()
         .code(1)
         .stdout(contains("job 1: failed").and(contains("exit 3")));
@@ -155,7 +155,7 @@ async fn a_job_id_already_taken_on_the_remote_is_skipped() {
     let theirs = git_on_origin(&tmp, &["rev-parse", "al/job-1"]);
 
     assembly(&tmp)
-        .args(["run", "--prompt", "x"])
+        .args(["submit", "--prompt", "x"])
         .assert()
         .success()
         .stdout(contains("job 2: passed"));
@@ -180,7 +180,7 @@ async fn a_job_id_already_taken_on_the_remote_is_skipped() {
 async fn a_job_whose_branch_was_deleted_keeps_its_directory_to_itself() {
     let tmp = repo_running("fake-agent.sh").await;
     assembly(&tmp)
-        .args(["run", "--prompt", "first job"])
+        .args(["submit", "--prompt", "first job"])
         .assert()
         .success();
     git_on_origin(&tmp, &["branch", "-D", "al/job-1"]);
@@ -188,14 +188,14 @@ async fn a_job_whose_branch_was_deleted_keeps_its_directory_to_itself() {
     let first_events = std::fs::read_to_string(&events).unwrap();
 
     assembly(&tmp)
-        .args(["run", "--prompt", "second job"])
+        .args(["submit", "--prompt", "second job"])
         .assert()
         .failure()
-        .stderr(contains("still holds that job").and(contains("run again")));
+        .stderr(contains("still holds that job").and(contains("submit again")));
     assert_eq!(std::fs::read_to_string(&events).unwrap(), first_events);
 
     assembly(&tmp)
-        .args(["run", "--prompt", "second job"])
+        .args(["submit", "--prompt", "second job"])
         .assert()
         .success()
         .stdout(contains("job 2: passed"));
@@ -207,13 +207,13 @@ async fn a_job_whose_branch_was_deleted_keeps_its_directory_to_itself() {
 async fn revising_a_job_whose_branch_was_deleted_says_there_is_nothing_to_revise() {
     let tmp = repo_running("fake-agent.sh").await;
     assembly(&tmp)
-        .args(["run", "--prompt", "x"])
+        .args(["submit", "--prompt", "x"])
         .assert()
         .success();
     git_on_origin(&tmp, &["branch", "-D", "al/job-1"]);
 
     assembly(&tmp)
-        .args(["revise", "1", "try again"])
+        .args(["submit", "--job", "1", "--prompt", "try again"])
         .assert()
         .code(2)
         .stderr(contains("job 1 has no branch on 'origin'").and(contains("nothing to revise")));
@@ -227,7 +227,7 @@ async fn a_repository_that_has_not_opted_in_is_told_which_file_to_write() {
     publish_to_origin(&tmp).await;
 
     assembly(&tmp)
-        .args(["run", "--prompt", "x"])
+        .args(["submit", "--prompt", "x"])
         .assert()
         .code(2)
         .stderr(contains(".assembly/config.toml"));
@@ -247,7 +247,7 @@ async fn a_repository_with_no_remote_is_told_to_add_one() {
     let tmp = support::repo_with_initial_commit().await;
 
     assembly(&tmp)
-        .args(["run", "--prompt", "x"])
+        .args(["submit", "--prompt", "x"])
         .assert()
         .code(2)
         .stderr(contains("no 'origin' remote").and(contains("add one")))
@@ -260,7 +260,7 @@ async fn a_repository_with_no_remote_is_told_to_add_one() {
 async fn a_job_whose_round_changed_nothing_can_still_be_revised() {
     let tmp = repo_running("noop-agent.sh").await;
     assembly(&tmp)
-        .args(["run", "--prompt", "x"])
+        .args(["submit", "--prompt", "x"])
         .assert()
         .success();
     assert_eq!(
@@ -270,7 +270,7 @@ async fn a_job_whose_round_changed_nothing_can_still_be_revised() {
     );
 
     assembly(&tmp)
-        .args(["revise", "1", "try again"])
+        .args(["submit", "--job", "1", "--prompt", "try again"])
         .assert()
         .success();
 
@@ -282,7 +282,7 @@ async fn an_undeclared_provider_is_rejected_before_a_job_directory_is_allocated(
     let tmp = repo_running("fake-agent.sh").await;
 
     assembly(&tmp)
-        .args(["run", "--prompt", "x", "--provider", "ghost"])
+        .args(["submit", "--prompt", "x", "--provider", "ghost"])
         .assert()
         .code(2)
         .stderr(contains("ghost").and(contains("add a block for it")));
@@ -300,7 +300,7 @@ async fn run_outside_a_git_repo_explains_itself() {
         .unwrap()
         .current_dir(tmp.path())
         .env("ASSEMBLY_ROOT", tmp.path().join("root"))
-        .args(["run", "--prompt", "x"])
+        .args(["submit", "--prompt", "x"])
         .assert()
         .code(2)
         .stderr(contains("not inside a git repository"));
@@ -310,7 +310,7 @@ async fn run_outside_a_git_repo_explains_itself() {
 async fn a_run_with_no_prompt_at_all_is_a_usage_error() {
     let tmp = repo_running("fake-agent.sh").await;
 
-    assembly(&tmp).arg("run").assert().code(2);
+    assembly(&tmp).arg("submit").assert().code(2);
 
     discard_outside_state(&tmp);
 }
@@ -321,7 +321,7 @@ async fn a_prompt_can_come_from_a_file_instead() {
     std::fs::write(tmp.path().join("auth.md"), "Implement auth").unwrap();
 
     assembly(&tmp)
-        .args(["run", "--prompt-file", "auth.md"])
+        .args(["submit", "--prompt-file", "auth.md"])
         .assert()
         .success();
 
@@ -336,7 +336,7 @@ async fn a_missing_prompt_file_is_reported_before_the_job_starts() {
     let tmp = repo_running("fake-agent.sh").await;
 
     assembly(&tmp)
-        .args(["run", "--prompt-file", "gone.md"])
+        .args(["submit", "--prompt-file", "gone.md"])
         .assert()
         .code(2)
         .stderr(contains("gone.md"));
@@ -351,7 +351,7 @@ async fn status_and_logs_report_a_finished_job() {
     let tmp = repo_running("failing-agent.sh").await;
 
     assembly(&tmp)
-        .args(["run", "--prompt", "x"])
+        .args(["submit", "--prompt", "x"])
         .assert()
         .code(1);
 
@@ -383,7 +383,7 @@ async fn the_local_runner_keeps_the_hosts_credentials_even_with_a_token_exported
 
     assembly(&tmp)
         .env("ASSEMBLY_GIT_TOKEN", "t")
-        .args(["run", "--prompt", "x"])
+        .args(["submit", "--prompt", "x"])
         .assert()
         .success();
 
@@ -398,7 +398,7 @@ async fn the_local_runner_keeps_the_hosts_credentials_even_with_a_token_exported
 }
 
 /// Every command resolves the repository the same way, so a job started with
-/// `--repo` is findable by `status`, `logs` and `revise` with the same
+/// `--repo` is findable by `status`, `logs` and `submit --job` with the same
 /// `--repo` — and invisible without it.
 #[tokio::test]
 async fn a_job_started_elsewhere_is_found_by_pointing_the_read_commands_at_it() {
@@ -412,7 +412,7 @@ async fn a_job_started_elsewhere_is_found_by_pointing_the_read_commands_at_it() 
     };
 
     assembly_standing_in()
-        .args(["run", "--repo", &at, "--prompt", "x"])
+        .args(["submit", "--repo", &at, "--prompt", "x"])
         .assert()
         .success();
 
@@ -441,7 +441,15 @@ async fn a_job_started_elsewhere_is_found_by_pointing_the_read_commands_at_it() 
         .stdout(contains("fake-agent"));
 
     assembly_standing_in()
-        .args(["revise", "1", "do it again", "--repo", &at])
+        .args([
+            "submit",
+            "--job",
+            "1",
+            "--prompt",
+            "do it again",
+            "--repo",
+            &at,
+        ])
         .assert()
         .success()
         .stdout(contains("round 2"));
@@ -474,7 +482,7 @@ async fn a_global_push_rewrite_is_followed_rather_than_refused() {
 
     assembly(&tmp)
         .env("GIT_CONFIG_GLOBAL", &global_config)
-        .args(["run", "--prompt", "x"])
+        .args(["submit", "--prompt", "x"])
         .assert()
         .success();
     assert_eq!(
@@ -501,7 +509,7 @@ async fn a_job_branches_from_the_ref_it_is_given() {
     assert_ne!(git(&tmp, &["rev-parse", "HEAD"]), earlier);
 
     assembly(&tmp)
-        .args(["run", "--ref", "start-here", "--prompt", "x"])
+        .args(["submit", "--ref", "start-here", "--prompt", "x"])
         .assert()
         .success();
     assert_eq!(
@@ -512,7 +520,7 @@ async fn a_job_branches_from_the_ref_it_is_given() {
 
     // With no --ref the job follows the checked-out branch instead.
     assembly(&tmp)
-        .args(["run", "--prompt", "x"])
+        .args(["submit", "--prompt", "x"])
         .assert()
         .success();
     assert_eq!(
@@ -530,7 +538,7 @@ async fn a_detached_head_is_asked_to_name_its_ref() {
     git(&tmp, &["checkout", "--detach"]);
 
     assembly(&tmp)
-        .args(["run", "--prompt", "x"])
+        .args(["submit", "--prompt", "x"])
         .assert()
         .code(2)
         .stderr(contains("--ref"));
@@ -545,7 +553,7 @@ async fn unpushed_local_work_is_pointed_out_and_the_remotes_ref_is_used() {
     commit_all(tmp.path(), "unpushed").await.unwrap().unwrap();
 
     assembly(&tmp)
-        .args(["run", "--prompt", "x"])
+        .args(["submit", "--prompt", "x"])
         .assert()
         .success()
         .stdout(contains("push first"));
@@ -589,12 +597,12 @@ async fn a_revise_round_continues_the_branch_instead_of_starting_over() {
     let tmp = repo_running("revising-agent.sh").await;
 
     assembly(&tmp)
-        .args(["run", "--prompt", "hi"])
+        .args(["submit", "--prompt", "hi"])
         .assert()
         .success();
 
     assembly(&tmp)
-        .args(["revise", "1", "add error handling"])
+        .args(["submit", "--job", "1", "--prompt", "add error handling"])
         .assert()
         .success()
         .stdout(contains("round 2").and(contains("job 1: passed")));
@@ -620,15 +628,70 @@ async fn a_revise_round_continues_the_branch_instead_of_starting_over() {
     discard_outside_state(&tmp);
 }
 
-/// Feedback is a required argument — clap refuses the invocation before
-/// assembly ever sees it.
 #[tokio::test]
-async fn revise_without_feedback_is_a_usage_error() {
-    let tmp = repo_running("fake-agent.sh").await;
+async fn a_revise_can_take_its_prompt_from_a_file() {
+    let tmp = repo_running("revising-agent.sh").await;
+    std::fs::write(tmp.path().join("feedback.md"), "add error handling").unwrap();
+    assembly(&tmp)
+        .args(["submit", "--prompt", "hi"])
+        .assert()
+        .success();
 
-    assembly(&tmp).args(["revise", "1"]).assert().code(2);
+    assembly(&tmp)
+        .args(["submit", "--job", "1", "--prompt-file", "feedback.md"])
+        .assert()
+        .success();
+
+    let body = git_on_origin(&tmp, &["show", "al/job-1:rounds.txt"]);
+    assert!(body.contains("add error handling"), "{body}");
 
     discard_outside_state(&tmp);
+}
+
+#[tokio::test]
+async fn a_revise_with_a_missing_prompt_file_starts_no_round() {
+    let tmp = repo_running("fake-agent.sh").await;
+    assembly(&tmp)
+        .args(["submit", "--prompt", "x"])
+        .assert()
+        .success();
+    let events = job_dir(&tmp, 1).join("events.jsonl");
+    let first_events = std::fs::read_to_string(&events).unwrap();
+
+    assembly(&tmp)
+        .args(["submit", "--job", "1", "--prompt-file", "gone.md"])
+        .assert()
+        .code(2)
+        .stderr(contains("gone.md"));
+    assert_eq!(std::fs::read_to_string(&events).unwrap(), first_events);
+
+    discard_outside_state(&tmp);
+}
+
+/// A revise needs to be told what to change, like any submit.
+#[tokio::test]
+async fn a_revise_without_a_prompt_is_a_usage_error() {
+    let tmp = repo_running("fake-agent.sh").await;
+
+    assembly(&tmp)
+        .args(["submit", "--job", "1"])
+        .assert()
+        .code(2)
+        .stderr(contains("required arguments were not provided"));
+
+    discard_outside_state(&tmp);
+}
+
+/// A revise starts from the job's own base and provider; naming others
+/// would say something the revise cannot honour.
+#[test]
+fn a_revise_cannot_name_a_ref_or_a_provider() {
+    for flag in ["--ref", "--provider"] {
+        let parsed = Cli::try_parse_from([
+            "assembly", "submit", "--job", "1", "--prompt", "fb", flag, "x",
+        ]);
+        assert!(parsed.is_err(), "{flag} was accepted alongside --job");
+    }
 }
 
 #[tokio::test]
@@ -637,7 +700,7 @@ async fn a_job_writes_nothing_to_the_target_repositorys_working_tree() {
     let before = git(&tmp, &["rev-parse", "HEAD"]);
 
     assembly(&tmp)
-        .args(["run", "--prompt", "x"])
+        .args(["submit", "--prompt", "x"])
         .assert()
         .success();
 
@@ -654,7 +717,7 @@ async fn a_job_writes_nothing_to_the_target_repositorys_working_tree() {
 async fn container_flags_are_refused_for_the_local_runner() {
     let tmp = repo_running("fake-agent.sh").await;
     assembly(&tmp)
-        .args(["run", "--prompt", "x", "--pass-env", "ANTHROPIC_API_KEY"])
+        .args(["submit", "--prompt", "x", "--pass-env", "ANTHROPIC_API_KEY"])
         .assert()
         .code(2)
         .stderr(contains("container runners"));
@@ -681,7 +744,7 @@ async fn docker_preflight_reports_every_problem_before_allocating() {
             ),
         )
         .env_remove("ASSEMBLY_GIT_TOKEN")
-        .args(["run", "--prompt", "x", "--runner", "docker"])
+        .args(["submit", "--prompt", "x", "--runner", "docker"])
         .assert()
         .code(2)
         .stderr(contains("`docker` cannot be reached"))
@@ -715,7 +778,7 @@ async fn a_remote_that_is_a_local_path_is_refused_for_a_container_runner() {
         )
         .env("ASSEMBLY_GIT_TOKEN", "t0ken")
         .args([
-            "run",
+            "submit",
             "--prompt",
             "x",
             "--runner",
@@ -736,7 +799,7 @@ async fn a_remote_that_is_a_local_path_is_refused_for_a_container_runner() {
 async fn the_k8s_runner_requires_a_namespace() {
     let tmp = repo_running("fake-agent.sh").await;
     assembly(&tmp)
-        .args(["run", "--prompt", "x", "--runner", "k8s"])
+        .args(["submit", "--prompt", "x", "--runner", "k8s"])
         .assert()
         .code(2)
         .stderr(contains("--namespace"));
@@ -748,7 +811,7 @@ async fn a_namespace_is_refused_for_runners_that_have_none() {
     let tmp = repo_running("fake-agent.sh").await;
     assembly(&tmp)
         .args([
-            "run",
+            "submit",
             "--prompt",
             "x",
             "--runner",
@@ -764,9 +827,7 @@ async fn a_namespace_is_refused_for_runners_that_have_none() {
 
 fn inapplicable_flags_of(argv: &[&str]) -> Option<InapplicableFlags> {
     match Cli::try_parse_from(argv).unwrap().command {
-        Subcommand::Run { runner, .. } | Subcommand::Revise { runner, .. } => {
-            runner.inapplicable_flags()
-        }
+        Subcommand::Submit { runner, .. } => runner.inapplicable_flags(),
         other => panic!("not a command that runs a job: {other:?}"),
     }
 }
@@ -776,7 +837,7 @@ fn a_kubectl_context_is_inapplicable_to_docker() {
     assert_eq!(
         inapplicable_flags_of(&[
             "assembly",
-            "run",
+            "submit",
             "--prompt",
             "x",
             "--runner",
@@ -791,7 +852,16 @@ fn a_kubectl_context_is_inapplicable_to_docker() {
 #[test]
 fn pass_env_is_inapplicable_to_the_local_runner() {
     assert_eq!(
-        inapplicable_flags_of(&["assembly", "revise", "1", "fb", "--pass-env", "KEY"]),
+        inapplicable_flags_of(&[
+            "assembly",
+            "submit",
+            "--job",
+            "1",
+            "--prompt",
+            "fb",
+            "--pass-env",
+            "KEY"
+        ]),
         Some(InapplicableFlags::ContainerOnly)
     );
 }
@@ -801,7 +871,7 @@ fn every_flag_applies_to_the_k8s_runner() {
     assert_eq!(
         inapplicable_flags_of(&[
             "assembly",
-            "run",
+            "submit",
             "--prompt",
             "x",
             "--runner",
