@@ -15,7 +15,6 @@ async fn a_repo_declares_how_the_factory_builds_it() {
 provider = "claude"
 verify = "cargo test"
 base = "main"
-copy = [".env"]
 
 [providers.claude]
 cmd = "claude"
@@ -32,7 +31,6 @@ args = ["-p", "{prompt}"]
     assert_eq!(config.provider.as_deref(), Some("claude"));
     assert_eq!(config.verify.as_deref(), Some("cargo test"));
     assert_eq!(config.base.as_deref(), Some("main"));
-    assert_eq!(config.copy, vec![".env".to_string()]);
     assert!(config.providers.contains_key("claude"));
 }
 

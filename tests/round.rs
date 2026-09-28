@@ -407,52 +407,16 @@ async fn an_agent_that_commits_its_own_work_has_it_published() {
 /// checked out — not whatever the job's local branch was left pointing at.
 #[tokio::test]
 async fn an_agent_that_switches_branches_publishes_what_it_left_checked_out() {
-    let h = Harness::with_config(&format!(
-        "provider = \"fake\"\ncopy = [\".env\"]\n{}",
-        provider_block("branch-switching-agent.sh", "a")
-    ))
-    .await;
-    std::fs::write(h.repo.join(".env"), "API_KEY=hunter2\n").unwrap();
+    let h = Harness::with_config(&config_running("branch-switching-agent.sh")).await;
 
     let outcome = h.run_job("switched").await;
     assert!(outcome.passed);
 
-    let branch = outcome.job_id.branch_name();
     assert_eq!(
-        h.file_on_remote_branch(&branch, "agent-output.txt")
+        h.file_on_remote_branch(&outcome.job_id.branch_name(), "agent-output.txt")
             .await
             .as_deref(),
         Some("switched\n")
-    );
-    let history =
-        git::run_allowing_failure(&h.origin, &["log", "--format=", "--name-only", &branch])
-            .await
-            .unwrap()
-            .stdout;
-    assert!(
-        !history.contains(".env"),
-        "the seeded secret reached the remote: {history}"
-    );
-}
-
-#[tokio::test]
-async fn seeded_files_reach_the_agent_but_never_the_branch() {
-    let h = Harness::with_config(&format!(
-        "provider = \"fake\"\ncopy = [\".env\"]\n{}",
-        provider_block("fake-agent.sh", "a")
-    ))
-    .await;
-    std::fs::write(h.repo.join(".env"), "API_KEY=hunter2\n").unwrap();
-
-    let outcome = h.run_job("x").await;
-    assert!(outcome.passed);
-
-    let listed = h
-        .files_on_remote_branch(&outcome.job_id.branch_name())
-        .await;
-    assert!(
-        !listed.contains(".env"),
-        "the seeded secret reached a branch: {listed}"
     );
 }
 

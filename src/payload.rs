@@ -10,7 +10,7 @@ use crate::git::{self, PinnedRef};
 use crate::job::JobId;
 use crate::provider::{CommandSpec, render_command};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// The environment variable a payload travels in: the one channel a child
 /// process, `docker run` and a pod spec all share.
@@ -73,10 +73,6 @@ pub struct RoundPayload {
     /// Cap on the agent, and again on `verify`, in whole seconds. See
     /// [`RepoConfig::max_duration`].
     pub command_limit_secs: Option<u64>,
-    pub copy: Vec<String>,
-    /// Where `copy` paths resolve from — the host's checkout, which only a
-    /// runner sharing the host's filesystem can read.
-    pub seed_from: PathBuf,
     /// Whether the round runs `mise install` before the agent. Set by
     /// runners whose rounds arrive in an image with no toolchain of the
     /// repository's own.
@@ -93,7 +89,6 @@ pub struct RoundRequest<'a> {
     pub start: PinnedRef,
     pub remote_name: &'a str,
     pub remote_url: String,
-    pub seed_from: &'a Path,
 }
 
 impl RoundPayload {
@@ -129,8 +124,6 @@ impl RoundPayload {
             commit_message: commit_message(request.job_id, request.prompt),
             verify: config.verify.clone(),
             command_limit_secs,
-            copy: config.copy.clone(),
-            seed_from: request.seed_from.to_path_buf(),
             provision_toolchain: false,
         })
     }

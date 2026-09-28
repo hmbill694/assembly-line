@@ -101,7 +101,6 @@ pub enum RunnerProblem {
         resource: String,
         namespace: String,
     },
-    CopyNeedsLocalRunner,
     MissingEnvironment(String),
     /// `--pass-env` named a variable assembly-line sets for the round itself.
     ReservedEnvironment(String),
@@ -126,11 +125,6 @@ impl std::fmt::Display for RunnerProblem {
                 f,
                 "cannot {verb} {resource} in namespace '{namespace}' — grant the permission, \
                  or pass a --namespace where you have it"
-            ),
-            Self::CopyNeedsLocalRunner => write!(
-                f,
-                "this repository declares `copy`, which reads files from your checkout — a \
-                 container has no access to it; use --runner local"
             ),
             Self::MissingEnvironment(name) => write!(
                 f,
@@ -225,19 +219,16 @@ impl JobSecrets {
     }
 }
 
-/// What a repository asks for that no container can give it: files from
-/// the host's checkout, or a remote that is only a path on the host.
+/// What a repository asks for that no container can give it: a remote that
+/// is only a path on the host.
 #[must_use]
-pub fn reasons_a_container_cannot_run(copy: &[String], remote_url: &str) -> Vec<RunnerProblem> {
-    [
-        (!copy.is_empty()).then_some(RunnerProblem::CopyNeedsLocalRunner),
-        is_path_on_this_machine(remote_url).then(|| RunnerProblem::RemoteIsLocalPath {
+pub fn reasons_a_container_cannot_run(remote_url: &str) -> Vec<RunnerProblem> {
+    is_path_on_this_machine(remote_url)
+        .then(|| RunnerProblem::RemoteIsLocalPath {
             url: remote_url.to_string(),
-        }),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
+        })
+        .into_iter()
+        .collect()
 }
 
 /// The secrets a round on `runner` carries, once nothing stands in the way.
@@ -251,7 +242,6 @@ pub fn reasons_a_container_cannot_run(copy: &[String], remote_url: &str) -> Vec<
 /// the container's, then each `pass_env` name it cannot carry.
 pub async fn secrets_or_reasons_it_cannot_run<R: Runner>(
     runner: &R,
-    copy: &[String],
     remote_url: &str,
     pass_env: &[String],
     host_environment: impl Fn(&str) -> Option<String>,
@@ -259,7 +249,7 @@ pub async fn secrets_or_reasons_it_cannot_run<R: Runner>(
     let (secrets, container_problems) = match R::RUNS_IN_A_CONTAINER {
         true => {
             let (secrets, unsendable) = JobSecrets::from_lookup(pass_env, host_environment);
-            let problems: Vec<RunnerProblem> = reasons_a_container_cannot_run(copy, remote_url)
+            let problems: Vec<RunnerProblem> = reasons_a_container_cannot_run(remote_url)
                 .into_iter()
                 .chain(unsendable)
                 .collect();

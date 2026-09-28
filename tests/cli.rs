@@ -63,16 +63,6 @@ async fn repo_running(script: &str) -> tempfile::TempDir {
     .await
 }
 
-/// Like [`repo_running`], but the config also declares `copy` — which no
-/// container runner can honour.
-async fn repo_running_with_copy(script: &str) -> tempfile::TempDir {
-    repo_opted_in_with(&format!(
-        "verify = \"true\"\ncopy = [\"local.env\"]\n{}",
-        support::config_running(script)
-    ))
-    .await
-}
-
 /// A repository whose committed, published `.assembly/config.toml` is `config`.
 async fn repo_opted_in_with(config: &str) -> tempfile::TempDir {
     let tmp = support::repo_with_initial_commit().await;
@@ -607,7 +597,7 @@ async fn container_flags_are_refused_for_the_local_runner() {
 /// allocated.
 #[tokio::test]
 async fn docker_preflight_reports_every_problem_before_allocating() {
-    let tmp = repo_running_with_copy("fake-agent.sh").await;
+    let tmp = repo_running("fake-agent.sh").await;
     let fakes = tempfile::tempdir().unwrap();
     // A docker that cannot reach its daemon.
     support::fake_cli(fakes.path(), "docker", "echo 'no daemon' >&2\nexit 1\n");
@@ -626,7 +616,6 @@ async fn docker_preflight_reports_every_problem_before_allocating() {
         .assert()
         .code(2)
         .stderr(contains("`docker` cannot be reached"))
-        .stderr(contains("declares `copy`"))
         .stderr(contains("$ASSEMBLY_GIT_TOKEN is not set"))
         .stderr(contains("is a path on this machine"));
 
