@@ -4,6 +4,7 @@ pub mod claim;
 pub mod cli;
 pub mod collect;
 pub mod config;
+pub mod daemon;
 pub mod delivery;
 pub mod event;
 pub mod exec;
