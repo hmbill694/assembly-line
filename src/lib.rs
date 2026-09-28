@@ -11,6 +11,7 @@ pub mod frame;
 pub mod git;
 pub mod job;
 pub mod lifecycle;
+pub mod locate;
 pub mod paths;
 pub mod payload;
 pub mod provider;

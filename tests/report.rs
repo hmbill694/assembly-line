@@ -1,4 +1,5 @@
 use assembly_line::event::{Event, EventKind};
+use assembly_line::git::PinnedRef;
 use assembly_line::report::JobReport;
 use assembly_line::state::JobState;
 use chrono::{DateTime, TimeDelta, Utc};
@@ -373,4 +374,28 @@ fn timing_is_reported_only_once_a_round_has_ended() {
             .unwrap(),
         "took 2.0s"
     );
+}
+
+#[test]
+fn a_jobs_identity_is_its_first_requested_round() {
+    let requested = |prompt: &str, sha: &str| EventKind::RoundRequested {
+        remote_url: "git@github.com:o/r.git".into(),
+        base: PinnedRef {
+            name: "main".into(),
+            sha: sha.into(),
+        },
+        prompt: prompt.into(),
+        provider: "claude".into(),
+    };
+    let events = timeline(vec![
+        (0, requested("add auth", "a1")),
+        (1, requested("use sessions", "b2")),
+    ]);
+
+    let report = JobReport::from_events(1, &events);
+
+    assert_eq!(report.remote_url.as_deref(), Some("git@github.com:o/r.git"));
+    assert_eq!(report.first_prompt.as_deref(), Some("add auth"));
+    assert_eq!(report.base.map(|base| base.sha).as_deref(), Some("b2"));
+    assert_eq!(report.provider.as_deref(), Some("claude"));
 }

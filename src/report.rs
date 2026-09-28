@@ -1,4 +1,5 @@
 use crate::event::{Event, EventKind};
+use crate::git::PinnedRef;
 use crate::state::JobState;
 use chrono::{DateTime, Utc};
 use std::time::Duration;
@@ -46,6 +47,15 @@ pub struct JobReport {
     /// is a job that has not produced anything yet, even though its claimed
     /// branch exists.
     pub branch: Option<String>,
+    /// Where the job clones from and pushes to, from its first request.
+    pub remote_url: Option<String>,
+    /// The job's base as its latest round asked for it. A revise starts from
+    /// the job's branch, not from here.
+    pub base: Option<PinnedRef>,
+    /// What the job was first asked to do.
+    pub first_prompt: Option<String>,
+    /// The provider its latest round was asked to use.
+    pub provider: Option<String>,
 }
 
 /// A job's facts, accumulated as its event stream is folded.
@@ -58,11 +68,27 @@ struct JobProgress {
     committed_diff: Option<DiffSummary>,
     detail: Option<String>,
     branch: Option<String>,
+    remote_url: Option<String>,
+    base: Option<PinnedRef>,
+    first_prompt: Option<String>,
+    provider: Option<String>,
 }
 
 impl JobProgress {
     fn after_event(self, event: &Event) -> Self {
         match &event.kind {
+            EventKind::RoundRequested {
+                remote_url,
+                base,
+                prompt,
+                provider,
+            } => JobProgress {
+                remote_url: self.remote_url.or_else(|| Some(remote_url.clone())),
+                first_prompt: self.first_prompt.or_else(|| Some(prompt.clone())),
+                base: Some(base.clone()),
+                provider: Some(provider.clone()),
+                ..self
+            },
             // A new round restarts the clock and clears the previous round's
             // reason and diff, so a revised job reports its final round.
             EventKind::RoundStarted { round } => JobProgress {
@@ -131,6 +157,10 @@ impl JobReport {
             diff: progress.committed_diff,
             detail: progress.detail,
             branch: progress.branch,
+            remote_url: progress.remote_url,
+            base: progress.base,
+            first_prompt: progress.first_prompt,
+            provider: progress.provider,
         }
     }
 

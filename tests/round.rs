@@ -457,7 +457,7 @@ async fn a_provider_the_repository_never_declared_stops_the_job_before_it_starts
         ),
         "{refusal:?}"
     );
-    assert!(!h.repo.join(".assembly/jobs").exists());
+    assert!(!h.root.join("jobs").exists());
 }
 
 #[tokio::test]

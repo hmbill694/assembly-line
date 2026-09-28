@@ -6,11 +6,20 @@ use std::path::Path;
 
 /// Everything that happens to one job.
 ///
-/// A job's identity — its repository, ref, prompt and provider — lives in
-/// `meta.json`, so no event repeats it.
+/// A job's identity — its repository, base, prompt and provider — is its
+/// first [`EventKind::RoundRequested`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum EventKind {
+    /// A round was asked for: the job's first, or a revise.
+    RoundRequested {
+        remote_url: String,
+        /// The base as it was when the round was asked for. A revise
+        /// re-pins it at the remote's tip then.
+        base: crate::git::PinnedRef,
+        prompt: String,
+        provider: String,
+    },
     /// A round began. Round 1 is the job's `run`; each revise adds one.
     RoundStarted {
         round: u32,

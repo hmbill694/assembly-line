@@ -9,10 +9,11 @@ use crate::claim;
 use crate::collect::{collect, record_launch_failure};
 use crate::config::{self, ConfigError, RepoConfig, Warning};
 use crate::delivery::{self, Delivered, PullRequestText};
-use crate::event::{Event, EventLog};
+use crate::event::{Event, EventKind, EventLog};
 use crate::git::{self, PinnedRef};
 use crate::job::JobId;
-use crate::paths::{self, JobMeta, JobPaths};
+use crate::locate;
+use crate::paths::{self, JobPaths, RepoKey};
 use crate::payload::{self, RoundPayload, RoundRequest};
 use crate::report::JobReport;
 use crate::round::Verdict;
@@ -123,9 +124,18 @@ impl<R> Prepared<'_, R> {
 /// A round that has passed every check, bound to the runner that checked it.
 pub struct ReadyRound<'r, R> {
     runner: &'r R,
-    meta: JobMeta,
+    /// The checkout git runs in on the host: claiming, delivering.
+    repo: PathBuf,
+    base_ref: String,
+    provider: String,
+    /// What the job was first asked to do, which its pull request describes.
+    original_prompt: String,
     destination: Destination,
+    /// The commit the round starts from: the base for a new job, the job
+    /// branch's tip for a revise.
     start: PinnedRef,
+    /// The base as it is now, which the round's request records.
+    requested_base: PinnedRef,
     /// Where the job clones from and pushes to — `DEFAULT_REMOTE`'s URL.
     remote_url: String,
     round_prompt: String,
@@ -134,7 +144,9 @@ pub struct ReadyRound<'r, R> {
 }
 
 enum Destination {
-    NewJob,
+    NewJob {
+        jobs_dir: PathBuf,
+    },
     ExistingJob {
         paths: JobPaths,
         round: u32,
@@ -148,7 +160,7 @@ impl<R> ReadyRound<'_, R> {
     #[must_use]
     pub fn to_announcement_line(&self) -> Option<String> {
         match &self.destination {
-            Destination::NewJob => None,
+            Destination::NewJob { .. } => None,
             Destination::ExistingJob { paths, round, .. } => {
                 Some(format!("revising job {} (round {round})", paths.id))
             }
@@ -234,6 +246,7 @@ impl RoundConclusion {
 pub async fn prepare_start<'r, R: Runner>(
     runner: &'r R,
     pass_env: &[String],
+    root: &Path,
     request: StartRequest,
 ) -> Prepared<'r, R> {
     let located = match locate_start(
@@ -246,6 +259,10 @@ pub async fn prepare_start<'r, R: Runner>(
     {
         Ok(located) => located,
         Err(e) => return Prepared::refused(Vec::new(), Refusal::Unpreparable(e)),
+    };
+    let jobs_dir = match RepoKey::from_remote_url(&located.remote_url) {
+        Ok(key) => key.jobs_dir(root),
+        Err(e) => return Prepared::refused(Vec::new(), Refusal::Unpreparable(e.into())),
     };
     let local_ref_note = local_ref_differs(&located.repo, &located.base_ref, &located.start).await;
 
@@ -278,13 +295,12 @@ pub async fn prepare_start<'r, R: Runner>(
         notes,
         round: Ok(ReadyRound {
             runner,
-            meta: JobMeta {
-                repo: located.repo,
-                base_ref: located.base_ref,
-                prompt: located.prompt.clone(),
-                provider,
-            },
-            destination: Destination::NewJob,
+            repo: located.repo,
+            base_ref: located.base_ref,
+            provider,
+            original_prompt: located.prompt.clone(),
+            destination: Destination::NewJob { jobs_dir },
+            requested_base: located.start.clone(),
             start: located.start,
             remote_url: located.remote_url,
             round_prompt: located.prompt,
@@ -298,14 +314,15 @@ pub async fn prepare_start<'r, R: Runner>(
 pub async fn prepare_revision<'r, R: Runner>(
     runner: &'r R,
     pass_env: &[String],
+    root: &Path,
     request: RevisionRequest,
 ) -> Prepared<'r, R> {
-    let located = match locate_revision(request.job_id, request.repo).await {
+    let located = match locate_revision(root, request.job_id, request.repo).await {
         Ok(located) => located,
         Err(e) => return Prepared::refused(Vec::new(), Refusal::Unpreparable(e)),
     };
     let (notes, runnable) =
-        runnable_config_and_provider(located.declared, Some(located.meta.provider.clone()));
+        runnable_config_and_provider(located.declared, Some(located.provider.clone()));
     let config = match runnable {
         Ok((config, _)) => config,
         Err(refusal) => return Prepared::refused(notes, refusal),
@@ -328,20 +345,24 @@ pub async fn prepare_revision<'r, R: Runner>(
             );
         }
     };
-    let round = JobReport::from_events(located.paths.id.into(), &located.events).rounds + 1;
-    let round_prompt = payload::revised_prompt(&located.meta.prompt, &request.feedback);
+    let round = located.rounds + 1;
+    let round_prompt = payload::revised_prompt(&located.original_prompt, &request.feedback);
 
     Prepared {
         notes,
         round: Ok(ReadyRound {
             runner,
-            meta: located.meta,
+            repo: located.checkout,
+            base_ref: located.base.name.clone(),
+            provider: located.provider,
+            original_prompt: located.original_prompt,
             destination: Destination::ExistingJob {
                 paths: located.paths,
                 round,
                 log,
             },
             start: located.tip,
+            requested_base: located.base,
             remote_url: located.remote_url,
             round_prompt,
             config,
@@ -363,21 +384,32 @@ pub async fn run<R: Runner>(
 ) -> anyhow::Result<RoundConclusion> {
     let ReadyRound {
         runner,
-        meta,
+        repo,
+        base_ref,
+        provider,
+        original_prompt,
         destination,
         start,
+        requested_base,
         remote_url,
         round_prompt,
         config,
         secrets,
     } = ready;
-    let started_the_job = matches!(destination, Destination::NewJob);
+    let started_the_job = matches!(destination, Destination::NewJob { .. });
     let (paths, mut log, round) = match destination {
-        Destination::NewJob => allocate_job(&meta, &start.sha)
+        Destination::NewJob { jobs_dir } => allocate_job(&jobs_dir, &repo, &start.sha)
             .await
             .map(|(paths, log)| (paths, log, 1))?,
         Destination::ExistingJob { paths, round, log } => (paths, log, round),
     };
+    log.append(EventKind::RoundRequested {
+        remote_url: remote_url.clone(),
+        base: requested_base,
+        prompt: round_prompt.clone(),
+        provider: provider.clone(),
+    })
+    .map_err(|e| anyhow!("recording the round's request: {e}"))?;
 
     let payload = RoundPayload::for_round(
         &config,
@@ -385,7 +417,7 @@ pub async fn run<R: Runner>(
             job_id: paths.id,
             round,
             prompt: &round_prompt,
-            provider: &meta.provider,
+            provider: &provider,
             start,
             remote_name: DEFAULT_REMOTE,
             remote_url,
@@ -399,14 +431,14 @@ pub async fn run<R: Runner>(
         .map(|events| JobReport::from_events(paths.id.into(), &events));
     let branch = report.as_ref().and_then(|report| report.branch.clone());
     let handoff = hand_off(
-        &meta.repo,
+        &repo,
         &config,
-        &meta.base_ref,
+        &base_ref,
         branch,
         verdict,
         PullRequestText {
             title: payload.commit_message.lines().next().unwrap_or_default(),
-            body: &meta.prompt,
+            body: &original_prompt,
         },
     )
     .await;
@@ -420,31 +452,18 @@ pub async fn run<R: Runner>(
     })
 }
 
-/// The job `job_id` names in `repo`, or the latest one there when it names
-/// none.
-fn locate_job(job_id: Option<u64>, repo: Option<PathBuf>) -> anyhow::Result<(JobPaths, JobMeta)> {
-    let repo_root = repository_named_or_enclosing(repo)?;
-    let jobs_root = paths::jobs_root(&repo_root);
-
-    let id = match job_id {
-        Some(id) => JobId::from(id),
-        None => paths::latest_job_id(&jobs_root)?.ok_or_else(|| anyhow!("no jobs yet"))?,
-    };
-
-    let paths = paths::open_job(&jobs_root, id)?;
-    let meta =
-        paths::read_meta(&paths).map_err(|e| anyhow!("reading meta.json for job {id}: {e}"))?;
-    Ok((paths, meta))
-}
-
 /// The report on the job `job_id` names in `repo`, or on the latest one there
 /// when it names none.
 ///
 /// # Errors
 ///
 /// When the job cannot be found, or its event log cannot be read.
-pub fn report_for_job(job_id: Option<u64>, repo: Option<PathBuf>) -> anyhow::Result<JobReport> {
-    let (paths, _) = locate_job(job_id, repo)?;
+pub async fn report_for_job(
+    root: &Path,
+    job_id: Option<u64>,
+    repo: Option<PathBuf>,
+) -> anyhow::Result<JobReport> {
+    let paths = locate::job_at(root, repo, job_id).await?;
     events_of(&paths).map(|events| JobReport::from_events(paths.id.into(), &events))
 }
 
@@ -453,8 +472,12 @@ pub fn report_for_job(job_id: Option<u64>, repo: Option<PathBuf>) -> anyhow::Res
 /// # Errors
 ///
 /// When the job cannot be found, or has captured nothing yet.
-pub fn output_log_of(job_id: u64, repo: Option<PathBuf>) -> anyhow::Result<PathBuf> {
-    let (paths, _) = locate_job(Some(job_id), repo)?;
+pub async fn output_log_of(
+    root: &Path,
+    job_id: u64,
+    repo: Option<PathBuf>,
+) -> anyhow::Result<PathBuf> {
+    let paths = locate::job_at(root, repo, Some(job_id)).await?;
     let log = paths.log();
     match log.exists() {
         true => Ok(log),
@@ -464,26 +487,6 @@ pub fn output_log_of(job_id: u64, repo: Option<PathBuf>) -> anyhow::Result<PathB
 
 fn events_of(paths: &JobPaths) -> anyhow::Result<Vec<Event>> {
     EventLog::read(paths.events()).map_err(|e| anyhow!("reading the event log: {e}"))
-}
-
-/// Which repository a command acts on: whatever `--repo` named, else the one
-/// the user is standing in.
-///
-/// Every command resolves it the same way, so a job started with `--repo` is
-/// findable by `status`, `logs` and `revise` with the same `--repo`.
-fn repository_named_or_enclosing(repo: Option<PathBuf>) -> anyhow::Result<PathBuf> {
-    match repo {
-        Some(named) => Ok(named),
-        None => enclosing_repo_root(),
-    }
-}
-
-/// Job state lives under the repo, so every command needs to know which repo.
-fn enclosing_repo_root() -> anyhow::Result<PathBuf> {
-    let cwd = std::env::current_dir()?;
-    paths::git_root(&cwd).ok_or_else(|| {
-        anyhow!("not inside a git repository — assembly stores job state at <git-root>/.assembly")
-    })
 }
 
 /// A new job's repository, prompt and start, before its config is read.
@@ -504,7 +507,7 @@ async fn locate_start(
     base_ref: Option<String>,
 ) -> anyhow::Result<StartLocated> {
     let prompt = prompt_text(prompt, prompt_file)?;
-    let repo = repository_named_or_enclosing(repo)?;
+    let repo = locate::checkout_named_or_enclosing(repo)?;
     let base_ref = match base_ref {
         Some(named) => named,
         None => default_base_ref(&repo).await?,
@@ -528,29 +531,49 @@ async fn locate_start(
 /// that governs it.
 struct RevisionLocated {
     paths: JobPaths,
-    meta: JobMeta,
-    events: Vec<Event>,
+    checkout: PathBuf,
+    rounds: u32,
     remote_url: String,
+    /// The job's base, pinned at the remote's tip now.
+    base: PinnedRef,
+    provider: String,
+    original_prompt: String,
     tip: PinnedRef,
     declared: RepoConfig,
 }
 
-async fn locate_revision(job_id: u64, repo: Option<PathBuf>) -> anyhow::Result<RevisionLocated> {
-    let (paths, meta) = locate_job(Some(job_id), repo)?;
-    let events = events_of(&paths)?;
+async fn locate_revision(
+    root: &Path,
+    job_id: u64,
+    repo: Option<PathBuf>,
+) -> anyhow::Result<RevisionLocated> {
+    let checkout = locate::checkout_named_or_enclosing(repo)?;
+    let (jobs_dir, remote_url) = locate::jobs_dir_of(root, Some(checkout.clone())).await?;
+    let paths = paths::open_job(&jobs_dir, JobId::from(job_id))?;
+    let report = JobReport::from_events(job_id, &events_of(&paths)?);
+    let (Some(requested_base), Some(provider), Some(original_prompt)) =
+        (report.base, report.provider, report.first_prompt)
+    else {
+        return Err(anyhow!(
+            "job {job_id} has no recorded request — its first round never started, so there is \
+             nothing to revise"
+        ));
+    };
 
-    let remote_url = payload::remote_to_clone(&meta.repo, DEFAULT_REMOTE).await?;
-    let base = git::pinned(&meta.repo, DEFAULT_REMOTE, &meta.base_ref).await?;
-    let tip = job_branch_tip(&meta.repo, paths.id).await?;
+    let base = git::pinned(&checkout, DEFAULT_REMOTE, &requested_base.name).await?;
+    let tip = job_branch_tip(&checkout, paths.id).await?;
     // `base`, not the job's own branch: the previous round is not allowed to
     // have changed the settings that govern this one.
-    let declared = RepoConfig::from_ref(&meta.repo, &base.sha).await?;
+    let declared = RepoConfig::from_ref(&checkout, &base.sha).await?;
 
     Ok(RevisionLocated {
         paths,
-        meta,
-        events,
+        checkout,
+        rounds: report.rounds,
         remote_url,
+        base,
+        provider,
+        original_prompt,
         tip,
         declared,
     })
@@ -610,24 +633,25 @@ fn runnable_config_and_provider(
     (warnings, runnable)
 }
 
-/// A new job's directory, its `meta.json` and its open event log, under the
-/// id it claimed on the remote.
+/// A new job's directory under `jobs_dir` and its open event log, under the
+/// id it claimed on `repo`'s remote.
 ///
 /// Called only once the round is known good, so a repository that has not
 /// opted in leaves no litter and burns no id.
-async fn allocate_job(meta: &JobMeta, base_sha: &str) -> anyhow::Result<(JobPaths, EventLog)> {
-    let id = claim::claim_job(&meta.repo, DEFAULT_REMOTE, base_sha).await?;
-    let jobs_root = paths::jobs_root(&meta.repo);
-    let paths = paths::create_job(&jobs_root, id).map_err(|e| match e.kind() {
+async fn allocate_job(
+    jobs_dir: &Path,
+    repo: &Path,
+    base_sha: &str,
+) -> anyhow::Result<(JobPaths, EventLog)> {
+    let id = claim::claim_job(repo, DEFAULT_REMOTE, base_sha).await?;
+    let paths = paths::create_job(jobs_dir, id).map_err(|e| match e.kind() {
         std::io::ErrorKind::AlreadyExists => anyhow!(
             "job {id}'s branch was gone from '{DEFAULT_REMOTE}', so its id was claimed again, \
              but {} still holds that job — run again, and the next id will be claimed",
-            jobs_root.join(id.to_string()).display()
+            jobs_dir.join(id.to_string()).display()
         ),
         _ => anyhow!("preparing the job directory: {e}"),
     })?;
-
-    paths::write_meta(&paths, meta).map_err(|e| anyhow!("writing meta.json: {e}"))?;
 
     EventLog::open_append(paths.events())
         .map(|log| (paths, log))

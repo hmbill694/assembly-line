@@ -5,7 +5,8 @@ use assembly_line::lifecycle::{
     Note, Prepared, Refusal, RevisionRequest, StartRequest, output_log_of, prepare_revision,
     prepare_start, report_for_job,
 };
-use assembly_line::paths::{self, JobMeta, JobPaths};
+use assembly_line::locate;
+use assembly_line::paths::{self, JobPaths, RepoKey};
 use assembly_line::runner::local::LocalRunner;
 use support::{Harness, commit_all, config_running};
 
@@ -25,20 +26,25 @@ fn start_in(h: &Harness, provider: Option<&str>) -> StartRequest {
     }
 }
 
-/// Job `id`'s directory and `meta.json` in `h`'s repository, as `run` would
-/// have left them before its round started.
-fn job_in(h: &Harness, id: u64) -> JobPaths {
-    let job = paths::create_job(&paths::jobs_root(&h.repo), id.into()).unwrap();
-    paths::write_meta(
-        &job,
-        &JobMeta {
-            repo: h.repo.clone(),
-            base_ref: "main".into(),
+/// Job `id`'s directory under `h`'s root and the request that opens its
+/// log, as `run` would have left them before its round started.
+async fn job_in(h: &Harness, id: u64) -> JobPaths {
+    let jobs_dir = RepoKey::from_remote_url(h.origin.to_str().unwrap())
+        .unwrap()
+        .jobs_dir(&h.root);
+    let job = paths::create_job(&jobs_dir, id.into()).unwrap();
+    EventLog::open_append(job.events())
+        .unwrap()
+        .append(EventKind::RoundRequested {
+            remote_url: h.origin.to_string_lossy().into_owned(),
+            base: git::PinnedRef {
+                name: "main".into(),
+                sha: git::sha_at_ref(&h.origin, "main").await.unwrap(),
+            },
             prompt: "x".into(),
             provider: "fake".into(),
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     job
 }
 
@@ -54,7 +60,7 @@ async fn a_refused_round_still_carries_its_config_warnings() {
     let h = Harness::new().await;
     let runner = the_binary();
 
-    let prepared = prepare_start(&runner, &[], start_in(&h, Some("ghost"))).await;
+    let prepared = prepare_start(&runner, &[], &h.root, start_in(&h, Some("ghost"))).await;
 
     assert_eq!(prepared.notes, [Note::ConfigWarning(Warning::NoVerify)]);
 }
@@ -68,7 +74,7 @@ async fn a_new_job_is_ready_without_an_announcement() {
     .await;
     let runner = the_binary();
 
-    let prepared = prepare_start(&runner, &[], start_in(&h, None)).await;
+    let prepared = prepare_start(&runner, &[], &h.root, start_in(&h, None)).await;
 
     assert!(prepared.notes.is_empty(), "{:?}", prepared.notes);
     let Ok(ready) = prepared.round else {
@@ -85,7 +91,7 @@ async fn unpushed_local_work_is_noted_against_the_remotes_commit() {
     commit_all(&h.repo, "unpushed").await.unwrap().unwrap();
     let runner = the_binary();
 
-    let prepared = prepare_start(&runner, &[], start_in(&h, None)).await;
+    let prepared = prepare_start(&runner, &[], &h.root, start_in(&h, None)).await;
 
     assert!(
         prepared.notes.contains(&Note::LocalRefDiffers {
@@ -102,11 +108,13 @@ async fn unpushed_local_work_is_noted_against_the_remotes_commit() {
 #[tokio::test]
 async fn a_repository_with_no_remote_cannot_be_prepared() {
     let repo = support::repo_with_initial_commit().await;
+    let root = tempfile::tempdir().unwrap();
     let runner = the_binary();
 
     let prepared = prepare_start(
         &runner,
         &[],
+        root.path(),
         StartRequest {
             prompt: Some("x".into()),
             prompt_file: None,
@@ -129,10 +137,12 @@ async fn a_repository_with_no_remote_cannot_be_prepared() {
 #[tokio::test]
 async fn status_without_a_job_id_reports_the_latest_job() {
     let h = Harness::new().await;
-    job_in(&h, 3);
-    job_in(&h, 12);
+    job_in(&h, 3).await;
+    job_in(&h, 12).await;
 
-    let report = report_for_job(None, Some(h.repo.clone())).unwrap();
+    let report = report_for_job(&h.root, None, Some(h.repo.clone()))
+        .await
+        .unwrap();
 
     assert_eq!(report.id, 12);
 }
@@ -141,7 +151,9 @@ async fn status_without_a_job_id_reports_the_latest_job() {
 async fn status_in_a_repository_with_no_jobs_says_so() {
     let h = Harness::new().await;
 
-    let err = report_for_job(None, Some(h.repo.clone())).unwrap_err();
+    let err = report_for_job(&h.root, None, Some(h.repo.clone()))
+        .await
+        .unwrap_err();
 
     assert_eq!(err.to_string(), "no jobs yet");
 }
@@ -149,9 +161,11 @@ async fn status_in_a_repository_with_no_jobs_says_so() {
 #[tokio::test]
 async fn a_job_that_has_captured_nothing_has_no_log_to_show() {
     let h = Harness::new().await;
-    job_in(&h, 1);
+    job_in(&h, 1).await;
 
-    let err = output_log_of(1, Some(h.repo.clone())).unwrap_err();
+    let err = output_log_of(&h.root, 1, Some(h.repo.clone()))
+        .await
+        .unwrap_err();
 
     assert_eq!(err.to_string(), "job 1 has captured no output yet");
 }
@@ -159,10 +173,15 @@ async fn a_job_that_has_captured_nothing_has_no_log_to_show() {
 #[tokio::test]
 async fn a_job_that_has_captured_output_names_its_log() {
     let h = Harness::new().await;
-    let job = job_in(&h, 1);
+    let job = job_in(&h, 1).await;
     std::fs::write(job.log(), "agent says hi\n").unwrap();
 
-    assert_eq!(output_log_of(1, Some(h.repo.clone())).unwrap(), job.log());
+    assert_eq!(
+        output_log_of(&h.root, 1, Some(h.repo.clone()))
+            .await
+            .unwrap(),
+        job.log()
+    );
 }
 
 #[tokio::test]
@@ -173,6 +192,7 @@ async fn revising_a_job_that_does_not_exist_cannot_be_prepared() {
     let prepared = prepare_revision(
         &runner,
         &[],
+        &h.root,
         RevisionRequest {
             job_id: 9,
             feedback: "more".into(),
@@ -192,7 +212,9 @@ async fn a_revise_is_numbered_past_the_highest_round_recorded() {
     let h = Harness::new().await;
     let first = h.run_job("x").await;
     assert!(first.passed);
-    let job = paths::open_job(&paths::jobs_root(&h.repo), first.job_id).unwrap();
+    let job = locate::job_at(&h.root, Some(h.repo.clone()), Some(first.job_id.into()))
+        .await
+        .unwrap();
     let mut log = EventLog::open_append(job.events()).unwrap();
     log.append(EventKind::RoundStarted { round: 3 }).unwrap();
     log.append(EventKind::RoundPassed).unwrap();
@@ -201,6 +223,7 @@ async fn a_revise_is_numbered_past_the_highest_round_recorded() {
     let prepared = prepare_revision(
         &runner,
         &[],
+        &h.root,
         RevisionRequest {
             job_id: first.job_id.into(),
             feedback: "more".into(),
@@ -215,5 +238,79 @@ async fn a_revise_is_numbered_past_the_highest_round_recorded() {
     assert_eq!(
         ready.to_announcement_line().as_deref(),
         Some("revising job 1 (round 4)")
+    );
+}
+
+#[tokio::test]
+async fn every_round_asked_for_is_recorded_before_it_starts() {
+    let h = Harness::new().await;
+    let first = h.run_job("add auth").await;
+    let second = h.revise_job(first.job_id, "use sessions").await;
+
+    let base = git::pinned(&h.repo, "origin", "main").await.unwrap();
+    let requests: Vec<(usize, &str)> = second
+        .events
+        .iter()
+        .enumerate()
+        .filter_map(|(at, kind)| match kind {
+            EventKind::RoundRequested {
+                prompt,
+                base: asked,
+                ..
+            } => {
+                // A revise starts from the job's branch, but asks for its base.
+                assert_eq!(asked, &base, "{kind:?}");
+                Some((at, prompt.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    let starts: Vec<usize> = second
+        .events
+        .iter()
+        .enumerate()
+        .filter_map(|(at, kind)| matches!(kind, EventKind::RoundStarted { .. }).then_some(at))
+        .collect();
+
+    assert_eq!(requests.len(), 2, "{:?}", second.events);
+    assert_eq!(requests[0].1, "add auth");
+    assert!(requests[1].1.contains("use sessions"), "{}", requests[1].1);
+    assert!(
+        requests
+            .iter()
+            .zip(&starts)
+            .all(|((requested_at, _), started_at)| requested_at < started_at),
+        "{:?}",
+        second.events
+    );
+}
+
+/// A job directory whose log holds no request — allocated, but its first
+/// round never recorded — has nothing to revise it from.
+#[tokio::test]
+async fn a_job_with_no_recorded_request_cannot_be_revised() {
+    let h = Harness::new().await;
+    let jobs_dir = RepoKey::from_remote_url(h.origin.to_str().unwrap())
+        .unwrap()
+        .jobs_dir(&h.root);
+    paths::create_job(&jobs_dir, 1.into()).unwrap();
+    let runner = the_binary();
+
+    let prepared = prepare_revision(
+        &runner,
+        &[],
+        &h.root,
+        RevisionRequest {
+            job_id: 1,
+            feedback: "more".into(),
+            repo: Some(h.repo.clone()),
+        },
+    )
+    .await;
+
+    let refusal = refusal_of(prepared);
+    assert!(
+        refusal.to_string().contains("no recorded request"),
+        "{refusal}"
     );
 }
