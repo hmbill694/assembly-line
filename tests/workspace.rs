@@ -35,14 +35,14 @@ impl Fixture {
     }
 
     async fn workspace(&self) -> anyhow::Result<workspace::RoundWorkspace> {
-        workspace::create(
-            self.url(),
-            &self.main().await,
-            "al/job-1",
-            self.scratch(),
-            None,
-        )
-        .await
+        self.workspace_at(&self.main().await).await
+    }
+
+    /// A scratch clone with `al/job-1` checked out at `start`, as `run`
+    /// builds one.
+    async fn workspace_at(&self, start: &PinnedRef) -> anyhow::Result<workspace::RoundWorkspace> {
+        let clone = workspace::clone_scratch(self.url(), self.scratch(), None).await?;
+        workspace::start_round(clone, start, "al/job-1").await
     }
 }
 
@@ -122,9 +122,7 @@ async fn continuing_a_branch_restores_the_previous_rounds_work() {
     workspace::discard(first).unwrap();
 
     let tip = git::pinned(&fx.repo, "origin", "al/job-1").await.unwrap();
-    let second = workspace::create(fx.url(), &tip, "al/job-1", fx.scratch(), None)
-        .await
-        .unwrap();
+    let second = fx.workspace_at(&tip).await.unwrap();
 
     assert_eq!(
         std::fs::read_to_string(second.path().join("rounds.txt")).unwrap(),

@@ -1,8 +1,7 @@
 //! Running a round as a k8s Job, through the `kubectl` CLI.
 
 use super::child::ChildLines;
-use super::{JobSecrets, Runner, RunnerProblem, RunningRound, Termination, job_resource_name};
-use crate::payload::{PAYLOAD_VAR, RoundPayload};
+use super::{JobSecrets, LaunchSpec, Runner, RunnerProblem, RunningRound, Termination};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -123,19 +122,25 @@ pub fn pod_progress(pods: &Value) -> PodProgress {
     }
 }
 
-/// The Job's own deadline: a backstop behind the command limits `job-exec`
+/// The Job's own deadline: a backstop behind the command limits `run`
 /// enforces, for a pod that wedges beyond them.
 #[must_use]
-pub fn active_deadline_secs(payload: &RoundPayload) -> Option<u64> {
-    payload
-        .command_limit_secs
-        .map(|limit| 2 * limit + BACKSTOP_ALLOWANCE_SECS)
+pub fn active_deadline_secs(command_limit_secs: Option<u64>) -> Option<u64> {
+    command_limit_secs.map(|limit| 2 * limit + BACKSTOP_ALLOWANCE_SECS)
 }
 
-/// A Job that runs `job-exec` once, never retried, with its environment
-/// read from the Secret of the same name.
+/// A Job that runs `assembly` with `args` once, never retried, with its
+/// environment read from the Secret of the same name.
 #[must_use]
-pub fn job_manifest(name: &str, image: &str, active_deadline_secs: Option<u64>) -> Value {
+pub fn job_manifest(
+    name: &str,
+    image: &str,
+    args: &[String],
+    active_deadline_secs: Option<u64>,
+) -> Value {
+    let command: Vec<&str> = std::iter::once("assembly")
+        .chain(args.iter().map(String::as_str))
+        .collect();
     // Built, then extended: `json!` has no syntax for an optional key.
     let mut spec = json!({
         "backoffLimit": 0,
@@ -149,7 +154,7 @@ pub fn job_manifest(name: &str, image: &str, active_deadline_secs: Option<u64>) 
                 "containers": [{
                     "name": "job",
                     "image": image,
-                    "command": ["assembly", "job-exec"],
+                    "command": command,
                     "envFrom": [{ "secretRef": { "name": name } }],
                 }],
             },
@@ -390,12 +395,12 @@ impl Runner for KubernetesRunner {
 
     async fn launch(
         &self,
-        payload: &RoundPayload,
+        spec: &LaunchSpec,
         secrets: &JobSecrets,
         cancel: &CancellationToken,
     ) -> anyhow::Result<KubernetesRound> {
-        let mut round = KubernetesRound::named(self.clone(), job_resource_name(payload));
-        match round.create_and_follow(payload, secrets, cancel).await {
+        let mut round = KubernetesRound::named(self.clone(), spec.name.clone());
+        match round.create_and_follow(spec, secrets, cancel).await {
             Ok(()) => Ok(round),
             Err(e) => {
                 round.delete_job_and_secret().await;
@@ -463,7 +468,7 @@ impl KubernetesRound {
     /// annotation.
     async fn create_and_follow(
         &mut self,
-        payload: &RoundPayload,
+        spec: &LaunchSpec,
         secrets: &JobSecrets,
         cancel: &CancellationToken,
     ) -> anyhow::Result<()> {
@@ -476,7 +481,8 @@ impl KubernetesRound {
                     job_manifest(
                         &self.name,
                         &self.runner.image,
-                        active_deadline_secs(payload),
+                        &spec.args,
+                        active_deadline_secs(spec.command_limit_secs),
                     )
                     .to_string(),
                 ),
@@ -491,17 +497,11 @@ impl KubernetesRound {
                 anyhow::anyhow!("kubectl create returned no uid for Job {}", self.name)
             })?;
 
-        let vars: BTreeMap<String, String> = secrets
-            .vars()
-            .clone()
-            .into_iter()
-            .chain([(PAYLOAD_VAR.to_string(), serde_json::to_string(payload)?)])
-            .collect();
         let mut create_secret = self.runner.kubectl();
         create_secret.args(["create", "-f", "-"]);
         output_of(
             create_secret,
-            Some(secret_manifest(&self.name, uid, &vars).to_string()),
+            Some(secret_manifest(&self.name, uid, secrets.vars()).to_string()),
         )
         .await?;
 

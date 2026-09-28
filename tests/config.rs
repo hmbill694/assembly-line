@@ -99,6 +99,15 @@ fn rejects_an_unparseable_max_duration() {
 }
 
 #[test]
+fn a_command_limit_is_max_duration_in_whole_seconds_when_it_parses() {
+    let parsed = |body: &str| RepoConfig::parse(body).unwrap().command_limit_secs();
+
+    assert_eq!(parsed(FULL), Some(20 * 60));
+    assert_eq!(parsed("max_duration = \"soon\"\n"), None);
+    assert_eq!(parsed(""), None);
+}
+
+#[test]
 fn reports_every_problem_at_once() {
     let config = RepoConfig::parse("max_duration = \"soon\"\n").unwrap();
 

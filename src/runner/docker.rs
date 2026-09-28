@@ -1,8 +1,7 @@
 //! Running a round in a container, through the `docker` CLI.
 
 use super::child::ChildLines;
-use super::{JobSecrets, Runner, RunnerProblem, RunningRound, Termination, job_resource_name};
-use crate::payload::{PAYLOAD_VAR, RoundPayload};
+use super::{JobSecrets, LaunchSpec, Runner, RunnerProblem, RunningRound, Termination};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -35,7 +34,12 @@ impl DockerRunner {
 /// No `--rm`: a container that exits non-zero is inspected first, to learn
 /// whether it was OOM-killed, and removed afterwards.
 #[must_use]
-pub fn docker_run_args(image: &str, container: &str, env_names: &[&str]) -> Vec<String> {
+pub fn docker_run_args(
+    image: &str,
+    container: &str,
+    env_names: &[&str],
+    args: &[String],
+) -> Vec<String> {
     ["run", "--name", container]
         .into_iter()
         .map(String::from)
@@ -44,11 +48,8 @@ pub fn docker_run_args(image: &str, container: &str, env_names: &[&str]) -> Vec<
                 .iter()
                 .flat_map(|name| ["-e".to_string(), (*name).to_string()]),
         )
-        .chain([
-            image.to_string(),
-            "assembly".to_string(),
-            "job-exec".to_string(),
-        ])
+        .chain([image.to_string(), "assembly".to_string()])
+        .chain(args.iter().cloned())
         .collect()
 }
 
@@ -78,37 +79,38 @@ impl Runner for DockerRunner {
     /// once, with nothing for `cancel` to interrupt.
     fn launch(
         &self,
-        payload: &RoundPayload,
+        spec: &LaunchSpec,
         secrets: &JobSecrets,
         _cancel: &CancellationToken,
     ) -> impl Future<Output = anyhow::Result<DockerRound>> + Send {
-        std::future::ready(self.spawn_docker_run(payload, secrets))
+        std::future::ready(self.spawn_docker_run(spec, secrets))
     }
 }
 
 impl DockerRunner {
-    /// `docker run` as a child of this process, carrying the payload and
-    /// `secrets` in its environment.
+    /// `docker run` as a child of this process, carrying `secrets` in its
+    /// environment.
     fn spawn_docker_run(
         &self,
-        payload: &RoundPayload,
+        spec: &LaunchSpec,
         secrets: &JobSecrets,
     ) -> anyhow::Result<DockerRound> {
-        let container = job_resource_name(payload);
         let names = secrets.names();
-        let env_names: Vec<&str> = std::iter::once(PAYLOAD_VAR)
-            .chain(names.iter().map(String::as_str))
-            .collect();
+        let env_names: Vec<&str> = names.iter().map(String::as_str).collect();
 
         let mut command = Command::new(&self.program);
         command
-            .args(docker_run_args(&self.image, &container, &env_names))
-            .env(PAYLOAD_VAR, serde_json::to_string(payload)?)
+            .args(docker_run_args(
+                &self.image,
+                &spec.name,
+                &env_names,
+                &spec.args,
+            ))
             .envs(secrets.vars());
 
         ChildLines::spawn(command).map(|lines| DockerRound {
             lines,
-            container,
+            container: spec.name.clone(),
             program: self.program.clone(),
             stopping: None,
         })
@@ -151,7 +153,7 @@ impl RunningRound for DockerRound {
 
     /// Killing the `docker` client does not stop the container; `docker
     /// stop` does, and the client exits with it. SIGTERM first, as the other
-    /// runners send it, so `job-exec` can stop its agent, keep the work and
+    /// runners send it, so `run` can stop its agent, keep the work and
     /// report the round; SIGKILL only once `STOP_GRACE_SECS` have passed.
     ///
     /// `docker stop` is started, not waited on: it returns only once the

@@ -75,52 +75,6 @@ enum RoundResult {
     },
 }
 
-/// Run one round of a job end to end: scratch clone, agent, commit, push,
-/// `verify`, the verdict, then discard.
-///
-/// # Errors
-///
-/// Returns an error only if the round cannot be *administered* — its frames
-/// cannot be written. An agent that fails, a clone that fails, and a push
-/// that fails are all [`Verdict::Failed`], reported as events.
-pub async fn run_round<W: Write + Send + 'static>(
-    payload: &RoundPayload,
-    frames: &FrameWriter<W>,
-    scratch_root: &Path,
-    cancel: CancellationToken,
-) -> anyhow::Result<Verdict> {
-    frames.append_event(EventKind::RoundStarted {
-        round: payload.round,
-    })?;
-
-    // Set before the clone, so a slow clone leaves less of the shared budget
-    // for provisioning rather than a fresh 15 minutes of its own.
-    let provisioning_deadline = Instant::now() + PROVISIONING_LIMIT;
-    let cloning = workspace::create(
-        &payload.remote_url,
-        &payload.start,
-        &payload.branch,
-        scratch_root,
-        credential_helper_for_this_environment(),
-    );
-    let ws = match within_provisioning_limit(cloning, &cancel).await {
-        Ok(ws) => ws,
-        Err(e) => {
-            return record_completion(
-                frames,
-                RoundResult::Failed {
-                    reason: e.to_string(),
-                    work: None,
-                },
-            );
-        }
-    };
-
-    let verdict = run_round_in(payload, &ws, frames, provisioning_deadline, cancel).await;
-    discard_reporting_failure(ws, frames)?;
-    verdict
-}
-
 /// Remove the round's checkout. That is housekeeping: failing at it neither
 /// undoes a pushed branch nor says anything about the work, so it is
 /// reported as output rather than allowed to replace what the round did.
@@ -147,7 +101,8 @@ pub fn discard_reporting_failure<W: Write>(
 ///
 /// # Errors
 ///
-/// As [`run_round`]: only when the round's frames cannot be written.
+/// Only when the round's frames cannot be written. An agent that fails and a
+/// push that fails are both [`Verdict::Failed`], reported as events.
 pub async fn run_round_in<W: Write + Send + 'static>(
     payload: &RoundPayload,
     ws: &RoundWorkspace,
@@ -461,7 +416,7 @@ fn events_for_completion(result: RoundResult) -> (Vec<EventKind>, Verdict) {
 #[cfg(test)]
 mod provisioning_tests {
     //! `provision_toolchain` is private, and the deadline it takes
-    //! cannot be exercised through the public `job-exec` surface without
+    //! cannot be exercised through the public `run` surface without
     //! either waiting out the real 15-minute `PROVISIONING_LIMIT` or making
     //! it configurable — both ruled out. This calls the internal function
     //! directly instead, which needs no subprocess: a deadline that has
@@ -474,7 +429,6 @@ mod provisioning_tests {
     fn payload_asking_for_provisioning() -> RoundPayload {
         RoundPayload {
             job_id: 1.into(),
-            round: 1,
             remote_url: "does-not-matter".to_string(),
             remote_name: "origin".to_string(),
             start: PinnedRef {

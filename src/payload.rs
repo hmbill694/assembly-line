@@ -1,24 +1,15 @@
-//! Everything a round needs to run, resolved by the host before it starts.
-//!
-//! The payload is the whole plan. `job-exec` runs the round — as a child of
-//! the host, in a docker container, or in a k8s pod — and executes exactly
-//! what it says, reading no configuration of its own, so nothing inside the
-//! boundary can influence the settings that govern it.
+//! What one round runs, resolved by `run` in the process that runs it: the
+//! repository's config applied to the job, its branch and its prompt.
 
 use crate::config::{ConfigError, RepoConfig, parse_duration};
 use crate::git::{self, PinnedRef};
 use crate::job::JobId;
 use crate::provider::{CommandSpec, render_command};
-use serde::{Deserialize, Serialize};
 use std::path::Path;
-
-/// The environment variable a payload travels in: the one channel a child
-/// process, `docker run` and a pod spec all share.
-pub const PAYLOAD_VAR: &str = "ASSEMBLY_JOB";
 
 /// The git credential a round in a container clones and pushes with.
 /// Withheld from the agent's environment — see [`crate::exec`] — but an
-/// agent running as the same user can still read it from `job-exec`'s own
+/// agent running as the same user can still read it from `run`'s own
 /// process environment; the spec lists that as an accepted risk.
 pub const GIT_TOKEN_VAR: &str = "ASSEMBLY_GIT_TOKEN";
 
@@ -59,13 +50,12 @@ pub fn is_path_on_this_machine(url: &str) -> bool {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoundPayload {
     pub job_id: JobId,
-    pub round: u32,
     /// Where the round clones from and pushes to.
     pub remote_url: String,
-    /// The host's name for that remote, which `BranchPushed` records.
+    /// The name `BranchPushed` records that remote under.
     pub remote_name: String,
     /// The commit the round starts from — the base for round 1, the job's
     /// branch tip for a revise.
@@ -83,11 +73,10 @@ pub struct RoundPayload {
     pub provision_toolchain: bool,
 }
 
-/// What the host knows about a round before config has been applied to it.
+/// What `run` knows about a round before config has been applied to it.
 #[derive(Debug, Clone)]
 pub struct RoundRequest<'a> {
     pub job_id: JobId,
-    pub round: u32,
     pub prompt: &'a str,
     pub provider: &'a str,
     pub start: PinnedRef,
@@ -119,7 +108,6 @@ impl RoundPayload {
 
         Ok(RoundPayload {
             job_id: request.job_id,
-            round: request.round,
             remote_url: request.remote_url,
             remote_name: request.remote_name.to_string(),
             start: request.start,
@@ -130,28 +118,6 @@ impl RoundPayload {
             command_limit_secs,
             provision_toolchain: false,
         })
-    }
-
-    /// The payload a runner handed `job-exec` in [`PAYLOAD_VAR`].
-    ///
-    /// # Errors
-    ///
-    /// When the variable is unset or does not hold a payload.
-    pub fn from_environment() -> anyhow::Result<RoundPayload> {
-        Self::from_variable(std::env::var(PAYLOAD_VAR).ok().as_deref())
-    }
-
-    /// [`Self::from_environment`], given the variable's value.
-    ///
-    /// # Errors
-    ///
-    /// When `value` is absent or does not hold a payload.
-    pub fn from_variable(value: Option<&str>) -> anyhow::Result<RoundPayload> {
-        let json = value.ok_or_else(|| {
-            anyhow::anyhow!("{PAYLOAD_VAR} is not set — job-exec is started by a runner")
-        })?;
-        serde_json::from_str(json)
-            .map_err(|e| anyhow::anyhow!("{PAYLOAD_VAR} is not a round payload: {e}"))
     }
 }
 
@@ -164,22 +130,6 @@ pub fn commit_message(job_id: JobId, prompt: &str) -> String {
         Some(first) => format!("job {job_id}: {}\n\n{}", first.trim(), prompt.trim()),
         None => format!("job {job_id}: agent work"),
     }
-}
-
-/// The prompt a revise round carries: what was originally asked, then what to
-/// change about the answer.
-///
-/// That is enough because a revise is a *new round*, not a resumption.
-/// Nothing is kept from the last round except the branch: the agent's prior
-/// work arrives as files on disk, already committed in the tree it is dropped
-/// into. No session replay, no conversation history — which is what makes
-/// revising behave identically across every provider.
-#[must_use]
-pub fn revised_prompt(original: &str, feedback: &str) -> String {
-    format!(
-        "{original}\n\n---\n\nYour previous attempt is already committed in this \
-         working tree. Revise it based on this feedback:\n\n{feedback}\n"
-    )
 }
 
 /// Where the round clones from. A repository without the remote cannot run a

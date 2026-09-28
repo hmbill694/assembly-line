@@ -106,11 +106,6 @@ pub enum Command {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
-
-    /// Run the round in `ASSEMBLY_JOB` and report it as frames on stdout.
-    /// Started by a runner, never by hand.
-    #[command(name = "job-exec", hide = true)]
-    JobExec,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -134,7 +129,7 @@ pub struct RunnerArgs {
     #[arg(long)]
     pub image: Option<String>,
     /// Pass this variable from your environment into the round's container.
-    /// Repeatable. `ASSEMBLY_GIT_TOKEN` is always passed.
+    /// Repeatable. `ASSEMBLY_GIT_TOKEN` and `GH_TOKEN` are always passed.
     #[arg(long = "pass-env", value_name = "NAME")]
     pub pass_env: Vec<String>,
     /// Where k8s Jobs and their Secrets are created. Required for k8s.

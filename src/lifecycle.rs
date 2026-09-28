@@ -1,25 +1,25 @@
 //! Starting a job and revising one: from what the user asked for, through
-//! every check that can refuse it, to the round, its report and its delivery.
+//! every check that can refuse it, to the round and its report.
 //!
 //! Preparing allocates no job, so a mistake costs nothing and every reason
-//! to refuse is known before a job directory exists. Running allocates, runs
-//! the round and hands its branch on.
+//! to refuse is known before a job directory exists. Running allocates,
+//! records the round's request and start, and launches `assembly run`, which
+//! does the round and delivers its branch.
 
 use crate::claim;
 use crate::collect::{collect, record_launch_failure};
 use crate::config::{self, ConfigError, RepoConfig, Warning};
-use crate::delivery::{self, Delivered, PullRequestText};
 use crate::event::{Event, EventKind, EventLog};
 use crate::git::{self, PinnedRef};
 use crate::job::JobId;
 use crate::locate;
 use crate::paths::{self, JobPaths, RepoKey};
-use crate::payload::{self, RoundPayload, RoundRequest};
+use crate::payload;
 use crate::report::JobReport;
 use crate::round::Verdict;
-use crate::run::{BaseDiffers, prompt_text};
+use crate::run::prompt_text;
 use crate::runner::{
-    JobSecrets, Runner, RunnerProblem, payload_fitted_to, secrets_or_reasons_it_cannot_run,
+    JobSecrets, LaunchSpec, Runner, RunnerProblem, secrets_or_reasons_it_cannot_run,
 };
 use crate::workspace::DEFAULT_REMOTE;
 use anyhow::anyhow;
@@ -163,17 +163,12 @@ impl<R> Prepared<'_, R> {
 /// A round that has passed every check, bound to the runner that checked it.
 pub struct ReadyRound<'r, R> {
     runner: &'r R,
-    /// The checkout git runs in on the host: claiming, delivering.
+    /// The checkout git runs in on the host, where a new job's id is claimed.
     repo: PathBuf,
-    base_ref: String,
     provider: String,
-    /// What the job was first asked to do, which its pull request describes.
-    original_prompt: String,
     destination: Destination,
-    /// The commit the round starts from: the base for a new job, the job
-    /// branch's tip for a revise.
-    start: PinnedRef,
-    /// The base as it is now, which the round's request records.
+    /// The base as it is now: what the round's request records and its
+    /// `--ref` pins.
     requested_base: PinnedRef,
     /// Where the job clones from and pushes to — `DEFAULT_REMOTE`'s URL.
     remote_url: String,
@@ -213,51 +208,19 @@ pub struct RoundConclusion {
     pub verdict: Verdict,
     /// `None` when the job's own event log could not be read back.
     pub report: Option<JobReport>,
-    pub handoff: Handoff,
     started_the_job: bool,
-}
-
-/// What became of a finished round's branch.
-#[derive(Debug)]
-pub enum Handoff {
-    /// The round pushed nothing — its branch, if any, holds no work of its
-    /// own — so there is nothing to deliver.
-    NoBranch,
-    /// A failed round still leaves a real branch, but opening a pull request
-    /// for work that did not pass is noise.
-    Withheld { branch: String },
-    Delivered {
-        base_differs: Option<BaseDiffers>,
-        delivered: Delivered,
-    },
 }
 
 impl RoundConclusion {
     /// What the round left, as printed once it is over.
     #[must_use]
     pub fn to_lines(&self) -> Vec<String> {
-        let summary = self.report.as_ref().map(JobReport::to_summary_line);
-        let handoff: Vec<String> = match &self.handoff {
-            Handoff::NoBranch => Vec::new(),
-            Handoff::Withheld { branch } => {
-                vec![format!(
-                    "branch: {branch} (not delivered — the round did not pass)"
-                )]
-            }
-            Handoff::Delivered {
-                base_differs,
-                delivered,
-            } => base_differs
-                .iter()
-                .map(|differs| format!("note: {differs}"))
-                .chain(std::iter::once(delivered.to_string()))
-                .collect(),
-        };
+        let report = self.report.iter().flat_map(JobReport::to_status_lines);
         let state = self
             .started_the_job
             .then(|| format!("state: {}", self.job.dir.display()));
 
-        summary.into_iter().chain(handoff).chain(state).collect()
+        report.chain(state).collect()
     }
 }
 
@@ -315,12 +278,9 @@ pub async fn prepare_start<'r, R: Runner>(
         round: Ok(ReadyRound {
             runner,
             repo: located.repo,
-            base_ref: located.base_ref,
             provider,
-            original_prompt: located.prompt.clone(),
             destination: Destination::NewJob { jobs_dir },
-            requested_base: located.start.clone(),
-            start: located.start,
+            requested_base: located.start,
             remote_url: located.remote_url,
             round_prompt: located.prompt,
             config,
@@ -336,8 +296,8 @@ pub async fn prepare_revision<'r, R: Runner>(
     root: &Path,
     request: RevisionRequest,
 ) -> Prepared<'r, R> {
-    let feedback = match prompt_text(request.prompt, request.prompt_file) {
-        Ok(feedback) => feedback,
+    let round_prompt = match prompt_text(request.prompt, request.prompt_file) {
+        Ok(prompt) => prompt,
         Err(e) => return Prepared::refused(Vec::new(), Refusal::Unpreparable(e)),
     };
     let located = match locate_revision(root, request.job_id, request.repo).await {
@@ -369,22 +329,18 @@ pub async fn prepare_revision<'r, R: Runner>(
         }
     };
     let round = located.rounds + 1;
-    let round_prompt = payload::revised_prompt(&located.original_prompt, &feedback);
 
     Prepared {
         notes,
         round: Ok(ReadyRound {
             runner,
             repo: located.checkout,
-            base_ref: located.base.name.clone(),
             provider: located.provider,
-            original_prompt: located.original_prompt,
             destination: Destination::ExistingJob {
                 paths: located.paths,
                 round,
                 log,
             },
-            start: located.tip,
             requested_base: located.base,
             remote_url: located.remote_url,
             round_prompt,
@@ -394,8 +350,14 @@ pub async fn prepare_revision<'r, R: Runner>(
     }
 }
 
-/// Run a prepared round: allocate its job if it is a new one, launch and
-/// collect the round, and hand its branch on once `verify` accepted it.
+/// Run a prepared round: claim its job if it is a new one, record the
+/// round's request and start, then launch `assembly run` for it and collect
+/// what it reports. A new job and a revise launch alike, with `--job`.
+///
+/// A launch failure is a failed round, not a usage error: the job directory
+/// already exists and must say what became of it. `cancel` reaches the
+/// launch too, so Ctrl-C while a round is still starting stops it rather
+/// than waiting for it to start.
 ///
 /// # Errors
 ///
@@ -408,11 +370,8 @@ pub async fn run<R: Runner>(
     let ReadyRound {
         runner,
         repo,
-        base_ref,
         provider,
-        original_prompt,
         destination,
-        start,
         requested_base,
         remote_url,
         round_prompt,
@@ -421,56 +380,42 @@ pub async fn run<R: Runner>(
     } = ready;
     let started_the_job = matches!(destination, Destination::NewJob { .. });
     let (paths, mut log, round) = match destination {
-        Destination::NewJob { jobs_dir } => allocate_job(&jobs_dir, &repo, &start.sha)
+        Destination::NewJob { jobs_dir } => allocate_job(&jobs_dir, &repo, &requested_base.sha)
             .await
             .map(|(paths, log)| (paths, log, 1))?,
         Destination::ExistingJob { paths, round, log } => (paths, log, round),
     };
     log.append(EventKind::RoundRequested {
         remote_url: remote_url.clone(),
-        base: requested_base,
+        base: requested_base.clone(),
         prompt: round_prompt.clone(),
         provider: provider.clone(),
     })
     .map_err(|e| anyhow!("recording the round's request: {e}"))?;
+    log.append(EventKind::RoundStarted { round })
+        .map_err(|e| anyhow!("recording the round's start: {e}"))?;
 
-    let payload = RoundPayload::for_round(
-        &config,
-        RoundRequest {
-            job_id: paths.id,
-            round,
-            prompt: &round_prompt,
-            provider: &provider,
-            start,
-            remote_name: DEFAULT_REMOTE,
-            remote_url,
-        },
-    )
-    .map(payload_fitted_to::<R>)?;
-    let verdict = collect_round(runner, &payload, &secrets, &mut log, &paths.log(), cancel).await?;
+    let spec = LaunchSpec::for_round::<R>(
+        paths.id,
+        round,
+        &remote_url,
+        &requested_base,
+        &round_prompt,
+        &provider,
+        config.command_limit_secs(),
+    );
+    let verdict = match runner.launch(&spec, &secrets, &cancel).await {
+        Ok(running) => collect(running, &mut log, &paths.log(), cancel).await?,
+        Err(e) => record_launch_failure(&mut log, &e)?,
+    };
 
     let report = events_of(&paths)
         .ok()
         .map(|events| JobReport::from_events(paths.id.into(), &events));
-    let branch = report.as_ref().and_then(|report| report.branch.clone());
-    let handoff = hand_off(
-        &repo,
-        &config,
-        &base_ref,
-        branch,
-        verdict,
-        PullRequestText {
-            title: payload.commit_message.lines().next().unwrap_or_default(),
-            body: &original_prompt,
-        },
-    )
-    .await;
-
     Ok(RoundConclusion {
         job: paths,
         verdict,
         report,
-        handoff,
         started_the_job,
     })
 }
@@ -550,8 +495,8 @@ async fn locate_start(
     })
 }
 
-/// An existing job, the commit its next round starts from, and the config
-/// that governs it.
+/// An existing job whose branch is still on the remote, and the config that
+/// governs its next round.
 struct RevisionLocated {
     paths: JobPaths,
     checkout: PathBuf,
@@ -560,8 +505,6 @@ struct RevisionLocated {
     /// The job's base, pinned at the remote's tip now.
     base: PinnedRef,
     provider: String,
-    original_prompt: String,
-    tip: PinnedRef,
     declared: RepoConfig,
 }
 
@@ -574,9 +517,7 @@ async fn locate_revision(
     let (jobs_dir, remote_url) = locate::jobs_dir_of(root, Some(checkout.clone())).await?;
     let paths = paths::open_job(&jobs_dir, JobId::from(job_id))?;
     let report = JobReport::from_events(job_id, &events_of(&paths)?);
-    let (Some(requested_base), Some(provider), Some(original_prompt)) =
-        (report.base, report.provider, report.first_prompt)
-    else {
+    let (Some(requested_base), Some(provider)) = (report.base, report.provider) else {
         return Err(anyhow!(
             "job {job_id} has no recorded request — its first round never started, so there is \
              nothing to revise"
@@ -584,7 +525,7 @@ async fn locate_revision(
     };
 
     let base = git::pinned(&checkout, DEFAULT_REMOTE, &requested_base.name).await?;
-    let tip = job_branch_tip(&checkout, paths.id).await?;
+    ensure_job_branch_exists(&checkout, paths.id).await?;
     // `base`, not the job's own branch: the previous round is not allowed to
     // have changed the settings that govern this one.
     let declared = RepoConfig::from_ref(&checkout, &base.sha).await?;
@@ -596,8 +537,6 @@ async fn locate_revision(
         remote_url,
         base,
         provider,
-        original_prompt,
-        tip,
         declared,
     })
 }
@@ -670,61 +609,17 @@ async fn allocate_job(
         .map_err(|e| anyhow!("opening the event log: {e}"))
 }
 
-/// Launch the round and collect it. A launch failure is a failed round, not
-/// a usage error: the job directory already exists and must say what
-/// became of it. `cancel` reaches the launch too, so Ctrl-C while a round is
-/// still starting stops it rather than waiting for it to start.
-async fn collect_round<R: Runner>(
-    runner: &R,
-    payload: &RoundPayload,
-    secrets: &JobSecrets,
-    log: &mut EventLog,
-    output_log: &Path,
-    cancel: CancellationToken,
-) -> anyhow::Result<Verdict> {
-    match runner.launch(payload, secrets, &cancel).await {
-        Ok(job) => collect(job, log, output_log, payload.round, cancel).await,
-        Err(e) => record_launch_failure(log, payload.round, &e),
-    }
-}
-
-/// Hand the job's branch on, once its round passed.
-async fn hand_off(
-    repo: &Path,
-    config: &RepoConfig,
-    base_ref: &str,
-    branch: Option<String>,
-    verdict: Verdict,
-    pull_request: PullRequestText<'_>,
-) -> Handoff {
-    match (branch, verdict) {
-        (None, _) => Handoff::NoBranch,
-        (Some(branch), Verdict::Failed) => Handoff::Withheld { branch },
-        (Some(branch), Verdict::Passed) => {
-            let base = config.base.as_deref().unwrap_or(base_ref);
-            let base_differs = (base != base_ref).then(|| BaseDiffers {
-                base: base.to_string(),
-                base_ref: base_ref.to_string(),
-            });
-            let delivered =
-                delivery::deliver(repo, &config.delivery, &branch, base, pull_request).await;
-            Handoff::Delivered {
-                base_differs,
-                delivered,
-            }
-        }
-    }
-}
-
-/// Where a revise round starts: the remote's copy of the job's branch.
+/// Refuses a revise whose job has no branch on the remote to continue. `run`
+/// starts from the branch itself; this only keeps a round from being
+/// recorded for a job with nothing to revise.
 ///
 /// A job's branch can be absent rather than unpushed — deleted once its pull
 /// request merged, or never pushed by a job from before ids were claimed on
 /// the remote — and "push it first" would be the wrong advice.
-async fn job_branch_tip(repo: &Path, job_id: JobId) -> anyhow::Result<PinnedRef> {
+async fn ensure_job_branch_exists(repo: &Path, job_id: JobId) -> anyhow::Result<()> {
     let branch = job_id.branch_name();
     match git::pinned(repo, DEFAULT_REMOTE, &branch).await {
-        Ok(tip) => Ok(tip),
+        Ok(_) => Ok(()),
         Err(e) => match git::remote_lacks_ref(repo, DEFAULT_REMOTE, &branch).await {
             Ok(true) => Err(anyhow!(
                 "job {job_id} has no branch on '{DEFAULT_REMOTE}' — it was deleted, or the job \

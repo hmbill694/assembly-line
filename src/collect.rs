@@ -17,13 +17,12 @@ use tokio_util::sync::CancellationToken;
 /// round that fails, or dies without saying how, is a [`Verdict::Failed`].
 /// The round is cancelled, and its end waited for, before the error is
 /// returned: dropping it would kill only the local end — a `docker` client,
-/// or `job-exec` before it has stopped its agent — and leave the work
-/// running with nobody collecting it.
+/// or `run` before it has stopped its agent — and leave the work running
+/// with nobody collecting it.
 pub async fn collect<R: RunningRound>(
     mut running: R,
     log: &mut EventLog,
     output_log: &Path,
-    round: u32,
     cancel: CancellationToken,
 ) -> anyhow::Result<Verdict> {
     let collected = match stream_into_logs(&mut running, log, output_log, cancel).await {
@@ -35,22 +34,12 @@ pub async fn collect<R: RunningRound>(
     };
 
     let termination = running.termination().await;
-    let settled = start_missing_from(&collected, round)
-        .into_iter()
-        .chain(verdict_missing_from(&collected, &termination.to_string()))
+    let settled = verdict_missing_from(&collected, &termination.to_string())
         .map(|kind| log.append(kind))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(verdict_of(&[collected, settled].concat()))
-}
-
-/// The start of a round whose stream never announced one — a round that died
-/// before its first frame, or never ran. Without it the round's failure would
-/// read as the previous round's, and the next revise would reuse its number.
-fn start_missing_from(round_events: &[Event], round: u32) -> Option<EventKind> {
-    (!round_events
-        .iter()
-        .any(|e| matches!(e.kind, EventKind::RoundStarted { .. })))
-    .then_some(EventKind::RoundStarted { round })
+        .transpose()?;
+    Ok(verdict_of(
+        &collected.into_iter().chain(settled).collect::<Vec<_>>(),
+    ))
 }
 
 /// Route every line of the round's stream to the event log or the output log
@@ -103,17 +92,12 @@ async fn cancel_and_wait_out<R: RunningRound>(mut running: R) {
 }
 
 /// A runner that could not start the round at all still leaves a record: the
-/// round began, it failed, and this is why.
+/// round failed, and this is why.
 ///
 /// # Errors
 ///
 /// Returns an error if the event log cannot be written.
-pub fn record_launch_failure(
-    log: &mut EventLog,
-    round: u32,
-    error: &anyhow::Error,
-) -> anyhow::Result<Verdict> {
-    log.append(EventKind::RoundStarted { round })?;
+pub fn record_launch_failure(log: &mut EventLog, error: &anyhow::Error) -> anyhow::Result<Verdict> {
     log.append(EventKind::RoundFailed {
         reason: format!("the runner could not start the round: {error}"),
     })?;

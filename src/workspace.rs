@@ -43,32 +43,6 @@ pub const DEFAULT_REMOTE: &str = "origin";
 /// the repository itself calls that remote.
 const CLONE_REMOTE: &str = "origin";
 
-/// Clone `remote_url` into a fresh directory under `scratch_root`, with
-/// `branch` checked out at `start`. A `credential_helper` authenticates both
-/// the clone and the eventual push.
-///
-/// # Errors
-///
-/// A clone that fails midway leaves nothing: the directory is removed as
-/// the error propagates.
-pub async fn create(
-    remote_url: &str,
-    start: &PinnedRef,
-    branch: &str,
-    scratch_root: impl AsRef<Path>,
-    credential_helper: Option<&str>,
-) -> anyhow::Result<RoundWorkspace> {
-    let clone = clone_scratch(remote_url, scratch_root, credential_helper).await?;
-    // A tag, or a commit reachable only from the ref the job names, is not
-    // guaranteed by a plain clone.
-    git::run_allowing_failure(
-        clone.path(),
-        &["fetch", "--quiet", CLONE_REMOTE, &start.name],
-    )
-    .await?;
-    start_round(clone, start, branch).await
-}
-
 /// Clone `remote_url` into a fresh directory under `scratch_root`, checking
 /// nothing out. A `credential_helper` authenticates both the clone and every
 /// later fetch and push from it.

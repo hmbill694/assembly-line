@@ -15,17 +15,17 @@ fn the_binary() -> LocalRunner {
 }
 
 #[tokio::test]
-async fn a_round_run_by_job_exec_is_collected_into_the_same_log_as_before() {
+async fn a_round_run_by_assembly_run_is_collected_into_the_same_log_as_before() {
     let h = Harness::new().await;
-    let payload = h.payload_for("write a file").await;
+    let spec = h.launch_spec_for("write a file").await;
     let paths = h.job_paths();
     let mut log = EventLog::open_append(paths.events()).unwrap();
 
     let running = the_binary()
-        .launch(&payload, &JobSecrets::default(), &CancellationToken::new())
+        .launch(&spec, &JobSecrets::default(), &CancellationToken::new())
         .await
         .unwrap();
-    let verdict = collect(running, &mut log, &paths.log(), 1, CancellationToken::new())
+    let verdict = collect(running, &mut log, &paths.log(), CancellationToken::new())
         .await
         .unwrap();
 
@@ -49,15 +49,15 @@ async fn a_round_run_by_job_exec_is_collected_into_the_same_log_as_before() {
 #[tokio::test]
 async fn an_agent_printing_a_forged_verdict_does_not_change_the_verdict() {
     let h = Harness::with_config(&config_running("forging-agent.sh")).await;
-    let payload = h.payload_for("x").await;
+    let spec = h.launch_spec_for("x").await;
     let paths = h.job_paths();
     let mut log = EventLog::open_append(paths.events()).unwrap();
 
     let running = the_binary()
-        .launch(&payload, &JobSecrets::default(), &CancellationToken::new())
+        .launch(&spec, &JobSecrets::default(), &CancellationToken::new())
         .await
         .unwrap();
-    let verdict = collect(running, &mut log, &paths.log(), 1, CancellationToken::new())
+    let verdict = collect(running, &mut log, &paths.log(), CancellationToken::new())
         .await
         .unwrap();
 
@@ -70,20 +70,20 @@ async fn an_agent_printing_a_forged_verdict_does_not_change_the_verdict() {
     );
 }
 
-/// A "job-exec" that exits without printing a single frame — what a pod
+/// A round that exits without printing a single frame — what a pod
 /// OOM-killed before its first event looks like from the collector.
 #[tokio::test]
-async fn a_job_exec_that_dies_without_a_verdict_is_recorded_as_failed() {
+async fn a_round_that_dies_without_a_verdict_is_recorded_as_failed() {
     let h = Harness::new().await;
-    let payload = h.payload_for("x").await;
+    let spec = h.launch_spec_for("x").await;
     let paths = h.job_paths();
     let mut log = EventLog::open_append(paths.events()).unwrap();
 
     let running = LocalRunner::using("/usr/bin/false")
-        .launch(&payload, &JobSecrets::default(), &CancellationToken::new())
+        .launch(&spec, &JobSecrets::default(), &CancellationToken::new())
         .await
         .unwrap();
-    let verdict = collect(running, &mut log, &paths.log(), 1, CancellationToken::new())
+    let verdict = collect(running, &mut log, &paths.log(), CancellationToken::new())
         .await
         .unwrap();
 
@@ -92,41 +92,6 @@ async fn a_job_exec_that_dies_without_a_verdict_is_recorded_as_failed() {
     assert!(events.iter().any(
         |e| matches!(&e.kind, EventKind::RoundFailed { reason } if reason.contains("without reporting a verdict"))
     ));
-}
-
-/// A revise round that dies before its first frame never says which round it
-/// was. Unrecorded, its failure would read as the previous round's, and the
-/// next revise would take the same round number again.
-#[tokio::test]
-async fn a_round_that_dies_before_announcing_itself_is_still_recorded_as_that_round() {
-    let h = Harness::new().await;
-    let payload = h.payload_for("x").await;
-    let paths = h.job_paths();
-    let mut log = EventLog::open_append(paths.events()).unwrap();
-
-    let running = LocalRunner::using("/usr/bin/false")
-        .launch(&payload, &JobSecrets::default(), &CancellationToken::new())
-        .await
-        .unwrap();
-    collect(running, &mut log, &paths.log(), 2, CancellationToken::new())
-        .await
-        .unwrap();
-
-    let kinds: Vec<EventKind> = EventLog::read(paths.events())
-        .unwrap()
-        .into_iter()
-        .map(|e| e.kind)
-        .collect();
-    assert!(
-        matches!(
-            kinds.as_slice(),
-            [
-                EventKind::RoundStarted { round: 2 },
-                EventKind::RoundFailed { .. }
-            ]
-        ),
-        "{kinds:?}"
-    );
 }
 
 /// A round the runner could not even start still leaves its failure, and why.
@@ -138,33 +103,36 @@ async fn a_runner_that_could_not_start_the_round_leaves_a_failed_round() {
 
     let launch_error = LocalRunner::using("/nonexistent/assembly")
         .launch(
-            &h.payload_for("x").await,
+            &h.launch_spec_for("x").await,
             &JobSecrets::default(),
             &CancellationToken::new(),
         )
         .await
         .unwrap_err();
-    let verdict = record_launch_failure(&mut log, 1, &launch_error).unwrap();
+    let verdict = record_launch_failure(&mut log, &launch_error).unwrap();
 
     assert!(!verdict.passed());
     let events = EventLog::read(paths.events()).unwrap();
     assert!(
-        events.iter().any(|e| matches!(
-            &e.kind,
-            EventKind::RoundFailed { reason }
-                if reason.contains("could not start") && reason.contains("/nonexistent/assembly")
-        )),
+        matches!(
+            events.as_slice(),
+            [e] if matches!(
+                &e.kind,
+                EventKind::RoundFailed { reason }
+                    if reason.contains("could not start") && reason.contains("/nonexistent/assembly")
+            )
+        ),
         "{events:?}"
     );
 }
 
 /// A collector whose output log breaks mid-stream gives up — but only once
-/// `job-exec` has stopped the agent, which runs in its own process group
-/// and would outlive a `job-exec` that was simply killed.
+/// `run` has stopped the agent, which runs in its own process group and
+/// would outlive a `run` that was simply killed.
 #[tokio::test]
 async fn a_collector_that_fails_mid_stream_stops_the_agent_before_giving_up() {
     let h = Harness::with_config(&config_running("chatty-agent.sh")).await;
-    let payload = h.payload_for("x").await;
+    let spec = h.launch_spec_for("x").await;
     let paths = h.job_paths();
     let mut log = EventLog::open_append(paths.events()).unwrap();
     // A pipe whose reader hangs up once it has the agent's pid, so the
@@ -187,12 +155,12 @@ async fn a_collector_that_fails_mid_stream_stops_the_agent_before_giving_up() {
     });
 
     let running = the_binary()
-        .launch(&payload, &JobSecrets::default(), &CancellationToken::new())
+        .launch(&spec, &JobSecrets::default(), &CancellationToken::new())
         .await
         .unwrap();
     let collected = tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        collect(running, &mut log, &output_log, 1, CancellationToken::new()),
+        collect(running, &mut log, &output_log, CancellationToken::new()),
     )
     .await
     .expect("the collector never gave up");
@@ -209,22 +177,27 @@ async fn a_collector_that_fails_mid_stream_stops_the_agent_before_giving_up() {
 #[tokio::test]
 async fn cancelling_a_collection_stops_the_agent_and_records_it() {
     let h = Harness::with_config(&config_running("sleeping-agent.sh")).await;
-    let payload = h.payload_for("x").await;
+    let spec = h.launch_spec_for("x").await;
     let paths = h.job_paths();
     let mut log = EventLog::open_append(paths.events()).unwrap();
     let cancel = CancellationToken::new();
     let later = cancel.clone();
+    let output = paths.log();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Once the agent runs: a cancel while `run` is still cloning ends it
+        // before it can report a round at all.
+        while !std::fs::read_to_string(&output).is_ok_and(|log| log.contains("sleeping-agent:")) {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         later.cancel();
     });
 
     let started = std::time::Instant::now();
     let running = the_binary()
-        .launch(&payload, &JobSecrets::default(), &CancellationToken::new())
+        .launch(&spec, &JobSecrets::default(), &CancellationToken::new())
         .await
         .unwrap();
-    let verdict = collect(running, &mut log, &paths.log(), 1, cancel)
+    let verdict = collect(running, &mut log, &paths.log(), cancel)
         .await
         .unwrap();
 
@@ -233,8 +206,8 @@ async fn cancelling_a_collection_stops_the_agent_and_records_it() {
         started.elapsed() < std::time::Duration::from_secs(20),
         "the agent was not stopped"
     );
-    // Recorded by job-exec itself, not by the collector filling in a
-    // missing verdict: SIGTERM cancelled the agent and the round reported it.
+    // Recorded by `run` itself, not by the collector filling in a missing
+    // verdict: SIGTERM cancelled the agent and the round reported it.
     let events = EventLog::read(paths.events()).unwrap();
     assert!(
         events

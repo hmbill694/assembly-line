@@ -155,6 +155,15 @@ impl RepoConfig {
             .then(|| ConfigError::UnparseableMaxDuration(value.to_string()))
     }
 
+    /// `max_duration` in whole seconds, when it is set and parses.
+    #[must_use]
+    pub fn command_limit_secs(&self) -> Option<u64> {
+        self.max_duration
+            .as_deref()
+            .and_then(|value| parse_duration(value).ok())
+            .map(|limit| limit.as_secs())
+    }
+
     /// Settings worth telling the user about, none of which stop a job.
     #[must_use]
     pub fn settings_worth_flagging(&self) -> Vec<Warning> {

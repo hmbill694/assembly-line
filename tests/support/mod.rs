@@ -5,6 +5,7 @@
 //! items only some of them use are expected to look unused here.
 #![allow(dead_code)]
 
+use assembly_line::claim;
 use assembly_line::config::RepoConfig;
 use assembly_line::event::{EventKind, EventLog};
 use assembly_line::git;
@@ -13,16 +14,17 @@ use assembly_line::lifecycle::{
     self, Prepared, Refusal, RevisionRequest, StartRequest, prepare_revision, prepare_start,
 };
 use assembly_line::paths::{self, JobPaths};
-use assembly_line::payload::{RoundPayload, RoundRequest};
 use assembly_line::report::JobReport;
+use assembly_line::runner::LaunchSpec;
 use assembly_line::runner::local::LocalRunner;
 use assembly_line::state::JobState;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Output;
 use tokio_util::sync::CancellationToken;
 
-/// The job id of [`Harness::payload_for`] and [`Harness::job_paths`]. A job
-/// run through the lifecycle gets whatever id the lifecycle allocates.
+/// The job id of [`Harness::job_paths`]. A job run through the lifecycle
+/// gets whatever id the lifecycle allocates.
 const THE_JOB: u64 = 1;
 
 /// Path to one of the fake-agent scripts under `tests/fixtures`.
@@ -201,7 +203,7 @@ impl Harness {
     }
 
     /// A job directory outside the repository, for tests that drive a runner
-    /// or `job-exec` directly rather than through the lifecycle.
+    /// directly rather than through the lifecycle.
     pub fn job_paths(&self) -> JobPaths {
         let jobs_dir = self.tmp.path().join("jobs");
         paths::open_job(&jobs_dir, THE_JOB.into())
@@ -265,25 +267,34 @@ impl Harness {
         }
     }
 
-    /// A realistic round-1 payload for this repository, for tests that hand
-    /// one to a runner or to `job-exec` directly.
-    pub async fn payload_for(&self, prompt: &str) -> RoundPayload {
-        let start = git::pinned(&self.repo, "origin", "main").await.unwrap();
-        let config = RepoConfig::from_ref(&self.repo, &start.sha).await.unwrap();
-
-        RoundPayload::for_round(
-            &config,
-            RoundRequest {
-                job_id: THE_JOB.into(),
-                round: 1,
-                prompt,
-                provider: config.provider.as_deref().unwrap_or_default(),
-                start,
-                remote_name: "origin",
-                remote_url: self.origin.to_string_lossy().into_owned(),
-            },
+    /// A claimed job and the launch spec for its first round, for tests
+    /// that hand a round to a runner directly.
+    pub async fn launch_spec_for(&self, prompt: &str) -> LaunchSpec {
+        let base = git::pinned(&self.repo, "origin", "main").await.unwrap();
+        let config = RepoConfig::from_ref(&self.repo, &base.sha).await.unwrap();
+        let job = claim::claim_job(&self.repo, "origin", &base.sha)
+            .await
+            .unwrap();
+        LaunchSpec::for_round::<LocalRunner>(
+            job,
+            1,
+            self.origin.to_str().unwrap(),
+            &base,
+            prompt,
+            config.provider.as_deref().unwrap_or_default(),
+            None,
         )
-        .unwrap()
+    }
+
+    /// `assembly` run by hand with a launch spec's arguments, as a runner
+    /// would run it, with `extra_env` on top of this process's environment.
+    pub async fn run_frames(&self, prompt: &str, extra_env: &[(&str, &str)]) -> Output {
+        std::process::Command::new(env!("CARGO_BIN_EXE_assembly"))
+            .args(self.launch_spec_for(prompt).await.args)
+            .env("TMPDIR", self.scratch_root())
+            .envs(extra_env.iter().copied())
+            .output()
+            .unwrap()
     }
 
     fn start(&self, prompt: &str, provider: Option<&str>, base_ref: Option<&str>) -> StartRequest {

@@ -276,7 +276,10 @@ async fn every_round_asked_for_is_recorded_before_it_starts() {
 
     assert_eq!(requests.len(), 2, "{:?}", second.events);
     assert_eq!(requests[0].1, "add auth");
-    assert!(requests[1].1.contains("use sessions"), "{}", requests[1].1);
+    assert_eq!(
+        requests[1].1, "use sessions",
+        "a revise asks only its feedback"
+    );
     assert!(
         requests
             .iter()
