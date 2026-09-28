@@ -5,6 +5,8 @@
 //! items only some of them use are expected to look unused here.
 #![allow(dead_code)]
 
+pub mod daemon;
+
 use assembly_line::claim;
 use assembly_line::config::RepoConfig;
 use assembly_line::event::{EventKind, EventLog};

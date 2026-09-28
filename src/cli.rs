@@ -87,6 +87,20 @@ pub enum Command {
         runner: RunnerArgs,
     },
 
+    /// Run the daemon: one root, one runner, rounds launched and watched on
+    /// behalf of `submit`
+    Daemon {
+        #[command(flatten)]
+        runner: RunnerArgs,
+        /// How many rounds may run at once
+        #[arg(
+            long,
+            default_value_t = 1,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+        )]
+        max_jobs: usize,
+    },
+
     /// Show a job's state, timing and diff
     Status {
         /// Defaults to the most recent job

@@ -1,4 +1,5 @@
 use assembly_line::cli::{Cli, Command, RunnerArgs, RunnerKind};
+use assembly_line::daemon::{self, Daemon};
 use assembly_line::frame::{FrameWriter, ReadableFrames};
 use assembly_line::lifecycle::{self, Note, Prepared, Refusal, Work};
 use assembly_line::paths;
@@ -63,10 +64,13 @@ fn main() -> ExitCode {
             },
             Ok(root),
         ) => in_async_runtime(run_work_on_chosen_runner(
-            runner,
+            &runner,
             &root,
             Work::from_submission(prompt, prompt_file, repo, base_ref, provider, job),
         )),
+        (Command::Daemon { runner, max_jobs }, Ok(root)) => {
+            in_async_runtime(serve_daemon_on_chosen_runner(&runner, root, max_jobs))
+        }
         (Command::Status { job_id, repo }, Ok(root)) => {
             in_async_runtime(print_job_status(&root, job_id, repo))
         }
@@ -159,44 +163,101 @@ fn cancel_on_termination_signal(cancel: CancellationToken) {
     });
 }
 
+/// The runner `RunnerArgs` chose, built.
+enum ChosenRunner {
+    Local(LocalRunner),
+    Docker(DockerRunner),
+    K8s(KubernetesRunner),
+}
+
 /// The one place flags become a concrete runner; everything after it is
 /// generic over [`Runner`].
-async fn run_work_on_chosen_runner(
-    args: RunnerArgs,
-    root: &Path,
-    work: Work,
-) -> Result<ExitCode, String> {
+fn chosen_runner(args: &RunnerArgs) -> Result<ChosenRunner, String> {
     if let Some(inapplicable) = args.inapplicable_flags() {
         return Err(inapplicable.to_string());
     }
+    let image = || args.image.clone().unwrap_or_else(runner::published_image);
     match args.runner {
-        RunnerKind::Local => {
-            run_work(
-                &LocalRunner::current_binary().map_err(|e| e.to_string())?,
-                &[],
-                root,
-                work,
-            )
-            .await
-        }
-        RunnerKind::Docker => {
-            let image = args.image.unwrap_or_else(runner::published_image);
-            run_work(&DockerRunner::new(image), &args.pass_env, root, work).await
-        }
-        RunnerKind::K8s => {
-            let image = args.image.unwrap_or_else(runner::published_image);
-            // clap has already required a namespace for k8s, so the default
-            // is never taken.
-            let namespace = args.namespace.unwrap_or_default();
-            run_work(
-                &KubernetesRunner::new(image, namespace, args.context),
-                &args.pass_env,
-                root,
-                work,
-            )
-            .await
-        }
+        RunnerKind::Local => LocalRunner::current_binary()
+            .map(ChosenRunner::Local)
+            .map_err(|e| e.to_string()),
+        RunnerKind::Docker => Ok(ChosenRunner::Docker(DockerRunner::new(image()))),
+        // clap has already required a namespace for k8s, so the default is
+        // never taken.
+        RunnerKind::K8s => Ok(ChosenRunner::K8s(KubernetesRunner::new(
+            image(),
+            args.namespace.clone().unwrap_or_default(),
+            args.context.clone(),
+        ))),
     }
+}
+
+async fn run_work_on_chosen_runner(
+    args: &RunnerArgs,
+    root: &Path,
+    work: Work,
+) -> Result<ExitCode, String> {
+    match chosen_runner(args)? {
+        ChosenRunner::Local(runner) => run_work(&runner, &args.pass_env, root, work).await,
+        ChosenRunner::Docker(runner) => run_work(&runner, &args.pass_env, root, work).await,
+        ChosenRunner::K8s(runner) => run_work(&runner, &args.pass_env, root, work).await,
+    }
+}
+
+async fn serve_daemon_on_chosen_runner(
+    args: &RunnerArgs,
+    root: PathBuf,
+    max_jobs: usize,
+) -> Result<ExitCode, String> {
+    match chosen_runner(args)? {
+        ChosenRunner::Local(runner) => serve_daemon(root, runner, max_jobs, &args.pass_env).await,
+        ChosenRunner::Docker(runner) => serve_daemon(root, runner, max_jobs, &args.pass_env).await,
+        ChosenRunner::K8s(runner) => serve_daemon(root, runner, max_jobs, &args.pass_env).await,
+    }
+}
+
+/// Hold the root, check the runner, and serve until SIGTERM or Ctrl-C.
+async fn serve_daemon<R: Runner + Send + Sync + 'static>(
+    root: PathBuf,
+    runner: R,
+    max_jobs: usize,
+    pass_env: &[String],
+) -> Result<ExitCode, String> {
+    let lock = daemon::root::hold_root(&root).map_err(|e| e.to_string())?;
+    let daemon = Daemon::prepare(root, runner, max_jobs, pass_env, |name| {
+        std::env::var(name).ok()
+    })
+    .await
+    .map_err(|problems| {
+        problems
+            .iter()
+            .for_each(|problem| eprintln!("error: {problem}"));
+        "the daemon's runner cannot run".to_string()
+    })?;
+    let shutdown = termination_requested().map_err(|e| format!("handling SIGTERM: {e}"))?;
+    eprintln!(
+        "listening on {}",
+        daemon::root::socket_path(&daemon.root).display()
+    );
+    daemon::serve(daemon, lock, shutdown)
+        .await
+        .map(|()| ExitCode::SUCCESS)
+        .map_err(|e| e.to_string())
+}
+
+/// Resolves on SIGTERM or Ctrl-C. Both handlers are installed before this
+/// returns: a signal landing before them would kill the daemon outright,
+/// leaving its socket behind.
+fn termination_requested() -> std::io::Result<impl Future<Output = ()> + Send + 'static> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    Ok(async move {
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+    })
 }
 
 async fn run_work<R: Runner>(
