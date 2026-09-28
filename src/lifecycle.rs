@@ -405,7 +405,7 @@ pub async fn run<R: Runner>(
         branch,
         verdict,
         PullRequestText {
-            title: &payload.commit_message,
+            title: payload.commit_message.lines().next().unwrap_or_default(),
             body: &meta.prompt,
         },
     )
