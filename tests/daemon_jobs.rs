@@ -38,17 +38,8 @@ impl Fixture {
     async fn repository(config: &str) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        support::init_git_repo(&repo).await;
-        std::fs::create_dir_all(repo.join(".assembly")).unwrap();
-        std::fs::write(
-            repo.join(REPO_CONFIG_PATH),
-            format!("{config}\n[delivery]\nmode = \"none\"\n"),
-        )
-        .unwrap();
-        support::commit_all(&repo, "opt in").await.unwrap().unwrap();
         let origin = tmp.path().join("origin.git");
-        support::add_origin(&repo, &origin).await;
-        support::publish_main(&repo).await;
+        publish_opted_in_repository(&repo, &origin, config).await;
         Fixture {
             daemon: None,
             tmp,
@@ -105,6 +96,21 @@ impl Fixture {
     fn on_origin(&self, args: &[&str]) -> String {
         git_in(&self.origin, args)
     }
+}
+
+/// A checkout at `repo` that opts in with `config`, published to a bare
+/// `origin`.
+async fn publish_opted_in_repository(repo: &Path, origin: &Path, config: &str) {
+    support::init_git_repo(repo).await;
+    std::fs::create_dir_all(repo.join(".assembly")).unwrap();
+    std::fs::write(
+        repo.join(REPO_CONFIG_PATH),
+        format!("{config}\n[delivery]\nmode = \"none\"\n"),
+    )
+    .unwrap();
+    support::commit_all(repo, "opt in").await.unwrap().unwrap();
+    support::add_origin(repo, origin).await;
+    support::publish_main(repo).await;
 }
 
 fn git_in(dir: &Path, args: &[&str]) -> String {
@@ -345,6 +351,240 @@ async fn a_revise_of_a_job_still_running_is_refused() {
         .assert()
         .code(2)
         .stderr(contains("already queued or running"));
+    fx.assembly().args(["cancel", "1"]).assert().success();
+}
+
+#[tokio::test]
+async fn cancelling_a_running_job_stops_its_agent_and_records_it() {
+    let fx = Fixture::running("sleeping-agent.sh", &[], &[]).await;
+    fx.assembly()
+        .args(["submit", "--prompt", "x"])
+        .assert()
+        .success();
+    wait_until_logged(&fx.job_dir(1), "sleeping-agent:");
+
+    fx.assembly()
+        .args(["cancel", "1"])
+        .assert()
+        .success()
+        .stdout(contains("job 1: cancelling"));
+
+    let report = wait_for_verdict(&fx.job_dir(1));
+    assert_eq!(report.state, JobState::Failed);
+    assert_eq!(report.detail.as_deref(), Some("cancelled"));
+    wait_until_empty(&fx.tmp.path().join("scratch"));
+}
+
+/// A job cancelled while it waits for a slot is closed on the spot, and the
+/// dispatcher passes over it when its turn comes.
+#[tokio::test]
+async fn cancelling_a_queued_job_means_it_never_runs() {
+    let fx = Fixture::running("sleeping-agent.sh", &["--max-jobs", "1"], &[]).await;
+    ["first", "second", "third"].iter().for_each(|prompt| {
+        fx.assembly()
+            .args(["submit", "--prompt", prompt])
+            .assert()
+            .success();
+    });
+    wait_until_logged(&fx.job_dir(1), "sleeping-agent:");
+
+    fx.assembly()
+        .args(["cancel", "2"])
+        .assert()
+        .success()
+        .stdout(contains("job 2: cancelled before it started"));
+    fx.assembly().args(["cancel", "1"]).assert().success();
+    assert_eq!(wait_for_verdict(&fx.job_dir(1)).state, JobState::Failed);
+    // The third job is behind the second in line, so once it runs the
+    // dispatcher has had its chance to start the second.
+    wait_until_logged(&fx.job_dir(3), "sleeping-agent:");
+    fx.assembly().args(["cancel", "3"]).assert().success();
+
+    let second = wait_for_verdict(&fx.job_dir(2));
+    assert_eq!(second.rounds, 0, "the cancelled job was started anyway");
+    assert_eq!(
+        second.detail.as_deref(),
+        Some("cancelled before it started")
+    );
+    assert!(
+        matches!(
+            fx.events_of(2).as_slice(),
+            [
+                EventKind::RoundRequested { .. },
+                EventKind::RoundFailed { .. }
+            ]
+        ),
+        "{:?}",
+        fx.events_of(2)
+    );
+}
+
+/// A job whose round was dispatched but is still reading its config has not
+/// started, and a cancel closes it as such rather than leaving it queued
+/// with no verdict to come.
+#[tokio::test]
+async fn cancelling_a_job_still_reading_its_config_closes_it() {
+    let fakes = tempfile::tempdir().unwrap();
+    let stall = fakes.path().join("stall");
+    let path = path_where_git_stalls(fakes.path(), &stall, CONFIG_READ_IN_THE_CACHE);
+    let fx = Fixture::running("sleeping-agent.sh", &[], &[("PATH", path.as_str())]).await;
+    ["first", "second"].iter().for_each(|prompt| {
+        fx.assembly()
+            .args(["submit", "--prompt", prompt])
+            .assert()
+            .success();
+    });
+    wait_until_logged(&fx.job_dir(1), "sleeping-agent:");
+    std::fs::write(&stall, "").unwrap();
+
+    fx.assembly().args(["cancel", "1"]).assert().success();
+    wait_until_stalled_times(&stall, 1);
+    fx.assembly()
+        .args(["cancel", "2"])
+        .assert()
+        .success()
+        .stdout(contains("job 2: cancelling"));
+
+    let second = wait_for_verdict(&fx.job_dir(2));
+    std::fs::remove_file(&stall).unwrap();
+    assert_eq!(second.rounds, 0);
+    assert_eq!(
+        second.detail.as_deref(),
+        Some("cancelled before it started")
+    );
+}
+
+/// A job cancelled while queued and then revised is in line twice. Its
+/// revise is launched once, and its second place in line gives the slot to
+/// the job behind it — here in another repository, so that job's config
+/// read does not wait on the first's.
+#[tokio::test]
+async fn a_job_in_line_twice_is_launched_once() {
+    let fakes = tempfile::tempdir().unwrap();
+    let stall = fakes.path().join("stall");
+    let path = path_where_git_stalls(fakes.path(), &stall, CONFIG_READ_IN_THE_CACHE);
+    let fx = Fixture::running(
+        "sleeping-agent.sh",
+        &["--max-jobs", "2"],
+        &[("PATH", path.as_str())],
+    )
+    .await;
+    let other = fx.tmp.path().join("other");
+    publish_opted_in_repository(
+        &other,
+        &fx.tmp.path().join("other.git"),
+        &support::config_running("sleeping-agent.sh"),
+    )
+    .await;
+    let other = other.to_str().unwrap();
+    ["first", "second", "third"].iter().for_each(|prompt| {
+        fx.assembly()
+            .args(["submit", "--prompt", prompt])
+            .assert()
+            .success();
+    });
+    wait_until_logged(&fx.job_dir(1), "sleeping-agent:");
+    wait_until_logged(&fx.job_dir(2), "sleeping-agent:");
+    fx.assembly().args(["cancel", "3"]).assert().success();
+    fx.assembly()
+        .args(["submit", "--job", "3", "--prompt", "again"])
+        .assert()
+        .success();
+    fx.assembly()
+        .args(["submit", "--repo", other, "--prompt", "behind"])
+        .assert()
+        .success();
+    std::fs::write(&stall, "").unwrap();
+
+    fx.assembly().args(["cancel", "1"]).assert().success();
+    wait_until_stalled_times(&stall, 1);
+    fx.assembly().args(["cancel", "2"]).assert().success();
+    wait_until_stalled_times(&stall, 2);
+
+    fx.assembly()
+        .args(["cancel", "1", "--repo", other])
+        .assert()
+        .success();
+    fx.assembly().args(["cancel", "3"]).assert().success();
+    let third = wait_for_verdict(&fx.job_dir(3));
+    std::fs::remove_file(&stall).unwrap();
+    assert_eq!(third.rounds, 0, "{:?}", fx.events_of(3));
+}
+
+/// A round's verdict is recorded before `run` has delivered it. From then
+/// on the job is over: a cancel is refused, and a revise is its next round
+/// rather than lost behind the one still delivering.
+#[tokio::test]
+async fn a_job_whose_round_is_still_delivering_has_its_verdict() {
+    let fakes = tempfile::tempdir().unwrap();
+    let stall = fakes.path().join("stall");
+    let path = path_where_git_stalls(fakes.path(), &stall, DELIVERY_CHECK_IN_A_CLONE);
+    std::fs::write(&stall, "").unwrap();
+    let fx = Fixture::running(
+        "fake-agent.sh",
+        &["--max-jobs", "2"],
+        &[("PATH", path.as_str())],
+    )
+    .await;
+    fx.assembly()
+        .args(["submit", "--prompt", "x"])
+        .assert()
+        .success();
+    wait_until_stalled_times(&stall, 1);
+    assert_eq!(wait_for_verdict(&fx.job_dir(1)).state, JobState::Passed);
+
+    fx.assembly()
+        .args(["cancel", "1"])
+        .assert()
+        .code(2)
+        .stderr(contains("job 1 is not queued or running"));
+    fx.assembly()
+        .args(["submit", "--job", "1", "--prompt", "more"])
+        .assert()
+        .success();
+    let revised = wait_for_verdict(&fx.job_dir(1));
+    std::fs::remove_file(&stall).unwrap();
+
+    assert_eq!(revised.state, JobState::Passed);
+    assert_eq!(revised.rounds, 2);
+}
+
+#[tokio::test]
+async fn cancelling_a_job_that_is_not_running_is_refused() {
+    let fx = Fixture::running("fake-agent.sh", &[], &[]).await;
+    fx.assembly()
+        .args(["submit", "--prompt", "x"])
+        .assert()
+        .success();
+    wait_for_verdict(&fx.job_dir(1));
+
+    fx.assembly()
+        .args(["cancel", "1"])
+        .assert()
+        .code(2)
+        .stderr(contains("job 1 is not queued or running"));
+}
+
+#[tokio::test]
+async fn cancelling_a_job_that_does_not_exist_is_refused() {
+    let fx = Fixture::running("fake-agent.sh", &[], &[]).await;
+
+    fx.assembly()
+        .args(["cancel", "9"])
+        .assert()
+        .code(2)
+        .stderr(contains("no such job: 9"));
+}
+
+#[tokio::test]
+async fn cancel_with_no_daemon_says_how_to_start_one() {
+    let fx = Fixture::repository(&support::config_running("fake-agent.sh")).await;
+
+    fx.assembly()
+        .args(["cancel", "1"])
+        .assert()
+        .code(2)
+        .stderr(contains("assembly daemon"));
 }
 
 #[tokio::test]
@@ -552,33 +792,7 @@ async fn stopping_the_daemon_cancels_its_rounds_and_records_why() {
 async fn a_stalled_fetch_does_not_hold_up_stopping_the_daemon() {
     let fakes = tempfile::tempdir().unwrap();
     let stall = fakes.path().join("stall");
-    let real_git = String::from_utf8(
-        std::process::Command::new("sh")
-            .args(["-c", "command -v git"])
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap();
-    support::fake_cli(
-        fakes.path(),
-        "git",
-        &format!(
-            "case \"$(pwd -P)\" in\n  \
-               */root/repos/*) if [ \"$1\" = fetch ] && [ -e '{stall}' ]; then\n    \
-                 touch '{stall}.reached'; sleep 60\n  \
-               fi ;;\n\
-             esac\n\
-             exec '{}' \"$@\"\n",
-            real_git.trim(),
-            stall = stall.display(),
-        ),
-    );
-    let path = format!(
-        "{}:{}",
-        fakes.path().display(),
-        support::path_where_gh_refuses()
-    );
+    let path = path_where_git_stalls(fakes.path(), &stall, FETCH_INTO_THE_CACHE);
     let mut fx = Fixture::repository(&format!(
         "verify = \"true\"\nmax_duration = \"3s\"\n{}",
         support::config_running("sleeping-agent.sh")
@@ -602,7 +816,7 @@ async fn a_stalled_fetch_does_not_hold_up_stopping_the_daemon() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    wait_until_exists(&fakes.path().join("stall.reached"));
+    wait_until_stalled_times(&stall, 1);
     wait_for_verdict(&fx.job_dir(1));
     // Job 2's round has had its chance to take the freed slot.
     std::thread::sleep(std::time::Duration::from_secs(1));
@@ -658,13 +872,88 @@ async fn a_round_whose_config_cannot_be_read_at_dispatch_fails_saying_why() {
     );
 }
 
-fn wait_until_exists(path: &Path) {
+/// Which `git` calls [`path_where_git_stalls`] holds up: a working
+/// directory pattern, and a shell test on the arguments.
+#[derive(Clone, Copy)]
+struct GitCall {
+    in_dir: &'static str,
+    when: &'static str,
+}
+
+/// A fetch into the daemon's repository cache, which holds the cache's lock.
+const FETCH_INTO_THE_CACHE: GitCall = GitCall {
+    in_dir: "*/root/repos/*",
+    when: "[ \"$1\" = fetch ]",
+};
+
+/// Reading a job's config from the daemon's repository cache.
+const CONFIG_READ_IN_THE_CACHE: GitCall = GitCall {
+    in_dir: "*/root/repos/*",
+    when: "[ \"$1\" = cat-file ]",
+};
+
+/// `run` asking whether the branch it pushed carries work worth delivering —
+/// after the round's verdict. Committing asks the same of `..HEAD`, before.
+const DELIVERY_CHECK_IN_A_CLONE: GitCall = GitCall {
+    in_dir: "*/scratch/*",
+    when: "[ \"$1\" = rev-list ] && [ \"${3%..HEAD}\" = \"$3\" ]",
+};
+
+/// A `PATH` whose `git`, while `stall` exists, holds up every `call` until
+/// `stall` is removed, adding a line to `<stall>.reached` as each one
+/// begins to wait.
+fn path_where_git_stalls(fakes: &Path, stall: &Path, call: GitCall) -> String {
+    let real_git = String::from_utf8(
+        std::process::Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    support::fake_cli(
+        fakes,
+        "git",
+        &format!(
+            "case \"$(pwd -P)\" in\n  \
+               {in_dir}) if {when} && [ -e '{stall}' ]; then\n    \
+                 echo stalled >> '{stall}.reached'\n    \
+                 while [ -e '{stall}' ]; do sleep 0.1; done\n  \
+               fi ;;\n\
+             esac\n\
+             exec '{}' \"$@\"\n",
+            real_git.trim(),
+            in_dir = call.in_dir,
+            when = call.when,
+            stall = stall.display(),
+        ),
+    );
+    format!("{}:{}", fakes.display(), support::path_where_gh_refuses())
+}
+
+/// Wait until `times` git calls have stalled on `stall`.
+fn wait_until_stalled_times(stall: &Path, times: usize) {
+    let reached = stall.with_extension("reached");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while !path.exists() {
+    while std::fs::read_to_string(&reached).map_or(0, |log| log.lines().count()) < times {
         assert!(
             std::time::Instant::now() < deadline,
-            "{} never appeared",
-            path.display()
+            "fewer than {times} git calls ever stalled on {}",
+            stall.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Wait until `dir` holds nothing — a round's clone, say, once the round has
+/// cleaned up after itself.
+fn wait_until_empty(dir: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} was never emptied",
+            dir.display()
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }

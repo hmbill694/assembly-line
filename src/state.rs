@@ -2,7 +2,8 @@
 /// stream.
 ///
 /// Nothing may live here that cannot be reconstructed from `events.jsonl`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum JobState {
     #[default]
     Pending,

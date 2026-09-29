@@ -1,5 +1,5 @@
 use assembly_line::cli::{Cli, Command, RunnerArgs, RunnerKind};
-use assembly_line::daemon::api::Queued;
+use assembly_line::daemon::api::{CancelRequest, Cancelling, Queued};
 use assembly_line::daemon::client::{DaemonClient, Reply};
 use assembly_line::daemon::{self, Daemon};
 use assembly_line::frame::{FrameWriter, ReadableFrames};
@@ -89,6 +89,9 @@ fn main() -> ExitCode {
             },
             Ok(root),
         ) => in_async_runtime(print_job_log(&root, job_id, follow, repo)),
+        (Command::Cancel { job_id, repo }, Ok(root)) => {
+            in_async_runtime(cancel_with_daemon(&root, job_id, repo))
+        }
     }
 }
 
@@ -286,6 +289,33 @@ async fn submit_to_daemon(root: &Path, request: SubmitRequest) -> Result<ExitCod
                 .for_each(|reason| eprintln!("error: {reason}"));
             Err(refused.summary)
         }
+    }
+}
+
+async fn cancel_with_daemon(
+    root: &Path,
+    job_id: u64,
+    repo: Option<String>,
+) -> Result<ExitCode, String> {
+    let remote_url = locate::remote_url_named_or_enclosing(repo)
+        .await
+        .map_err(|e| e.to_string())?;
+    match DaemonClient::for_root(root)
+        .post_json::<_, Cancelling>(
+            "/cancel",
+            &CancelRequest {
+                remote_url,
+                job: job_id,
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        Reply::Accepted(cancelling) => {
+            println!("{cancelling}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Reply::Refused(refused) => Err(refused.summary),
     }
 }
 

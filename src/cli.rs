@@ -120,6 +120,16 @@ pub enum Command {
         #[arg(long)]
         repo: Option<String>,
     },
+
+    /// Stop a queued or running job. A running round keeps what its agent
+    /// did so far, on the job's branch.
+    Cancel {
+        job_id: u64,
+        /// The repository the job belongs to: a checkout, or a remote URL.
+        /// Defaults to the enclosing checkout.
+        #[arg(long)]
+        repo: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]

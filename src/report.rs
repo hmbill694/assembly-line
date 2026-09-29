@@ -92,6 +92,7 @@ impl JobProgress {
                 // What waits is the round just asked for, so the previous
                 // round's reason, diff and timing no longer describe it.
                 state: JobState::Queued,
+                round_started_at: None,
                 last_round_duration: None,
                 committed_diff: None,
                 detail: None,
