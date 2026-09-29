@@ -110,7 +110,7 @@ fn install_tracing() {
 /// frames — the code only matters when the frames never said.
 async fn run_whole_job(request: RunRequest, as_frames: bool) -> Result<ExitCode, String> {
     let cancel = CancellationToken::new();
-    cancel_on_termination_signal(cancel.clone());
+    cancel_on_termination_signal(cancel.clone()).map_err(|e| format!("handling SIGTERM: {e}"))?;
     let ready = run::prepare_run(request, &std::env::temp_dir(), &cancel)
         .await
         .map_err(|refused| report_run_refusal(&refused))?;
@@ -151,23 +151,18 @@ fn report_run_refusal(refused: &RunRefused) -> String {
 /// whole foreground process group, and SIGHUP is the terminal closing — which
 /// the agent, leading a session of its own, never hears. Any of them cancels
 /// the round, which then still reports itself.
-fn cancel_on_termination_signal(cancel: CancellationToken) {
-    use tokio::signal::unix::{SignalKind, signal};
-
+fn cancel_on_termination_signal(cancel: CancellationToken) -> std::io::Result<()> {
+    use tokio::signal::unix::SignalKind;
+    let requested = any_signal_of([
+        SignalKind::terminate(),
+        SignalKind::interrupt(),
+        SignalKind::hangup(),
+    ])?;
     tokio::spawn(async move {
-        let (Ok(mut terminate), Ok(mut hangup)) = (
-            signal(SignalKind::terminate()),
-            signal(SignalKind::hangup()),
-        ) else {
-            return;
-        };
-        tokio::select! {
-            _ = terminate.recv() => {}
-            _ = hangup.recv() => {}
-            _ = tokio::signal::ctrl_c() => {}
-        }
+        requested.await;
         cancel.cancel();
     });
+    Ok(())
 }
 
 /// The runner `RunnerArgs` chose, built.
@@ -240,19 +235,29 @@ async fn serve_daemon<R: Runner + Send + Sync + 'static>(
         .map_err(|e| e.to_string())
 }
 
-/// Resolves on SIGTERM or Ctrl-C. Both handlers are installed before this
-/// returns: a signal landing before them would kill the daemon outright,
-/// leaving its socket behind.
+/// Resolves on SIGTERM or Ctrl-C.
 fn termination_requested() -> std::io::Result<impl Future<Output = ()> + Send + 'static> {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut terminate = signal(SignalKind::terminate())?;
-    let mut interrupt = signal(SignalKind::interrupt())?;
-    Ok(async move {
-        tokio::select! {
-            _ = terminate.recv() => {}
-            _ = interrupt.recv() => {}
+    use tokio::signal::unix::SignalKind;
+    any_signal_of([SignalKind::terminate(), SignalKind::interrupt()])
+}
+
+/// Resolves when any of `kinds` arrives. Every handler is installed before
+/// this returns, not when the future is first polled: until then each of
+/// these signals still has its default action, which kills the process
+/// before it can clean up or report.
+fn any_signal_of(
+    kinds: impl IntoIterator<Item = tokio::signal::unix::SignalKind>,
+) -> std::io::Result<impl Future<Output = ()> + Send + 'static> {
+    let mut signals = kinds
+        .into_iter()
+        .map(tokio::signal::unix::signal)
+        .collect::<std::io::Result<Vec<_>>>()?;
+    Ok(std::future::poll_fn(move |cx| {
+        match signals.iter_mut().any(|s| s.poll_recv(cx).is_ready()) {
+            true => std::task::Poll::Ready(()),
+            false => std::task::Poll::Pending,
         }
-    })
+    }))
 }
 
 /// `submit`: resolve, post to the daemon, report what it said.
