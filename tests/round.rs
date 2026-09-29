@@ -568,7 +568,12 @@ async fn a_revise_round_continues_the_branch_instead_of_starting_over() {
 async fn cancelling_a_round_stops_a_clone_in_progress() {
     let h = Harness::new().await;
     let fakes = h.scratch_root().with_file_name("fakes");
-    support::fake_cli(&fakes, "git-remote-hang", "sleep 60\n");
+    let cloning = fakes.join("cloning");
+    support::fake_cli(
+        &fakes,
+        "git-remote-hang",
+        &format!("touch {}\nsleep 60\n", cloning.display()),
+    );
     let spec = LaunchSpec::for_round::<LocalRunner>(
         JobId::from(1),
         1,
@@ -579,8 +584,7 @@ async fn cancelling_a_round_stops_a_clone_in_progress() {
         None,
     );
 
-    let started = std::time::Instant::now();
-    let run = std::process::Command::new(assert_cmd::cargo::cargo_bin("assembly"))
+    let mut run = std::process::Command::new(assert_cmd::cargo::cargo_bin("assembly"))
         .args(&spec.args)
         .env(
             "PATH",
@@ -591,7 +595,25 @@ async fn cancelling_a_round_stops_a_clone_in_progress() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    let spawned = std::time::Instant::now();
+    while !cloning.exists() {
+        match (
+            run.try_wait().unwrap(),
+            spawned.elapsed() > std::time::Duration::from_secs(15),
+        ) {
+            (Some(_), _) => panic!(
+                "`run` ended before it began cloning: {}",
+                String::from_utf8_lossy(&run.wait_with_output().unwrap().stderr)
+            ),
+            (None, true) => {
+                let _ = run.kill();
+                panic!("the clone never reached the remote helper");
+            }
+            (None, false) => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
+
+    let cancelled = std::time::Instant::now();
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(i32::try_from(run.id()).unwrap()),
         nix::sys::signal::Signal::SIGTERM,
@@ -600,9 +622,9 @@ async fn cancelling_a_round_stops_a_clone_in_progress() {
     let output = run.wait_with_output().unwrap();
 
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(20),
+        cancelled.elapsed() < std::time::Duration::from_secs(20),
         "the clone ran on past its cancel: {:?}",
-        started.elapsed()
+        cancelled.elapsed()
     );
     // The clone is `run`'s preparation, so a cancel there is a refusal,
     // reported on stderr, rather than a round.
