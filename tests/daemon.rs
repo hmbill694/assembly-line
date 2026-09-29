@@ -1,6 +1,7 @@
 //! `assembly daemon`: one per root, checked before it listens, reachable on
 //! its socket.
 
+use assembly_line::daemon::api::Queued;
 use assembly_line::daemon::client::{ClientError, DaemonClient};
 use assert_cmd::Command;
 use nix::sys::signal::Signal;
@@ -78,6 +79,21 @@ async fn with_no_daemon_the_client_says_how_to_start_one() {
 
     assert!(matches!(err, ClientError::NoDaemon { .. }), "{err}");
     assert!(err.to_string().contains("assembly daemon"), "{err}");
+}
+
+/// A client and daemon from different versions can disagree about a
+/// submission's shape; the daemon's own words for that must reach the user.
+#[tokio::test]
+async fn a_submission_the_daemon_cannot_read_is_reported_in_its_words() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _daemon = RunningDaemon::start(tmp.path(), &[], &[]);
+
+    let err = DaemonClient::for_root(tmp.path())
+        .post_json::<_, Queued>("/jobs", &serde_json::json!({ "remote_url": "x" }))
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("missing field"), "{err}");
 }
 
 #[test]

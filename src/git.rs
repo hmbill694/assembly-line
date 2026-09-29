@@ -167,6 +167,59 @@ pub async fn file_at_ref(
     }
 }
 
+/// A bare repository at `path`, made if nothing is there yet — the daemon's
+/// cache for one remote, which never has a working tree.
+pub async fn init_bare_if_absent(path: &Path) -> anyhow::Result<()> {
+    if path.join("HEAD").exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(path)?;
+    run_expecting_success(path, &["init", "--bare", "--quiet"], "init --bare")
+        .await
+        .map(|_| ())
+}
+
+/// The commit `git_ref` names on `remote`, asked without fetching anything
+/// into `repo` — or `None` when the remote has no such ref.
+///
+/// `ls-remote` matches a pattern against the tail of every ref, so
+/// `x/main` would answer for `main`. The ref is resolved the way a fetch of
+/// it is instead — as a full name, then under `refs/`, then as a tag, then
+/// a branch — and an annotated tag is peeled to its commit.
+pub async fn sha_on_remote(
+    repo: impl AsRef<Path>,
+    remote: &str,
+    git_ref: &str,
+) -> anyhow::Result<Option<String>> {
+    let peeled_pattern = format!("{git_ref}^{{}}");
+    let listed = run_expecting_success(
+        repo,
+        &["ls-remote", remote, git_ref, &peeled_pattern],
+        "ls-remote",
+    )
+    .await?;
+    // "<sha>\t<ref>" per line; an annotated tag's commit on a line of its
+    // own, named "<tag>^{}".
+    let refs: Vec<(&str, &str)> = listed
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .collect();
+    let sha_named = |name: &str| {
+        refs.iter()
+            .find(|(_, listed)| *listed == name)
+            .map(|(sha, _)| (*sha).to_string())
+    };
+    let candidates = [
+        git_ref.to_string(),
+        format!("refs/{git_ref}"),
+        format!("refs/tags/{git_ref}"),
+        format!("refs/heads/{git_ref}"),
+    ];
+    Ok(candidates.iter().find_map(|candidate| {
+        sha_named(&format!("{candidate}^{{}}")).or_else(|| sha_named(candidate))
+    }))
+}
+
 /// A ref name and the commit it named when the job was planned.
 ///
 /// The name is kept because a clone fetches by name; the sha is what the job

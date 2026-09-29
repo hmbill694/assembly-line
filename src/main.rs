@@ -1,14 +1,16 @@
 use assembly_line::cli::{Cli, Command, RunnerArgs, RunnerKind};
+use assembly_line::daemon::api::Queued;
+use assembly_line::daemon::client::{DaemonClient, Reply};
 use assembly_line::daemon::{self, Daemon};
 use assembly_line::frame::{FrameWriter, ReadableFrames};
-use assembly_line::lifecycle::{self, Note, Prepared, Refusal, Work};
-use assembly_line::paths;
 use assembly_line::round::Verdict;
 use assembly_line::run::{self, RunRefused, RunRequest};
 use assembly_line::runner::docker::DockerRunner;
 use assembly_line::runner::kubernetes::KubernetesRunner;
 use assembly_line::runner::local::LocalRunner;
 use assembly_line::runner::{self, Runner};
+use assembly_line::submission::{self, SubmitRequest};
+use assembly_line::{locate, paths};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -60,13 +62,18 @@ fn main() -> ExitCode {
                 base_ref,
                 provider,
                 job,
-                runner,
             },
             Ok(root),
-        ) => in_async_runtime(run_work_on_chosen_runner(
-            &runner,
+        ) => in_async_runtime(submit_to_daemon(
             &root,
-            Work::from_submission(prompt, prompt_file, repo, base_ref, provider, job),
+            SubmitRequest {
+                prompt,
+                prompt_file,
+                repo,
+                base_ref,
+                provider,
+                job,
+            },
         )),
         (Command::Daemon { runner, max_jobs }, Ok(root)) => {
             in_async_runtime(serve_daemon_on_chosen_runner(&runner, root, max_jobs))
@@ -192,18 +199,6 @@ fn chosen_runner(args: &RunnerArgs) -> Result<ChosenRunner, String> {
     }
 }
 
-async fn run_work_on_chosen_runner(
-    args: &RunnerArgs,
-    root: &Path,
-    work: Work,
-) -> Result<ExitCode, String> {
-    match chosen_runner(args)? {
-        ChosenRunner::Local(runner) => run_work(&runner, &args.pass_env, root, work).await,
-        ChosenRunner::Docker(runner) => run_work(&runner, &args.pass_env, root, work).await,
-        ChosenRunner::K8s(runner) => run_work(&runner, &args.pass_env, root, work).await,
-    }
-}
-
 async fn serve_daemon_on_chosen_runner(
     args: &RunnerArgs,
     root: PathBuf,
@@ -260,43 +255,33 @@ fn termination_requested() -> std::io::Result<impl Future<Output = ()> + Send + 
     })
 }
 
-async fn run_work<R: Runner>(
-    runner: &R,
-    pass_env: &[String],
-    root: &Path,
-    work: Work,
-) -> Result<ExitCode, String> {
-    let Prepared { notes, round } = match work {
-        Work::Start(request) => lifecycle::prepare_start(runner, pass_env, root, request).await,
-        Work::Revise(request) => lifecycle::prepare_revision(runner, pass_env, root, request).await,
-    };
-    notes.iter().for_each(|note| match note {
-        Note::LocalRefDiffers { .. } => println!("{note}"),
-        Note::ConfigWarning(_) => eprintln!("{note}"),
-    });
-
-    let ready = round.map_err(|refusal| report_refusal(&refusal))?;
-    if let Some(announcement) = ready.to_announcement_line() {
-        println!("{announcement}");
-    }
-
-    let conclusion = lifecycle::run(ready, cancel_on_ctrl_c())
+/// `submit`: resolve, post to the daemon, report what it said.
+async fn submit_to_daemon(root: &Path, request: SubmitRequest) -> Result<ExitCode, String> {
+    let prepared = submission::prepare_submission(request)
         .await
         .map_err(|e| e.to_string())?;
-    conclusion
-        .to_lines()
-        .iter()
-        .for_each(|line| println!("{line}"));
-    Ok(exit_code_for(conclusion.verdict))
-}
-
-/// Every reason on its own line; the refusal itself becomes the usage error.
-fn report_refusal(refusal: &Refusal) -> String {
-    refusal
-        .itemized_reasons()
-        .iter()
-        .for_each(|reason| eprintln!("error: {reason}"));
-    refusal.to_string()
+    prepared.notes.iter().for_each(|note| println!("{note}"));
+    match DaemonClient::for_root(root)
+        .post_json::<_, Queued>("/jobs", &prepared.submission)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        Reply::Accepted(queued) => {
+            queued
+                .warnings
+                .iter()
+                .for_each(|warning| eprintln!("warn: {warning}"));
+            println!("{queued}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Reply::Refused(refused) => {
+            refused
+                .reasons
+                .iter()
+                .for_each(|reason| eprintln!("error: {reason}"));
+            Err(refused.summary)
+        }
+    }
 }
 
 /// Where every async command's usage error is reported, so none of them has to
@@ -316,19 +301,6 @@ fn fail_with_usage_error(message: impl std::fmt::Display) -> ExitCode {
     ExitCode::from(EXIT_USAGE)
 }
 
-/// A token that Ctrl-C cancels, for the round about to run.
-fn cancel_on_ctrl_c() -> CancellationToken {
-    let cancel = CancellationToken::new();
-    let on_interrupt = cancel.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            eprintln!("\ninterrupted — cancelling the running agent");
-            on_interrupt.cancel();
-        }
-    });
-    cancel
-}
-
 fn exit_code_for(verdict: Verdict) -> ExitCode {
     match verdict {
         Verdict::Failed => ExitCode::from(EXIT_ROUND_FAILED),
@@ -339,9 +311,9 @@ fn exit_code_for(verdict: Verdict) -> ExitCode {
 async fn print_job_status(
     root: &Path,
     job_id: Option<u64>,
-    repo: Option<PathBuf>,
+    repo: Option<String>,
 ) -> Result<ExitCode, String> {
-    let report = lifecycle::report_for_job(root, job_id, repo)
+    let report = locate::report_for_job(root, job_id, repo)
         .await
         .map_err(|e| e.to_string())?;
     report
@@ -355,9 +327,9 @@ async fn print_job_log(
     root: &Path,
     job_id: u64,
     follow: bool,
-    repo: Option<PathBuf>,
+    repo: Option<String>,
 ) -> Result<ExitCode, String> {
-    let path = lifecycle::output_log_of(root, job_id, repo)
+    let path = locate::output_log_of(root, job_id, repo)
         .await
         .map_err(|e| e.to_string())?;
 

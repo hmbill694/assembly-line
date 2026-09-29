@@ -94,12 +94,12 @@ pub trait Runner {
     type Running: RunningRound + Send;
 
     /// Whether rounds run somewhere sharing nothing with the host. What that
-    /// implies is decided in [`secrets_or_reasons_it_cannot_run`] and
-    /// [`LaunchSpec::for_round`], so no caller branches on it.
+    /// implies is decided in [`crate::daemon::Daemon::prepare`],
+    /// [`crate::daemon::submit::accept`] and [`LaunchSpec::for_round`].
     const RUNS_IN_A_CONTAINER: bool;
 
     /// Every reason this runner cannot launch a round right now, checked
-    /// before a job directory is allocated.
+    /// once, before the daemon listens.
     fn reasons_it_cannot_run(&self) -> impl Future<Output = Vec<RunnerProblem>> + Send;
 
     /// Start the round. A runner whose launch waits — on a pod being
@@ -284,43 +284,4 @@ pub fn reasons_a_container_cannot_run(remote_url: &str) -> Vec<RunnerProblem> {
         })
         .into_iter()
         .collect()
-}
-
-/// The secrets a round on `runner` carries, once nothing stands in the way.
-/// A runner sharing the host's environment carries none; a container carries
-/// the git and forge tokens and every `pass_env` name, read with
-/// `host_environment`, and cannot take a repository that needs the host.
-///
-/// # Errors
-///
-/// Every reason the round cannot run there: the runner's own first, then
-/// the container's, then each `pass_env` name it cannot carry.
-pub async fn secrets_or_reasons_it_cannot_run<R: Runner>(
-    runner: &R,
-    remote_url: &str,
-    pass_env: &[String],
-    host_environment: impl Fn(&str) -> Option<String>,
-) -> Result<JobSecrets, Vec<RunnerProblem>> {
-    let (secrets, container_problems) = match R::RUNS_IN_A_CONTAINER {
-        true => {
-            let (secrets, unsendable) = JobSecrets::from_lookup(pass_env, host_environment);
-            let problems: Vec<RunnerProblem> = reasons_a_container_cannot_run(remote_url)
-                .into_iter()
-                .chain(unsendable)
-                .collect();
-            (secrets, problems)
-        }
-        false => (JobSecrets::default(), Vec::new()),
-    };
-    let problems: Vec<RunnerProblem> = runner
-        .reasons_it_cannot_run()
-        .await
-        .into_iter()
-        .chain(container_problems)
-        .collect();
-
-    match problems.is_empty() {
-        true => Ok(secrets),
-        false => Err(problems),
-    }
 }

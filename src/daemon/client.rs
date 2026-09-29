@@ -68,17 +68,23 @@ impl DaemonClient {
     ) -> Result<Reply<U>, ClientError> {
         let json = serde_json::to_vec(body).map_err(|e| ClientError::Failed(e.into()))?;
         let (status, reply) = self.send(Method::POST, path, Bytes::from(json)).await?;
-        let parsed = match status {
-            StatusCode::UNPROCESSABLE_ENTITY => serde_json::from_slice(&reply).map(Reply::Refused),
-            status if status.is_success() => serde_json::from_slice(&reply).map(Reply::Accepted),
-            status => {
-                return Err(ClientError::Failed(anyhow::anyhow!(
-                    "{status}: {}",
-                    String::from_utf8_lossy(&reply)
-                )));
-            }
+        let answered_otherwise = || {
+            ClientError::Failed(anyhow::anyhow!(
+                "{status}: {}",
+                String::from_utf8_lossy(&reply)
+            ))
         };
-        parsed.map_err(|e| ClientError::Failed(e.into()))
+        match status {
+            // A body the daemon could not read is a 422 too, with a plain
+            // reason instead of a `Refused` — say it as the daemon did.
+            StatusCode::UNPROCESSABLE_ENTITY => serde_json::from_slice(&reply)
+                .map(Reply::Refused)
+                .map_err(|_| answered_otherwise()),
+            status if status.is_success() => serde_json::from_slice(&reply)
+                .map(Reply::Accepted)
+                .map_err(|e| ClientError::Failed(e.into())),
+            _ => Err(answered_otherwise()),
+        }
     }
 
     async fn send(

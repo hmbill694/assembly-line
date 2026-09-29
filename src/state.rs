@@ -6,6 +6,8 @@
 pub enum JobState {
     #[default]
     Pending,
+    /// Asked for, and waiting for a slot to run in.
+    Queued,
     Running,
     Passed,
     Failed,
@@ -16,6 +18,7 @@ impl JobState {
     pub fn label(self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::Queued => "queued",
             Self::Running => "running",
             Self::Passed => "passed",
             Self::Failed => "failed",

@@ -1,3 +1,4 @@
+use assembly_line::daemon::Daemon;
 use assembly_line::git::PinnedRef;
 use assembly_line::job::JobId;
 use assembly_line::payload::{
@@ -7,12 +8,13 @@ use assembly_line::runner::docker::docker_run_args;
 use assembly_line::runner::local::LocalRound;
 use assembly_line::runner::{
     JobSecrets, LaunchSpec, Runner, RunnerProblem, reasons_a_container_cannot_run,
-    secrets_or_reasons_it_cannot_run,
 };
+use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
 /// A runner that reports `problems` and never launches, running rounds in a
 /// container or not as `IN_A_CONTAINER` says.
+#[derive(Debug)]
 struct RunnerReporting<const IN_A_CONTAINER: bool> {
     problems: Vec<RunnerProblem>,
 }
@@ -206,31 +208,42 @@ fn a_remote_that_is_a_path_on_this_machine_cannot_run_in_a_container() {
     }
 }
 
-/// The host's own checkout, remote and credentials are all there for a
-/// round that runs beside them.
+async fn daemon_on<R: Runner>(
+    runner: R,
+    pass_env: &[&str],
+    host: impl Fn(&str) -> Option<String>,
+) -> Result<Daemon<R>, Vec<RunnerProblem>> {
+    let pass_env: Vec<String> = pass_env.iter().map(ToString::to_string).collect();
+    Daemon::prepare(PathBuf::from("/unused"), runner, 1, &pass_env, host).await
+}
+
+/// The host's own credentials are all there for a round that runs beside
+/// them.
 #[tokio::test]
-async fn a_host_runner_carries_no_secrets_and_takes_what_a_container_cannot() {
-    let secrets = secrets_or_reasons_it_cannot_run(
-        &HostRunner {
+async fn a_host_runner_carries_no_secrets() {
+    let daemon = daemon_on(
+        HostRunner {
             problems: Vec::new(),
         },
-        "/tmp/origin.git",
-        &["ANTHROPIC_API_KEY".into()],
+        &["ANTHROPIC_API_KEY"],
         |_| None,
     )
     .await
     .unwrap();
 
-    assert!(secrets.names().is_empty(), "{secrets:?}");
+    assert!(
+        daemon.secrets().names().is_empty(),
+        "{:?}",
+        daemon.secrets()
+    );
 }
 
 #[tokio::test]
 async fn a_host_runner_is_refused_for_its_own_problems() {
-    let problems = secrets_or_reasons_it_cannot_run(
-        &HostRunner {
+    let problems = daemon_on(
+        HostRunner {
             problems: vec![unreachable_runner()],
         },
-        NETWORK_REMOTE,
         &[],
         |_| None,
     )
@@ -242,11 +255,10 @@ async fn a_host_runner_is_refused_for_its_own_problems() {
 
 #[tokio::test]
 async fn a_container_runner_carries_both_tokens_from_the_host() {
-    let secrets = secrets_or_reasons_it_cannot_run(
-        &ContainerRunner {
+    let daemon = daemon_on(
+        ContainerRunner {
             problems: Vec::new(),
         },
-        NETWORK_REMOTE,
         &[],
         host_with_both_tokens,
     )
@@ -254,19 +266,18 @@ async fn a_container_runner_carries_both_tokens_from_the_host() {
     .unwrap();
 
     assert_eq!(
-        secrets.names().into_iter().collect::<Vec<_>>(),
+        daemon.secrets().names().into_iter().collect::<Vec<_>>(),
         [GIT_TOKEN_VAR, FORGE_TOKEN_VAR]
     );
 }
 
 #[tokio::test]
 async fn every_reason_a_container_runner_cannot_run_is_reported_at_once() {
-    let problems = secrets_or_reasons_it_cannot_run(
-        &ContainerRunner {
+    let problems = daemon_on(
+        ContainerRunner {
             problems: vec![unreachable_runner()],
         },
-        "/tmp/origin.git",
-        &["ANTHROPIC_API_KEY".into()],
+        &["ANTHROPIC_API_KEY"],
         host_with_both_tokens,
     )
     .await
@@ -276,9 +287,6 @@ async fn every_reason_a_container_runner_cannot_run_is_reported_at_once() {
         problems,
         [
             unreachable_runner(),
-            RunnerProblem::RemoteIsLocalPath {
-                url: "/tmp/origin.git".into()
-            },
             RunnerProblem::MissingEnvironment("ANTHROPIC_API_KEY".into()),
         ]
     );

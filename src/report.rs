@@ -54,6 +54,8 @@ pub struct JobReport {
     pub base: Option<PinnedRef>,
     /// What the job was first asked to do.
     pub first_prompt: Option<String>,
+    /// What the job's latest round was asked to do.
+    pub latest_prompt: Option<String>,
     /// The provider its latest round was asked to use.
     pub provider: Option<String>,
     /// The URL of the branch's pull request, once one is open.
@@ -73,6 +75,7 @@ struct JobProgress {
     remote_url: Option<String>,
     base: Option<PinnedRef>,
     first_prompt: Option<String>,
+    latest_prompt: Option<String>,
     provider: Option<String>,
     pull_request: Option<String>,
 }
@@ -86,8 +89,15 @@ impl JobProgress {
                 prompt,
                 provider,
             } => JobProgress {
+                // What waits is the round just asked for, so the previous
+                // round's reason, diff and timing no longer describe it.
+                state: JobState::Queued,
+                last_round_duration: None,
+                committed_diff: None,
+                detail: None,
                 remote_url: self.remote_url.or_else(|| Some(remote_url.clone())),
                 first_prompt: self.first_prompt.or_else(|| Some(prompt.clone())),
+                latest_prompt: Some(prompt.clone()),
                 base: Some(base.clone()),
                 provider: Some(provider.clone()),
                 ..self
@@ -167,6 +177,7 @@ impl JobReport {
             remote_url: progress.remote_url,
             base: progress.base,
             first_prompt: progress.first_prompt,
+            latest_prompt: progress.latest_prompt,
             provider: progress.provider,
             pull_request: progress.pull_request,
         }

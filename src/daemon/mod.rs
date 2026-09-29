@@ -4,7 +4,9 @@
 
 pub mod api;
 pub mod client;
+pub mod dispatch;
 pub mod root;
+pub mod submit;
 
 use crate::runner::{JobSecrets, Runner, RunnerProblem};
 use anyhow::Context;
@@ -65,8 +67,16 @@ impl<R: Runner> Daemon<R> {
     }
 }
 
-/// Serve `daemon` on its root's socket until `shutdown` resolves, then
-/// remove the socket.
+/// What every route and every round shares while the daemon runs.
+#[derive(Debug)]
+pub struct Serving<R> {
+    pub daemon: Daemon<R>,
+    pub repos: dispatch::RepoLocks,
+    pub queue: dispatch::JobQueue,
+}
+
+/// Serve `daemon` on its root's socket, launching the jobs submitted to it,
+/// until `shutdown` resolves; then stop its rounds and remove the socket.
 ///
 /// # Errors
 ///
@@ -79,7 +89,22 @@ pub async fn serve<R: Runner + Send + Sync + 'static>(
     let socket = socket_path(&daemon.root);
     let listener = tokio::net::UnixListener::bind(&socket)
         .with_context(|| format!("listening on {}", socket.display()))?;
-    let served = serve_until_shutdown(listener, api::router(Arc::new(daemon)), shutdown).await;
+    let (queue, pending) = dispatch::JobQueue::new();
+    let serving = Arc::new(Serving {
+        daemon,
+        repos: dispatch::RepoLocks::default(),
+        queue,
+    });
+    let dispatcher = tokio::spawn(dispatch::dispatch_until_stopped(
+        Arc::clone(&serving),
+        pending,
+    ));
+
+    let served = serve_until_shutdown(listener, api::router(Arc::clone(&serving)), shutdown).await;
+    // P7: until reattach, a round the daemon cannot come back to is
+    // cancelled and given its verdict before the daemon goes.
+    serving.queue.stop_rounds_and_wait().await;
+    let _ = dispatcher.await;
     let _ = std::fs::remove_file(&socket);
     drop(lock);
     served.map_err(Into::into)

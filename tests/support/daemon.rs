@@ -1,6 +1,9 @@
 //! A real `assembly daemon`, started on a root the test owns and stopped
 //! when the test is done with it.
 
+use assembly_line::event::EventLog;
+use assembly_line::report::JobReport;
+use assembly_line::state::JobState;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -103,6 +106,46 @@ fn stop_within_five_seconds(child: &mut Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Fold `job_dir`'s log until its latest round has a verdict.
+///
+/// # Panics
+///
+/// If there is none within thirty seconds.
+pub fn wait_for_verdict(job_dir: &Path) -> JobReport {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let events = EventLog::read(job_dir.join("events.jsonl")).unwrap_or_default();
+        let report = JobReport::from_events(0, &events);
+        if matches!(report.state, JobState::Passed | JobState::Failed) {
+            return report;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no verdict in {}: {events:?}",
+            job_dir.display()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Wait until `job_dir`'s output log carries `text` — an agent's first
+/// line, say, which proves its round got that far.
+///
+/// # Panics
+///
+/// If it does not within thirty seconds.
+pub fn wait_until_logged(job_dir: &Path, text: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !std::fs::read_to_string(job_dir.join("job.log")).is_ok_and(|log| log.contains(text)) {
+        assert!(
+            Instant::now() < deadline,
+            "{} never logged {text:?}",
+            job_dir.display()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn signal(child: &Child, signal: nix::sys::signal::Signal) {

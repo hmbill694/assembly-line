@@ -30,6 +30,18 @@ fn state_after(kinds: Vec<EventKind>) -> JobState {
     JobReport::from_events(1, &events).state
 }
 
+fn requested(prompt: &str, sha: &str) -> EventKind {
+    EventKind::RoundRequested {
+        remote_url: "git@github.com:o/r.git".into(),
+        base: PinnedRef {
+            name: "main".into(),
+            sha: sha.into(),
+        },
+        prompt: prompt.into(),
+        provider: "claude".into(),
+    }
+}
+
 fn pushed() -> EventKind {
     EventKind::BranchPushed {
         branch: "al/job-1".into(),
@@ -89,6 +101,40 @@ fn pushing_a_branch_does_not_decide_the_verdict() {
 }
 
 #[test]
+fn a_requested_round_is_queued_until_it_starts() {
+    assert_eq!(state_after(vec![requested("x", "a1")]), JobState::Queued);
+
+    let revised = vec![
+        requested("x", "a1"),
+        EventKind::RoundStarted { round: 1 },
+        EventKind::RoundPassed,
+        requested("more", "b2"),
+    ];
+    assert_eq!(state_after(revised), JobState::Queued);
+}
+
+#[test]
+fn a_queued_revise_does_not_wear_the_previous_rounds_failure() {
+    let events = timeline(vec![
+        (0, requested("x", "a1")),
+        (0, EventKind::RoundStarted { round: 1 }),
+        (1, committed(1, 2, 0)),
+        (
+            4,
+            EventKind::RoundFailed {
+                reason: "verify failed".into(),
+            },
+        ),
+        (5, requested("more", "b2")),
+    ]);
+
+    assert_eq!(
+        JobReport::from_events(1, &events).to_status_lines(),
+        ["job 1: queued (round 1)"]
+    );
+}
+
+#[test]
 fn a_revise_round_puts_a_finished_job_back_into_running() {
     let st = state_after(vec![
         EventKind::RoundStarted { round: 1 },
@@ -114,6 +160,7 @@ fn the_final_state_is_reconstructed_from_the_log_alone() {
 #[test]
 fn every_state_has_a_label() {
     assert_eq!(JobState::Pending.label(), "pending");
+    assert_eq!(JobState::Queued.label(), "queued");
     assert_eq!(JobState::Running.label(), "running");
     assert_eq!(JobState::Passed.label(), "passed");
     assert_eq!(JobState::Failed.label(), "failed");
@@ -412,15 +459,6 @@ fn timing_is_reported_only_once_a_round_has_ended() {
 
 #[test]
 fn a_jobs_identity_is_its_first_requested_round() {
-    let requested = |prompt: &str, sha: &str| EventKind::RoundRequested {
-        remote_url: "git@github.com:o/r.git".into(),
-        base: PinnedRef {
-            name: "main".into(),
-            sha: sha.into(),
-        },
-        prompt: prompt.into(),
-        provider: "claude".into(),
-    };
     let events = timeline(vec![
         (0, requested("add auth", "a1")),
         (1, requested("use sessions", "b2")),
@@ -430,6 +468,7 @@ fn a_jobs_identity_is_its_first_requested_round() {
 
     assert_eq!(report.remote_url.as_deref(), Some("git@github.com:o/r.git"));
     assert_eq!(report.first_prompt.as_deref(), Some("add auth"));
+    assert_eq!(report.latest_prompt.as_deref(), Some("use sessions"));
     assert_eq!(report.base.map(|base| base.sha).as_deref(), Some("b2"));
     assert_eq!(report.provider.as_deref(), Some("claude"));
 }
