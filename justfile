@@ -96,10 +96,11 @@ verify-stack:
 
     exit $failed
 
-# Run one job end to end against a throwaway repo, to see real output.
+# Submit one job to a daemon and watch it end to end, to see real output.
 #
-# The repo, its opt-in config, and the job state it produces are all thrown
-# away with it — this never touches the repo you're standing in.
+# The repo, its origin, the daemon's root and the job state are all under one
+# throwaway directory — this never touches the repo you're standing in or your
+# real state root. Delivery is off, so your `gh` is never asked for anything.
 demo:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -107,10 +108,13 @@ demo:
     bin="$CARGO_TARGET_DIR/debug/assembly"
     fake="$PWD/tests/fixtures/fake-agent.sh"
     dir=$(mktemp -d)
-    cd "$dir"
-    git init -q --initial-branch=main .
+    export ASSEMBLY_ROOT="$dir/root"
+    git init -q --bare "$dir/origin.git"
+    git init -q --initial-branch=main "$dir/repo"
+    cd "$dir/repo"
     git config user.email t@e.com && git config user.name T
     git config commit.gpgsign false
+    git remote add origin "$dir/origin.git"
     mkdir -p .assembly
     cat > .assembly/config.toml <<EOF
     provider = "fake"
@@ -119,12 +123,30 @@ demo:
     [providers.fake]
     cmd = "bash"
     args = ["$fake", "{prompt}", "demo"]
+
+    [delivery]
+    mode = "none"
     EOF
     git add -A && git commit -qm "opt in to the factory"
-    "$bin" submit --prompt "make a change" || true
-    echo
+    git push -q origin main
+    "$bin" daemon &
+    daemon=$!
+    trap 'kill "$daemon" 2>/dev/null || true' EXIT
+    until [ -S "$ASSEMBLY_ROOT/daemon.sock" ]; do
+      kill -0 "$daemon" || exit 1
+      sleep 0.1
+    done
+    "$bin" submit --prompt "make a change"
+    # Captured before grep: `grep -q` can close the pipe while `status` is
+    # still printing, and pipefail would read that as no verdict yet.
+    until status=$("$bin" status) && grep -qE '^job [0-9]+: (passed|failed)' <<<"$status"; do
+      kill -0 "$daemon" || exit 1
+      sleep 0.5
+    done
     "$bin" status
-    echo "demo job left in $dir"
+    echo
+    "$bin" logs 1
+    echo "demo job left in $dir (its branch is on $dir/origin.git)"
 
 # Build the job image locally, for the host's platform.
 image tag="assembly-line:dev":

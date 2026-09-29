@@ -1,6 +1,34 @@
 # Software Factory F3 Implementation Plan — the daemon
 
-**Status:** planned 2026-09-28.
+**Status:** planned 2026-09-28; implemented. The code and its commit
+messages are the record now — where they and this plan disagree, they win.
+Known places this plan is stale, so that nobody copies them back in:
+
+- There is no `TaskTracker`: the lockfile update it needed was denied, so
+  the dispatcher counts running rounds in a `watch` counter, each round
+  holding a `Tally` guard on it (`src/daemon/dispatch.rs`). The dispatcher
+  is `dispatch_until_stopped`.
+- Stopping the daemon stops no round; P7's cancel-and-wait went with
+  Task 12. It gives up launches in progress and leaves launched rounds to
+  the next daemon on the root.
+- `just demo` runs a daemon and `submit` under a throwaway root, not a bare
+  `run`, with delivery off.
+
+Known open:
+
+- Nested `RepoKey` paths can collide: `/x/a.git` and `/x/a/7.git`.
+- A revise's pull request takes its title and body from the feedback
+  alone when no pull request is open yet.
+- A refusal inside `run` shows in `status` only as "ended without reporting
+  a verdict: exit 2"; its reason is in `assembly logs`.
+- A revise cancelled before it starts shows "failed (round 1)", naming the
+  round before it.
+- A round with a verdict still delivering when the daemon stops loses its
+  `PullRequestOpened` event; the pull request is still opened.
+- `tests/kubernetes_runner.rs` cancels after a fixed 300ms and may be
+  timing-sensitive.
+- The stack's revisions below `rtuzrxvq` still carry the flaky
+  `cancelling_a_round_stops_a_clone_in_progress`; `rtuzrxvq` fixes it.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
