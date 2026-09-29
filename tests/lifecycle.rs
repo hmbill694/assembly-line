@@ -2,18 +2,52 @@ use assembly_line::config::Warning;
 use assembly_line::event::{EventKind, EventLog};
 use assembly_line::git;
 use assembly_line::lifecycle::{
-    Note, Prepared, Refusal, RevisionRequest, StartRequest, output_log_of, prepare_revision,
-    prepare_start, report_for_job,
+    self, Note, Prepared, Refusal, RevisionRequest, RoundConclusion, StartRequest, output_log_of,
+    prepare_revision, prepare_start, report_for_job,
 };
 use assembly_line::locate;
 use assembly_line::paths::{self, JobPaths, RepoKey};
 use assembly_line::runner::local::LocalRunner;
 use support::{Harness, commit_all, config_running};
+use tokio_util::sync::CancellationToken;
 
 mod support;
 
 fn the_binary() -> LocalRunner {
     LocalRunner::using(env!("CARGO_BIN_EXE_assembly"))
+}
+
+/// A new job's first round, run by the host lifecycle into `h`'s root.
+async fn job_through_lifecycle(h: &Harness, prompt: &str) -> RoundConclusion {
+    let request = StartRequest {
+        prompt: Some(prompt.into()),
+        ..start_in(h, None)
+    };
+    round_through_lifecycle(prepare_start(&the_binary(), &[], &h.root, request).await).await
+}
+
+/// Another round on job `job_id`, run by the host lifecycle.
+async fn revision_through_lifecycle(h: &Harness, job_id: u64, prompt: &str) -> RoundConclusion {
+    let request = RevisionRequest {
+        job_id,
+        prompt: Some(prompt.into()),
+        prompt_file: None,
+        repo: Some(h.repo.clone()),
+    };
+    round_through_lifecycle(prepare_revision(&the_binary(), &[], &h.root, request).await).await
+}
+
+async fn round_through_lifecycle(prepared: Prepared<'_, LocalRunner>) -> RoundConclusion {
+    let ready = match prepared.round {
+        Ok(ready) => ready,
+        Err(refusal) => panic!(
+            "the round was refused: {refusal} {:?}",
+            refusal.itemized_reasons()
+        ),
+    };
+    lifecycle::run(ready, CancellationToken::new())
+        .await
+        .unwrap()
 }
 
 fn start_in(h: &Harness, provider: Option<&str>) -> StartRequest {
@@ -211,9 +245,9 @@ async fn revising_a_job_that_does_not_exist_cannot_be_prepared() {
 #[tokio::test]
 async fn a_revise_is_numbered_past_the_highest_round_recorded() {
     let h = Harness::new().await;
-    let first = h.run_job("x").await;
-    assert!(first.passed);
-    let job = locate::job_at(&h.root, Some(h.repo.clone()), Some(first.job_id.into()))
+    let first = job_through_lifecycle(&h, "x").await;
+    assert!(first.verdict.passed());
+    let job = locate::job_at(&h.root, Some(h.repo.clone()), Some(first.job.id.into()))
         .await
         .unwrap();
     let mut log = EventLog::open_append(job.events()).unwrap();
@@ -226,7 +260,7 @@ async fn a_revise_is_numbered_past_the_highest_round_recorded() {
         &[],
         &h.root,
         RevisionRequest {
-            job_id: first.job_id.into(),
+            job_id: first.job.id.into(),
             prompt: Some("more".into()),
             prompt_file: None,
             repo: Some(h.repo.clone()),
@@ -246,12 +280,16 @@ async fn a_revise_is_numbered_past_the_highest_round_recorded() {
 #[tokio::test]
 async fn every_round_asked_for_is_recorded_before_it_starts() {
     let h = Harness::new().await;
-    let first = h.run_job("add auth").await;
-    let second = h.revise_job(first.job_id, "use sessions").await;
+    let first = job_through_lifecycle(&h, "add auth").await;
+    revision_through_lifecycle(&h, first.job.id.into(), "use sessions").await;
+    let events: Vec<EventKind> = EventLog::read(first.job.events())
+        .unwrap()
+        .into_iter()
+        .map(|e| e.kind)
+        .collect();
 
     let base = git::pinned(&h.repo, "origin", "main").await.unwrap();
-    let requests: Vec<(usize, &str)> = second
-        .events
+    let requests: Vec<(usize, &str)> = events
         .iter()
         .enumerate()
         .filter_map(|(at, kind)| match kind {
@@ -267,14 +305,13 @@ async fn every_round_asked_for_is_recorded_before_it_starts() {
             _ => None,
         })
         .collect();
-    let starts: Vec<usize> = second
-        .events
+    let starts: Vec<usize> = events
         .iter()
         .enumerate()
         .filter_map(|(at, kind)| matches!(kind, EventKind::RoundStarted { .. }).then_some(at))
         .collect();
 
-    assert_eq!(requests.len(), 2, "{:?}", second.events);
+    assert_eq!(requests.len(), 2, "{events:?}");
     assert_eq!(requests[0].1, "add auth");
     assert_eq!(
         requests[1].1, "use sessions",
@@ -285,8 +322,7 @@ async fn every_round_asked_for_is_recorded_before_it_starts() {
             .iter()
             .zip(&starts)
             .all(|((requested_at, _), started_at)| requested_at < started_at),
-        "{:?}",
-        second.events
+        "{events:?}"
     );
 }
 
