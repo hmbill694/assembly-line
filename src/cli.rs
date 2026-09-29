@@ -55,7 +55,7 @@ pub enum Command {
         provision_toolchain: bool,
     },
 
-    /// Hand a job to a runner: a new job, or with --job, another round of
+    /// Hand a job to the daemon: a new job, or with --job, another round of
     /// an existing one
     Submit {
         /// What the agent is asked to do — for a revise, what to change
@@ -68,9 +68,9 @@ pub enum Command {
         /// Read the prompt from a file instead
         #[arg(long)]
         prompt_file: Option<PathBuf>,
-        /// The repository to work in. Defaults to the enclosing one.
+        /// A checkout, or a remote URL. Defaults to the enclosing checkout.
         #[arg(long)]
-        repo: Option<PathBuf>,
+        repo: Option<String>,
         /// What to branch from. Defaults to the checked-out branch.
         #[arg(long = "ref", conflicts_with = "job")]
         base_ref: Option<String>,
@@ -83,8 +83,6 @@ pub enum Command {
         /// files on disk, and this round appends to the job's branch.
         #[arg(long)]
         job: Option<u64>,
-        #[command(flatten)]
-        runner: RunnerArgs,
     },
 
     /// Run the daemon: one root, one runner, rounds launched and watched on
@@ -105,9 +103,10 @@ pub enum Command {
     Status {
         /// Defaults to the most recent job
         job_id: Option<u64>,
-        /// The repository whose jobs to look at. Defaults to the enclosing one.
+        /// The repository whose jobs to look at: a checkout, or a remote
+        /// URL. Defaults to the enclosing checkout.
         #[arg(long)]
-        repo: Option<PathBuf>,
+        repo: Option<String>,
     },
 
     /// Print a job's captured output
@@ -116,9 +115,10 @@ pub enum Command {
         /// Follow the log as it grows
         #[arg(short, long)]
         follow: bool,
-        /// The repository whose jobs to look at. Defaults to the enclosing one.
+        /// The repository whose jobs to look at: a checkout, or a remote
+        /// URL. Defaults to the enclosing checkout.
         #[arg(long)]
-        repo: Option<PathBuf>,
+        repo: Option<String>,
     },
 }
 
@@ -133,8 +133,7 @@ pub enum RunnerKind {
     K8s,
 }
 
-/// Where a round runs. A revise is a new round cut from the job's branch, so
-/// it may run somewhere the first round did not.
+/// Where the daemon runs every round it launches.
 #[derive(Debug, clap::Args)]
 pub struct RunnerArgs {
     #[arg(long, value_enum, default_value_t = RunnerKind::Local)]

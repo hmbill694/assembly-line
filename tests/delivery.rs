@@ -190,7 +190,7 @@ async fn a_failed_round_is_not_delivered() {
 
     assembly(&tmp)
         .env("PATH", path_with(&fake_bin))
-        .args(["submit", "--prompt", "write a file"])
+        .args(["run", "--prompt", "write a file"])
         .assert()
         .code(1)
         .stdout(contains("branch: al/job-1"))
@@ -204,8 +204,7 @@ async fn a_failed_round_is_not_delivered() {
     discard_outside_state(&tmp);
 }
 
-/// A passing revise round must deliver just as a passing new job does, and
-/// `submit` reports the pull request its `run` recorded.
+/// A passing revise round must deliver just as a passing new job does.
 #[tokio::test]
 async fn a_passing_revise_round_is_delivered() {
     let tmp = repo_running("revising-agent.sh", "true").await;
@@ -213,16 +212,15 @@ async fn a_passing_revise_round_is_delivered() {
 
     assembly(&tmp)
         .env("PATH", path_with(&fake_bin))
-        .args(["submit", "--prompt", "hi"])
+        .args(["run", "--prompt", "hi"])
         .assert()
         .success();
 
     assembly(&tmp)
         .env("PATH", path_with(&fake_bin))
-        .args(["submit", "--job", "1", "--prompt", "add error handling"])
+        .args(["run", "--job", "1", "--prompt", "add error handling"])
         .assert()
         .success()
-        .stdout(contains("round 2"))
         .stdout(contains("pull request: https://example.invalid/pr/1"));
 
     let creates = std::fs::read_to_string(&gh_capture)
@@ -251,8 +249,7 @@ async fn a_passing_revise_round_is_delivered() {
 /// variant printed.
 ///
 /// It also proves the divergence note fires: `base = "release"` here while
-/// the job is cut from the default checked-out branch, `main`. `run` prints
-/// it with the rest of the round's output, which is the job's log.
+/// the job is cut from the default checked-out branch, `main`.
 #[tokio::test]
 async fn configured_base_reaches_the_pull_request_and_the_divergence_is_reported() {
     let tmp = repo_running_with_base("fake-agent.sh", "true", "release").await;
@@ -260,14 +257,10 @@ async fn configured_base_reaches_the_pull_request_and_the_divergence_is_reported
 
     assembly(&tmp)
         .env("PATH", path_with(&fake_bin))
-        .args(["submit", "--prompt", "write a file"])
-        .assert()
-        .success();
-    assembly(&tmp)
-        .args(["logs", "1"])
+        .args(["run", "--prompt", "write a file"])
         .assert()
         .success()
-        .stdout(contains("will target 'release'"))
+        .stdout(contains("note: this pull request will target 'release'"))
         .stdout(contains("cut from 'main'"));
 
     let invocation = std::fs::read_to_string(&gh_capture)
@@ -294,7 +287,7 @@ async fn a_pull_request_is_titled_and_described_from_the_job_not_from_local_comm
 
     assembly(&tmp)
         .env("PATH", path_with(&fake_bin))
-        .args(["submit", "--prompt", "write a file"])
+        .args(["run", "--prompt", "write a file"])
         .assert()
         .success();
 

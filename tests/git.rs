@@ -466,6 +466,72 @@ async fn a_ref_the_remote_does_not_have_cannot_be_pinned() {
     assert!(err.to_string().contains("push it first"), "{err}");
 }
 
+/// The daemon's cache: pinning into a bare repository fetches the ref's
+/// commit there, and a second init leaves what was fetched alone.
+#[tokio::test]
+async fn a_bare_cache_is_made_once_and_can_pin_a_ref() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let origin = tmp.path().join("origin.git");
+    support::init_git_repo(&repo).await;
+    support::add_origin(&repo, &origin).await;
+    support::publish_main(&repo).await;
+    let cache = tmp.path().join("cache/r.git");
+
+    git::init_bare_if_absent(&cache).await.unwrap();
+    let pinned = git::pinned(&cache, origin.to_str().unwrap(), "main")
+        .await
+        .unwrap();
+    git::init_bare_if_absent(&cache).await.unwrap();
+
+    assert_eq!(pinned.sha, head_sha(&repo).await.unwrap());
+    assert!(git::has_commit(&cache, &pinned.sha).await.unwrap());
+}
+
+/// Asked without fetching, and by the ref's own name: a branch whose name
+/// merely ends in it is not it, and a tag is the commit it tags.
+#[tokio::test]
+async fn a_refs_commit_on_the_remote_is_read_without_fetching() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    support::init_git_repo(&repo).await;
+    support::add_origin(&repo, &tmp.path().join("origin.git")).await;
+    support::publish_main(&repo).await;
+    let published = head_sha(&repo).await.unwrap();
+    std::fs::write(repo.join("other.txt"), "other\n").unwrap();
+    commit_all(&repo, "elsewhere").await.unwrap().unwrap();
+    git::push_head_as(&repo, "origin", "feature/main")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        git::sha_on_remote(&repo, "origin", "main").await.unwrap(),
+        Some(published.clone())
+    );
+    let tagged =
+        git::run_allowing_failure(&repo, &["tag", "-a", "v1", "-m", "a release", &published])
+            .await
+            .unwrap();
+    assert!(tagged.succeeded(), "{}", tagged.stderr);
+    git::run_allowing_failure(&repo, &["push", "--quiet", "origin", "v1"])
+        .await
+        .unwrap();
+    for spelling in ["v1", "tags/v1", "refs/tags/v1"] {
+        assert_eq!(
+            git::sha_on_remote(&repo, "origin", spelling).await.unwrap(),
+            Some(published.clone()),
+            "an annotated tag spelled {spelling} is its commit, not the tag object"
+        );
+    }
+    assert_eq!(
+        git::sha_on_remote(&repo, "origin", "never-pushed")
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(!repo.join(".git/FETCH_HEAD").exists());
+}
+
 /// Pushing cannot fix a remote that does not answer, so a fetch that failed
 /// for any reason other than the ref being absent keeps git's own complaint.
 #[tokio::test]
