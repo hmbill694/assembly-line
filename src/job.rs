@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// A job's id, as [`crate::claim::claim_job`] claims it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct JobId(u64);
 

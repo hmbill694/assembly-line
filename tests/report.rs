@@ -135,6 +135,26 @@ fn a_queued_revise_does_not_wear_the_previous_rounds_failure() {
 }
 
 #[test]
+fn a_revise_cancelled_before_it_started_took_no_time() {
+    let events = timeline(vec![
+        (0, requested("x", "a1")),
+        (0, EventKind::RoundStarted { round: 1 }),
+        (4, EventKind::RoundPassed),
+        (60, requested("more", "b2")),
+        (
+            61,
+            EventKind::RoundFailed {
+                reason: "cancelled before it started".into(),
+            },
+        ),
+    ]);
+
+    let report = JobReport::from_events(1, &events);
+    assert_eq!(report.state, JobState::Failed);
+    assert_eq!(report.duration, None);
+}
+
+#[test]
 fn a_revise_round_puts_a_finished_job_back_into_running() {
     let st = state_after(vec![
         EventKind::RoundStarted { round: 1 },

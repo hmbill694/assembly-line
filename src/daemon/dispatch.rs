@@ -6,17 +6,21 @@ use crate::collect::{collect, record_launch_failure};
 use crate::config::{REPO_CONFIG_PATH, RepoConfig};
 use crate::event::{EventKind, EventLog};
 use crate::job::JobId;
-use crate::paths::{JobPaths, RepoKey};
+use crate::paths::{self, JobPaths, RepoKey};
 use crate::report::JobReport;
 use crate::runner::{LaunchSpec, Runner};
+use crate::state::JobState;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::sync::{OwnedMutexGuard, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
+/// Why a job cancelled before its round started has failed.
+pub const CANCELLED_BEFORE_IT_STARTED: &str = "cancelled before it started";
+
 /// Where one job's state lives, which is all the daemon needs to find it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct JobAddress {
     pub key: RepoKey,
     pub jobs_dir: PathBuf,
@@ -35,6 +39,14 @@ impl JobAddress {
     fn report(&self) -> anyhow::Result<JobReport> {
         let events = EventLog::read(self.paths().events())?;
         Ok(JobReport::from_events(self.id.into(), &events))
+    }
+
+    fn record_cancelled_before_it_started(&self) -> std::io::Result<()> {
+        EventLog::open_append(self.paths().events())?
+            .append(EventKind::RoundFailed {
+                reason: CANCELLED_BEFORE_IT_STARTED.to_string(),
+            })
+            .map(|_| ())
     }
 }
 
@@ -61,6 +73,35 @@ impl RepoLocks {
     }
 }
 
+/// Each launched round, until its task is over — which can be well after
+/// its verdict, while `run` delivers and cleans up.
+type CancelTable = Arc<Mutex<HashMap<JobAddress, LaunchedRound>>>;
+
+#[derive(Debug)]
+struct LaunchedRound {
+    round: u32,
+    cancel: CancellationToken,
+}
+
+impl LaunchedRound {
+    /// Whether this is the round `report` is waiting on — not yet started,
+    /// or running — rather than one past its verdict.
+    fn is_awaited_by(&self, report: &JobReport) -> bool {
+        match report.state {
+            JobState::Queued => report.rounds + 1 == self.round,
+            JobState::Running => report.rounds == self.round,
+            JobState::Pending | JobState::Passed | JobState::Failed => false,
+        }
+    }
+}
+
+fn lock_cancel_table(
+    cancels: &Mutex<HashMap<JobAddress, LaunchedRound>>,
+) -> MutexGuard<'_, HashMap<JobAddress, LaunchedRound>> {
+    // Nothing done under the lock leaves the table half-changed.
+    cancels.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Jobs waiting for a slot, how many rounds are running now, and a way to
 /// stop them.
 #[derive(Debug)]
@@ -68,6 +109,10 @@ pub struct JobQueue {
     pending: mpsc::UnboundedSender<JobAddress>,
     running: watch::Sender<usize>,
     stopping: CancellationToken,
+    /// Held while deciding whether a job is queued or launched and acting
+    /// on it — by [`JobQueue::cancel`] and by the dispatcher — so a job is
+    /// never both cancelled while queued and launched.
+    cancels: CancelTable,
 }
 
 impl JobQueue {
@@ -80,9 +125,77 @@ impl JobQueue {
                 pending,
                 running: watch::Sender::new(0),
                 stopping: CancellationToken::new(),
+                cancels: CancelTable::default(),
             },
             receiving,
         )
+    }
+
+    /// Stop `address`'s job: cancel the round it is waiting on, or close it
+    /// before it starts if it is still waiting for a slot. Returns which it
+    /// was: [`JobState::Running`] or [`JobState::Queued`].
+    ///
+    /// # Errors
+    ///
+    /// Why it cannot be cancelled: there is no such job, it is neither
+    /// queued nor running, or its log cannot be read or written.
+    pub fn cancel(&self, address: &JobAddress) -> Result<JobState, String> {
+        let cancels = lock_cancel_table(&self.cancels);
+        let id = address.id;
+        paths::open_job(&address.jobs_dir, id).map_err(|e| e.to_string())?;
+        let report = address
+            .report()
+            .map_err(|e| format!("reading job {id}'s log: {e:#}"))?;
+        match (cancels.get(address), report.state) {
+            (Some(launched), _) if launched.is_awaited_by(&report) => {
+                launched.cancel.cancel();
+                Ok(JobState::Running)
+            }
+            (_, JobState::Queued) => address
+                .record_cancelled_before_it_started()
+                .map(|()| JobState::Queued)
+                .map_err(|e| format!("recording job {id}'s cancel: {e}")),
+            (_, JobState::Pending | JobState::Running | JobState::Passed | JobState::Failed) => {
+                Err(format!(
+                    "job {id} is not queued or running, so there is nothing to cancel"
+                ))
+            }
+        }
+    }
+
+    /// Enter `address`'s next round in the cancel table, unless its job is
+    /// no longer queued — cancelled while it waited — or that round was
+    /// already launched from an earlier place in line: a job cancelled while
+    /// queued and then revised is in line twice.
+    fn register_if_still_queued(&self, address: &JobAddress) -> Option<Registration> {
+        let mut cancels = lock_cancel_table(&self.cancels);
+        let report = match address.report() {
+            Ok(report) => report,
+            Err(e) => {
+                tracing::error!("job {} in {}: {e:#}", address.id, address.key);
+                return None;
+            }
+        };
+        let already_launched = cancels
+            .get(address)
+            .is_some_and(|launched| launched.is_awaited_by(&report));
+        (report.state == JobState::Queued && !already_launched).then(|| {
+            let round = report.rounds + 1;
+            let cancel = self.stopping.child_token();
+            cancels.insert(
+                address.clone(),
+                LaunchedRound {
+                    round,
+                    cancel: cancel.clone(),
+                },
+            );
+            Registration {
+                cancels: Arc::clone(&self.cancels),
+                address: address.clone(),
+                round,
+                cancel,
+            }
+        })
     }
 
     /// Put a job in line behind every job already waiting.
@@ -98,6 +211,29 @@ impl JobQueue {
         self.stopping.cancel();
         // Cannot fail: `self` holds the sender.
         let _ = self.running.subscribe().wait_for(|n| *n == 0).await;
+    }
+}
+
+/// A launched round's entry in the cancel table, removed however its task
+/// ends — unless a later round of the job has taken its place, which a
+/// revise accepted after this round's verdict can do while `run` is still
+/// delivering it.
+struct Registration {
+    cancels: CancelTable,
+    address: JobAddress,
+    round: u32,
+    cancel: CancellationToken,
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        let mut cancels = lock_cancel_table(&self.cancels);
+        if cancels
+            .get(&self.address)
+            .is_some_and(|launched| launched.round == self.round)
+        {
+            cancels.remove(&self.address);
+        }
     }
 }
 
@@ -129,12 +265,16 @@ pub async fn dispatch_until_stopped<R: Runner + Send + Sync + 'static>(
         if !slot_free {
             return;
         }
+        let Some(registration) = queue.register_if_still_queued(&address) else {
+            continue;
+        };
         let slot = Slot::taken(&queue.running);
-        let cancel = queue.stopping.child_token();
         let serving = Arc::clone(&serving);
         tokio::spawn(async move {
             let _slot = slot;
-            if let Err(e) = run_queued_round(&serving, &address, cancel).await {
+            let (round, cancel) = (registration.round, registration.cancel.clone());
+            let _registration = registration;
+            if let Err(e) = run_queued_round(&serving, &address, round, cancel).await {
                 tracing::error!("job {} in {}: {e:#}", address.id, address.key);
             }
         });
@@ -158,16 +298,17 @@ impl Drop for Slot {
     }
 }
 
-/// The job's next round: numbered from its log, launched from its latest
-/// request, collected into its log.
+/// The job's next round, `round`: launched from its latest request,
+/// collected into its log.
 ///
-/// A round the daemon began stopping before it started is not started: the
-/// job stays queued. That includes a round still waiting for its
-/// repository's cache, which a submit's fetch can hold for as long as the
-/// remote takes to answer.
+/// A round cancelled before it started — still waiting for its repository's
+/// cache, which a submit's fetch can hold for as long as the remote takes to
+/// answer — is not started. The daemon stopping leaves its job queued; a
+/// `cancel` closes it.
 async fn run_queued_round<R: Runner>(
     serving: &Serving<R>,
     address: &JobAddress,
+    round: u32,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let report = address.report()?;
@@ -181,11 +322,15 @@ async fn run_queued_round<R: Runner>(
     };
     let config = tokio::select! {
         biased;
-        () = cancel.cancelled() => return Ok(()),
+        () = cancel.cancelled() => {
+            return match serving.queue.stopping.is_cancelled() {
+                true => Ok(()),
+                false => Ok(address.record_cancelled_before_it_started()?),
+            };
+        }
         config = config_in_cache(serving, &address.key, &base.sha) => config,
     };
     let paths = address.paths();
-    let round = report.rounds + 1;
     let mut log = EventLog::open_append(paths.events())?;
     log.append(EventKind::RoundStarted { round })?;
 
