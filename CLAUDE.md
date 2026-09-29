@@ -1,28 +1,30 @@
 # assembly-line
 
-A Rust CLI that runs one coding-agent job — a repo, a ref, and a prompt — as a
-branch, decides whether each round passed with `verify`, and opens a pull
-request when one did.
+A Rust CLI and daemon that run coding-agent jobs — a repo, a ref, and a
+prompt — as branches, decide whether each round passed with `verify`, and
+open a pull request when one did.
 
 - Design decisions: `docs/superpowers/specs/2026-09-11-software-factory-v2.md`
-- Current milestone: `docs/superpowers/plans/2026-09-21-software-factory-f2.md`
+- Current milestone: `docs/superpowers/plans/2026-09-28-software-factory-f3.md`
 
 ## Vocabulary
 
 Three words, used the same way in code, events, CLI text and docs:
 
-- **job** — the durable thing: an id, its branch `al/job-{id}`, `meta.json`,
-  one event log. It lives across revises.
-- **round** — one execution inside the boundary. `run` is round 1; each
-  `revise` adds one.
+- **job** — the durable thing: an id, its branch `al/job-{id}`, and one event
+  log under the daemon's root, whose first `RoundRequested` is its identity.
+  It lives across revises.
+- **round** — one execution inside the boundary: one `assembly run`.
+  `submit` asks for a job's first; each `submit --job` (or `run --job`) adds
+  one.
 - **verdict** — how a round ended: passed or failed. `verify` rejecting the
   work is one reason for failed, alongside a crash, a timeout or a lost push.
   What `verify` itself says is its *ruling*.
 
 A Kubernetes `Job` is Kubernetes' word, not ours; one runs one round. Code
 around it keeps the Kubernetes name and wraps it in ours (`KubernetesRound`).
-`job-exec` and `ASSEMBLY_JOB` also kept their names: the image's entry point
-and its input, left alone by choice rather than for compatibility.
+A runner launches `assembly run` — the command a person types — so a round's
+command line is its reproduction.
 
 ## Toolchain
 
@@ -149,7 +151,7 @@ match (prompt, prompt_file) {
 }
 ```
 
-(`src/lifecycle.rs`'s `prompt_text`.)
+(`src/run.rs`'s `prompt_text`.)
 
 ### Build values, don't mutate them
 
@@ -167,29 +169,33 @@ into text (`to_summary_line`, `to_duration_line`) is a separate step
 
 ### Where loops are still correct
 
-Don't contort this into an iterator chain: sequential I/O with early return on
-error, where `?` inside a loop reads better than `collect::<Result<_, _>>()`
-would. `git::commit_all_except` unstages each `never_commit` path this way
-(`src/git.rs`) — a genuine loop, not a map in disguise.
+Don't contort this into an iterator chain: sequential I/O with early return,
+where `?` or `return` inside a loop reads better than a combinator would.
+`claim::claim_job` lists the remote's job branches and pushes the next one,
+attempt after attempt, until a push creates its branch (`src/claim.rs`) — a
+genuine loop, not a fold in disguise.
+
+The daemon's dispatcher is the headline case:
+`daemon::dispatch::dispatch_until_stopped` takes one queued job at a time and
+waits for a free slot before looking at the next; that ordering *is* the loop
+(`src/daemon/dispatch.rs`).
 
 When you do write one, it should be because the alternative is worse, and
-that should be obvious to the next reader. `assembly` runs exactly one job at
-a time, so there is no scheduler loop any more to hold up as the headline
-case — if a later milestone's daemon brings one back, it belongs here.
+that should be obvious to the next reader — both of these say so in their
+doc comments.
 
 ### Cost
 
 The unit of work is one job, and the collections around it — a repository's
-declared providers, its `copy` list, the job branches `git ls-remote` lists,
-the frames one job prints — are a handful of items, not millions. Favor
-clarity: `git::remote_branches_matching` hands back the remote's job
-branches as a plain `Vec`, and `paths::job_id_past` scans it for the highest
-id rather than indexing it first (`src/git.rs`, `src/paths.rs`); with a
-handful of branches the scan is clearer and the difference in cost does not
-exist. There is no graph left to traverse — no DFS, no Kahn's-style peeling;
-a job either runs or it doesn't. If a later milestone's daemon runs many jobs
-at once, the cost question becomes scheduling contention, not walking a data
-structure — revisit this section when that lands.
+declared providers, the job branches `git ls-remote` lists, the frames one
+job prints — are a handful of items, not millions. Favor clarity:
+`git::remote_branches_matching` hands back the remote's job branches as a
+plain `Vec`, and `paths::job_id_past` scans it for the highest id rather than
+indexing it first (`src/git.rs`, `src/paths.rs`); with a handful of branches
+the scan is clearer and the difference in cost does not exist. There is no
+graph to traverse — a job either runs or it doesn't. The daemon runs many
+jobs at once, and what that costs is contention, which its `--max-jobs` cap
+bounds.
 
 ## Naming
 
@@ -257,33 +263,31 @@ Where a type owns a sink or source, make it generic with a sensible default
   test may touch the network or require credentials.
 - Prove concurrency with observable evidence — a wall-clock bound, or a probe
   that records how many copies of a command were live at once — not by
-  inspecting internal state. This is forward-looking, not descriptive of
-  today's tests: `assembly` runs exactly one job at a time, so there is
-  nothing concurrent to observe today, and the DAG scheduler's wall-clock
-  probes were deleted with it. Apply this rule when a later milestone's
-  daemon actually runs jobs concurrently — don't go looking for the tests it
-  describes before then.
+  inspecting internal state.
+  `the_daemon_never_runs_more_rounds_at_once_than_its_cap`
+  (`tests/daemon_jobs.rs`) runs `tests/fixtures/counting-agent.sh`, whose
+  every copy records how many were live.
+- Tests that run a command that reads the state root set `ASSEMBLY_ROOT` or
+  `--root` to a tempdir, never the real one; tests that need a daemon start one with
+  `support::daemon::RunningDaemon`.
 
 ## Invariants
 
-- The event log is **append-only**. Never rewrite or truncate it.
+- The event log is **append-only**. Never rewrite or truncate it. A round's
+  `position` file (`JobPaths::position`), where the collector records how far
+  it has read, is the one thing under a job directory that is rewritten.
 - `JobReport::from_events` is the only fold over a job's events, and it must
   stay pure. Anything that cannot be reconstructed from `events.jsonl` does
   not belong in `JobState` or `JobReport`.
-- Job ids are never user input, so there is nothing to validate. A job's id is
-  a `JobId` that `paths::next_job_id` allocates one past the max of both the
-  existing job directories and the remote's `al/job-*` branches — job
-  branches are shared on the remote, so a second clone, a teammate, or a
-  deleted `.assembly/jobs` must not restart at 1 and push onto a branch
-  somebody else already published. Its branch name is derived
-  from that id alone (`al/job-{id}`, `JobId::branch_name` in `src/job.rs`) — always a
-  well-formed git ref, with no pattern check needed because nothing
-  user-authored ever reaches it.
-- The target repository's working tree is never modified beyond
-  `.assembly/jobs/`, where a job's event log and metadata live until a later
-  milestone moves that state out of the repository entirely
-  (`src/paths.rs`). Its `.git` gains only what a fetch writes — objects,
-  `FETCH_HEAD`, remote-tracking refs — when a job pins its start to the
-  remote (`git::pinned`). Checkouts are scratch
-  clones under the system temp directory, never inside the repository, and
-  are deleted with the round that made them.
+- Job ids are never user input, so there is nothing to validate. A job's id
+  is claimed, never allocated locally: `claim::claim_job` creates the branch
+  one past the remote's highest `al/job-*` on the remote itself, so two
+  daemons, a teammate or a hand-typed `run` can never take the same one. Its
+  branch name is derived from that id alone (`al/job-{id}`,
+  `JobId::branch_name` in `src/job.rs`) — always a well-formed git ref, with
+  no pattern check needed because nothing user-authored ever reaches it.
+- The factory never writes to a user's repository — not its working tree,
+  not its `.git`. Job state and the daemon's fetches live under its root, in
+  directories named by the repository's `RepoKey` (`src/paths.rs`); a
+  hand-typed `run` keeps no state at all. Checkouts are scratch clones under
+  the system temp directory, deleted with the round that made them.
