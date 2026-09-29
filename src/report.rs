@@ -1,5 +1,6 @@
 use crate::event::{Event, EventKind};
 use crate::git::PinnedRef;
+use crate::runner::RoundHandle;
 use crate::state::JobState;
 use chrono::{DateTime, Utc};
 use std::time::Duration;
@@ -60,6 +61,10 @@ pub struct JobReport {
     pub provider: Option<String>,
     /// The URL of the branch's pull request, once one is open.
     pub pull_request: Option<String>,
+    /// How to find the latest round on its runner, once it has launched.
+    pub launched: Option<RoundHandle>,
+    /// When the job's latest round was asked for.
+    pub requested_at: Option<DateTime<Utc>>,
 }
 
 /// A job's facts, accumulated as its event stream is folded.
@@ -78,6 +83,8 @@ struct JobProgress {
     latest_prompt: Option<String>,
     provider: Option<String>,
     pull_request: Option<String>,
+    launched: Option<RoundHandle>,
+    requested_at: Option<DateTime<Utc>>,
 }
 
 impl JobProgress {
@@ -96,6 +103,8 @@ impl JobProgress {
                 last_round_duration: None,
                 committed_diff: None,
                 detail: None,
+                launched: None,
+                requested_at: Some(event.at),
                 remote_url: self.remote_url.or_else(|| Some(remote_url.clone())),
                 first_prompt: self.first_prompt.or_else(|| Some(prompt.clone())),
                 latest_prompt: Some(prompt.clone()),
@@ -111,6 +120,11 @@ impl JobProgress {
                 round_started_at: Some(event.at),
                 committed_diff: None,
                 detail: None,
+                launched: None,
+                ..self
+            },
+            EventKind::RoundLaunched { handle } => JobProgress {
+                launched: Some(handle.clone()),
                 ..self
             },
             EventKind::RoundCommitted {
@@ -181,6 +195,8 @@ impl JobReport {
             latest_prompt: progress.latest_prompt,
             provider: progress.provider,
             pull_request: progress.pull_request,
+            launched: progress.launched,
+            requested_at: progress.requested_at,
         }
     }
 

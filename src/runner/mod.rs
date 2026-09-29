@@ -4,11 +4,14 @@ pub mod child;
 pub mod docker;
 pub mod kubernetes;
 pub mod local;
+pub mod tail;
 
 use crate::git::PinnedRef;
-use crate::job::JobId;
+use crate::paths::JobPaths;
 use crate::payload::{FORGE_TOKEN_VAR, GIT_TOKEN_VAR, https_equivalent, is_path_on_this_machine};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
 /// Where the image a container runner launches is published.
@@ -27,21 +30,23 @@ pub struct LaunchSpec {
     /// The repository's `max_duration`, for a runner that enforces a
     /// backstop of its own behind `run`'s.
     pub command_limit_secs: Option<u64>,
+    /// Where a local round writes its frames; container runners ignore it.
+    pub frames_file: PathBuf,
 }
 
 impl LaunchSpec {
-    /// Round `round` of job `job`, fitted to where `R` runs it: a container
-    /// has neither the host's toolchain nor its SSH keys, so it provisions
-    /// the one and reaches the remote over HTTPS, with a token, in place of
-    /// the other. Every value is attached with `=`, so none can be read as
-    /// a flag.
+    /// Round `round` of the job at `job`, fitted to where `R` runs it: a
+    /// container has neither the host's toolchain nor its SSH keys, so it
+    /// provisions the one and reaches the remote over HTTPS, with a token,
+    /// in place of the other. Every value is attached with `=`, so none can
+    /// be read as a flag.
     ///
     /// An absolute path is passed as a `file://` URL: `run --repo` reads a
     /// path holding `.git` as a checkout and clones that checkout's own
     /// remote, and a remote that is a non-bare repository holds one.
     #[must_use]
     pub fn for_round<R: Runner>(
-        job: JobId,
+        job: &JobPaths,
         round: u32,
         remote_url: &str,
         base: &PinnedRef,
@@ -49,6 +54,7 @@ impl LaunchSpec {
         provider: &str,
         command_limit_secs: Option<u64>,
     ) -> LaunchSpec {
+        let (frames_file, job) = (job.frames(round), job.id);
         let remote_url = match (
             R::RUNS_IN_A_CONTAINER,
             std::path::Path::new(remote_url).is_absolute(),
@@ -76,7 +82,52 @@ impl LaunchSpec {
             .chain(R::RUNS_IN_A_CONTAINER.then(|| "--provision-toolchain".to_string()))
             .collect(),
             command_limit_secs,
+            frames_file,
         }
+    }
+}
+
+/// Enough to find a launched round again — from another daemon process, if
+/// need be. Recorded in the job's log as it launches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "runner", rename_all = "snake_case")]
+pub enum RoundHandle {
+    /// `run` leading a session of its own, writing its frames to `frames`.
+    Local {
+        pid: i32,
+        frames: PathBuf,
+    },
+    Docker {
+        container: String,
+    },
+    #[serde(rename = "k8s")]
+    Kubernetes {
+        job: String,
+    },
+}
+
+impl RoundHandle {
+    /// The runner that launched the round, as `--runner` names it.
+    fn runner_name(&self) -> &'static str {
+        match self {
+            Self::Local { .. } => "local",
+            Self::Docker { .. } => "docker",
+            Self::Kubernetes { .. } => "k8s",
+        }
+    }
+
+    /// Why a daemon running `this_runner` cannot pick this round up. The
+    /// round may still be running where it was launched, with nobody
+    /// collecting it.
+    #[must_use]
+    pub fn launched_by_another_runner(&self, this_runner: &str) -> anyhow::Error {
+        anyhow::anyhow!(
+            "the round was launched by a {} runner, and this daemon runs {this_runner} — \
+             it may still be running there: stop it with the {} runner's own tools, then \
+             submit again",
+            self.runner_name(),
+            self.runner_name()
+        )
     }
 }
 
@@ -111,6 +162,13 @@ pub trait Runner {
         secrets: &JobSecrets,
         cancel: &CancellationToken,
     ) -> impl Future<Output = anyhow::Result<Self::Running>> + Send;
+
+    /// Pick up a round this runner launched earlier — possibly from a
+    /// daemon process that has since gone — by the handle it recorded.
+    fn reattach(
+        &self,
+        handle: &RoundHandle,
+    ) -> impl Future<Output = anyhow::Result<Self::Running>> + Send;
 }
 
 /// A launched round: its stream, a way to stop it, and why it stopped.
@@ -123,6 +181,8 @@ pub trait RunningRound {
     /// ends, and a round winding down may print more than any pipe holds.
     fn cancel(&mut self) -> impl Future<Output = ()> + Send;
     fn termination(self) -> impl Future<Output = Termination> + Send;
+    /// How to find this round again with [`Runner::reattach`].
+    fn handle(&self) -> RoundHandle;
 }
 
 /// Why a round's process stopped, as its runner can tell.

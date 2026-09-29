@@ -5,11 +5,16 @@
 pub mod api;
 pub mod client;
 pub mod dispatch;
+pub mod fleet;
 pub mod root;
 pub mod submit;
 
+use crate::event::{EventKind, EventLog};
+use crate::report::JobReport;
 use crate::runner::{JobSecrets, Runner, RunnerProblem};
 use anyhow::Context;
+use dispatch::JobAddress;
+use fleet::Resumption;
 use root::{RootLock, socket_path};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -75,40 +80,91 @@ pub struct Serving<R> {
     pub queue: dispatch::JobQueue,
 }
 
-/// Serve `daemon` on its root's socket, launching the jobs submitted to it,
-/// until `shutdown` resolves; then stop its rounds and remove the socket.
+/// Give every job under the root what it is owed, then serve `daemon` on
+/// its root's socket, launching the jobs submitted to it, until `shutdown`
+/// resolves; then launch nothing more, give up the launches in progress, and
+/// remove the socket. Rounds already launched are left running: each
+/// finishes without this daemon, and the next one on the root reattaches to
+/// it.
 ///
 /// # Errors
 ///
-/// When the socket cannot be bound or the server fails.
+/// When a job's log under the root cannot be read or written, or the socket
+/// cannot be bound, or the server fails.
 pub async fn serve<R: Runner + Send + Sync + 'static>(
     daemon: Daemon<R>,
     lock: RootLock,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let socket = socket_path(&daemon.root);
-    let listener = tokio::net::UnixListener::bind(&socket)
-        .with_context(|| format!("listening on {}", socket.display()))?;
     let (queue, pending) = dispatch::JobQueue::new();
     let serving = Arc::new(Serving {
         daemon,
         repos: dispatch::RepoLocks::default(),
         queue,
     });
+    resume_jobs_under_root(&serving)?;
+    let socket = socket_path(&serving.daemon.root);
+    let listener = tokio::net::UnixListener::bind(&socket)
+        .with_context(|| format!("listening on {}", socket.display()))?;
     let dispatcher = tokio::spawn(dispatch::dispatch_until_stopped(
         Arc::clone(&serving),
         pending,
     ));
 
     let served = serve_until_shutdown(listener, api::router(Arc::clone(&serving)), shutdown).await;
-    // P7: until reattach, a round the daemon cannot come back to is
-    // cancelled and given its verdict before the daemon goes.
-    serving.queue.stop_rounds_and_wait().await;
+    serving.queue.stop_launching();
     let _ = dispatcher.await;
+    // Past the bound, a launch still cleaning up is dropped, and the next
+    // daemon closes its round as lost mid-launch.
+    let _ = tokio::time::timeout(LAUNCH_CLEANUP_GRACE, serving.queue.launches_settled()).await;
     let _ = std::fs::remove_file(&socket);
     drop(lock);
     served.map_err(Into::into)
 }
+
+/// Reattach to every round launched without a verdict, close every round
+/// lost mid-launch, and requeue every job still waiting, in the order they
+/// were asked for.
+fn resume_jobs_under_root<R: Runner + Send + Sync + 'static>(
+    serving: &Arc<Serving<R>>,
+) -> anyhow::Result<()> {
+    let owed: Vec<(JobAddress, JobReport, Resumption)> = fleet::jobs_under(&serving.daemon.root)?
+        .into_iter()
+        .filter_map(|(address, report)| {
+            Resumption::for_report(&report).map(|owed| (address, report, owed))
+        })
+        .collect();
+    let (mut requeued, others): (Vec<_>, Vec<_>) = owed
+        .into_iter()
+        .partition(|(_, _, owed)| *owed == Resumption::Requeue);
+
+    others
+        .into_iter()
+        .try_for_each(|(address, _, owed)| match owed {
+            Resumption::Reattach { round, handle } => {
+                dispatch::spawn_reattached(serving, address, round, handle);
+                Ok(())
+            }
+            Resumption::LostWhileLaunching { .. } => {
+                let reason = fleet::lost_while_launching(address.id);
+                EventLog::open_append(address.paths().events())
+                    .and_then(|mut log| log.append(EventKind::RoundFailed { reason }))
+                    .map(|_| ())
+                    .with_context(|| format!("closing job {} in {}", address.id, address.key))
+            }
+            Resumption::Requeue => Ok(()),
+        })?;
+
+    requeued.sort_by_key(|(_, report, _)| report.requested_at);
+    requeued
+        .into_iter()
+        .for_each(|(address, _, _)| serving.queue.enqueue(address));
+    Ok(())
+}
+
+/// How long a launch given up at shutdown gets to remove what it had
+/// created — a container, a Job and its Secret.
+const LAUNCH_CLEANUP_GRACE: Duration = Duration::from_secs(10);
 
 /// How long requests already in flight get to finish once shutdown is asked
 /// for.

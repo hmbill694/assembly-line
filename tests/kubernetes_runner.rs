@@ -5,7 +5,7 @@ use assembly_line::runner::kubernetes::{
     KubernetesRunner, LogReadPosition, PodProgress, active_deadline_secs, job_manifest,
     pod_progress, secret_manifest, split_timestamp,
 };
-use assembly_line::runner::{JobSecrets, Runner, RunningRound};
+use assembly_line::runner::{JobSecrets, RoundHandle, Runner, RunningRound};
 use serde_json::json;
 use std::collections::BTreeMap;
 use support::{Harness, fake_cli};
@@ -387,7 +387,13 @@ async fn collected_round(h: &Harness, k8s: &KubernetesRunner) -> (bool, Vec<Even
         .unwrap();
     let verdict = tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        collect(running, &mut log, &paths.log(), CancellationToken::new()),
+        collect(
+            running,
+            &mut log,
+            &paths.log(),
+            &paths.position(1),
+            CancellationToken::new(),
+        ),
     )
     .await
     .expect("collection never ended")
@@ -743,4 +749,75 @@ async fn cancelling_a_running_job_deletes_the_job_and_its_secret() {
     let argv = std::fs::read_to_string(fakes.join("argv")).unwrap();
     assert!(argv.contains("delete job"), "{argv}");
     assert!(argv.contains("delete secret"), "{argv}");
+}
+
+#[tokio::test]
+async fn a_kubernetes_round_is_reattached_by_its_job_name() {
+    let h = Harness::new().await;
+    let fakes = h.scratch_root().with_file_name("fakes");
+    let k8s = runner(kubectl_answering(
+        &fakes,
+        &format!("cat >/dev/null; echo '{CREATED_JOB}'"),
+        &format!("echo '{SUCCEEDED_POD}'"),
+        "cat frames",
+    ));
+    let spec = h.launch_spec_for("x").await;
+    let first = k8s
+        .launch(&spec, &JobSecrets::default(), &CancellationToken::new())
+        .await
+        .unwrap();
+    let handle = first.handle();
+    drop(first);
+
+    let again = k8s.reattach(&handle).await.unwrap();
+    let paths = h.job_paths();
+    let mut log = EventLog::open_append(paths.events()).unwrap();
+    let verdict = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        collect(
+            again,
+            &mut log,
+            &paths.log(),
+            &paths.position(1),
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("collection never ended")
+    .unwrap();
+
+    assert!(verdict.passed());
+    let output = std::fs::read_to_string(paths.log()).unwrap();
+    assert_eq!(output.matches("agent working").count(), 1, "{output}");
+    let argv = std::fs::read_to_string(fakes.join("argv")).unwrap();
+    assert_eq!(
+        argv.lines()
+            .filter(|call| call.contains("create -f -"))
+            .count(),
+        2,
+        "the reattach created something: {argv}"
+    );
+}
+
+/// The handle is recorded once the pod has started, so a Job with no pod
+/// when the daemon comes back has lost it for good.
+#[tokio::test]
+async fn a_kubernetes_round_whose_pod_is_gone_cannot_be_reattached() {
+    let tmp = tempfile::tempdir().unwrap();
+    let k8s = runner(kubectl_answering(
+        tmp.path(),
+        "exit 1",
+        "echo '{\"items\":[]}'",
+        "exit 1",
+    ));
+
+    let err = k8s
+        .reattach(&RoundHandle::Kubernetes {
+            job: "al-1-1-x".into(),
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("al-1-1-x has no pod"), "{err}");
 }

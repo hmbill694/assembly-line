@@ -253,7 +253,10 @@ impl Harness {
             .await
             .unwrap();
         LaunchSpec::for_round::<LocalRunner>(
-            job,
+            &JobPaths {
+                id: job,
+                dir: self.tmp.path().join("jobs").join(job.to_string()),
+            },
             1,
             self.origin.to_str().unwrap(),
             &base,

@@ -1,15 +1,15 @@
 use assembly_line::daemon::Daemon;
 use assembly_line::git::PinnedRef;
-use assembly_line::job::JobId;
+use assembly_line::paths::JobPaths;
 use assembly_line::payload::{
     FORGE_TOKEN_VAR, GIT_TOKEN_VAR, https_equivalent, is_path_on_this_machine,
 };
-use assembly_line::runner::docker::docker_run_args;
-use assembly_line::runner::local::LocalRound;
+use assembly_line::runner::docker::{DockerRunner, docker_create_args};
+use assembly_line::runner::local::{LocalRound, LocalRunner};
 use assembly_line::runner::{
-    JobSecrets, LaunchSpec, Runner, RunnerProblem, reasons_a_container_cannot_run,
+    JobSecrets, LaunchSpec, RoundHandle, Runner, RunnerProblem, reasons_a_container_cannot_run,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
 /// A runner that reports `problems` and never launches, running rounds in a
@@ -34,6 +34,13 @@ impl<const IN_A_CONTAINER: bool> Runner for RunnerReporting<IN_A_CONTAINER> {
         _cancel: &CancellationToken,
     ) -> impl Future<Output = anyhow::Result<LocalRound>> + Send {
         std::future::ready(Err(anyhow::anyhow!("a preflight test launches nothing")))
+    }
+
+    fn reattach(
+        &self,
+        _handle: &RoundHandle,
+    ) -> impl Future<Output = anyhow::Result<LocalRound>> + Send {
+        std::future::ready(Err(anyhow::anyhow!("a preflight test reattaches nothing")))
     }
 }
 
@@ -299,10 +306,50 @@ fn base() -> PinnedRef {
     }
 }
 
+fn job(id: u64) -> JobPaths {
+    JobPaths {
+        id: id.into(),
+        dir: PathBuf::from("/root/jobs/local/o").join(id.to_string()),
+    }
+}
+
+/// A daemon restarted with another `--runner` finds its root's rounds but
+/// cannot collect them, and says which runner launched them.
+#[tokio::test]
+async fn a_round_launched_by_another_runner_is_not_reattached() {
+    let docker_round = RoundHandle::Docker {
+        container: "al-1-1-x".into(),
+    };
+    let local_round = RoundHandle::Local {
+        pid: 1,
+        frames: job(1).frames(1),
+    };
+
+    let local = LocalRunner::using("assembly")
+        .reattach(&docker_round)
+        .await
+        .unwrap_err()
+        .to_string();
+    let docker = DockerRunner::new("img:1".into())
+        .reattach(&local_round)
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        local.contains("launched by a docker runner") && local.contains("runs local"),
+        "{local}"
+    );
+    assert!(
+        docker.contains("launched by a local runner") && docker.contains("runs docker"),
+        "{docker}"
+    );
+}
+
 #[test]
 fn a_container_round_runs_assembly_run_over_https_and_provisions_first() {
     let spec = LaunchSpec::for_round::<ContainerRunner>(
-        JobId::from(7),
+        &job(7),
         2,
         "git@github.com:o/r.git",
         &base(),
@@ -326,12 +373,16 @@ fn a_container_round_runs_assembly_run_over_https_and_provisions_first() {
     );
     assert_eq!(spec.command_limit_secs, Some(60));
     assert!(spec.name.starts_with("al-7-2-"), "{}", spec.name);
+    assert_eq!(
+        spec.frames_file,
+        Path::new("/root/jobs/local/o/7/round-2.frames")
+    );
 }
 
 #[test]
 fn a_host_round_runs_assembly_run_with_the_remote_and_toolchain_as_they_are() {
     let spec = LaunchSpec::for_round::<HostRunner>(
-        JobId::from(7),
+        &job(7),
         1,
         "git@github.com:o/r.git",
         &base(),
@@ -352,7 +403,7 @@ fn a_host_round_runs_assembly_run_with_the_remote_and_toolchain_as_they_are() {
 #[test]
 fn a_host_round_names_a_remote_on_this_machine_by_its_file_url() {
     let spec = LaunchSpec::for_round::<HostRunner>(
-        JobId::from(7),
+        &job(7),
         1,
         "/srv/origin",
         &base(),
@@ -373,7 +424,7 @@ fn a_host_round_names_a_remote_on_this_machine_by_its_file_url() {
 #[test]
 fn every_value_on_the_command_line_is_attached_to_its_flag() {
     let spec = LaunchSpec::for_round::<HostRunner>(
-        JobId::from(1),
+        &job(1),
         1,
         "/o.git",
         &base(),
@@ -413,8 +464,8 @@ fn every_runner_problem_says_what_to_do_about_it() {
 }
 
 #[test]
-fn docker_run_names_its_secrets_and_runs_assembly_run() {
-    let args = docker_run_args(
+fn docker_create_names_its_secrets_and_runs_assembly_run() {
+    let args = docker_create_args(
         "img:1",
         "al-1-1-x",
         &["ASSEMBLY_GIT_TOKEN", "GH_TOKEN"],
@@ -423,7 +474,7 @@ fn docker_run_names_its_secrets_and_runs_assembly_run() {
     let joined = args.join(" ");
 
     assert!(
-        joined.starts_with("run --name al-1-1-x -e ASSEMBLY_GIT_TOKEN -e GH_TOKEN"),
+        joined.starts_with("create --name al-1-1-x -e ASSEMBLY_GIT_TOKEN -e GH_TOKEN"),
         "{joined}"
     );
     assert!(joined.ends_with("img:1 assembly run --job=1"), "{joined}");

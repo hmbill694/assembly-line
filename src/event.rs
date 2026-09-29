@@ -24,6 +24,10 @@ pub enum EventKind {
     RoundStarted {
         round: u32,
     },
+    /// The round is running on its runner, and this is how to find it again.
+    RoundLaunched {
+        handle: crate::runner::RoundHandle,
+    },
     /// The round made commits — the agent's own, or assembly-line's of what
     /// it left uncommitted — and `sha` is the one the job's branch ends on.
     RoundCommitted {
