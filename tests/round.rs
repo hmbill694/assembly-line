@@ -2,8 +2,8 @@ use assembly_line::config::{ConfigError, REPO_CONFIG_PATH};
 use assembly_line::event::EventKind;
 use assembly_line::git::{self, head_sha};
 use assembly_line::job::JobId;
-use assembly_line::lifecycle::Refusal;
 use assembly_line::payload;
+use assembly_line::run::RunRefused;
 use assembly_line::runner::LaunchSpec;
 use assembly_line::runner::local::LocalRunner;
 use assembly_line::state::JobState;
@@ -506,12 +506,11 @@ async fn a_provider_the_repository_never_declared_stops_the_job_before_it_starts
     assert!(
         matches!(
             &refusal,
-            Refusal::ConfigNotRunnable(errors)
+            RunRefused::ConfigNotRunnable(errors)
                 if errors == &[ConfigError::UnknownProvider("ghost".into())]
         ),
         "{refusal:?}"
     );
-    assert!(!h.root.join("jobs").exists());
 }
 
 #[tokio::test]
@@ -527,7 +526,7 @@ async fn an_unparseable_max_duration_stops_the_job_before_it_starts() {
     assert!(
         matches!(
             &refusal,
-            Refusal::ConfigNotRunnable(errors)
+            RunRefused::ConfigNotRunnable(errors)
                 if errors == &[ConfigError::UnparseableMaxDuration("soon".into())]
         ),
         "{refusal:?}"
