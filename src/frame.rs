@@ -223,21 +223,55 @@ pub enum Routed {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StreamPosition {
     last_seq: u64,
+    /// For a collection resuming a stream that replays from its start: the
+    /// frame the replay has yet to reach, 0 once it has. Until then a line
+    /// that is not a frame was collected before too.
+    replaying_to: u64,
 }
 
 impl StreamPosition {
+    /// A position past `last_seq`, for a collection resuming a stream.
+    #[must_use]
+    pub fn after(last_seq: u64) -> StreamPosition {
+        StreamPosition {
+            last_seq,
+            replaying_to: last_seq,
+        }
+    }
+
+    #[must_use]
+    pub fn last_seq(self) -> u64 {
+        self.last_seq
+    }
+
     /// Where `line` goes, and where the stream stands after it.
     ///
     /// A line that is not a frame is output: `run`'s own stderr, or a
     /// crash backtrace, merged into the stream by a runner that cannot keep
-    /// the two apart. It does not move the position.
+    /// the two apart. It does not move the position, and while a resumed
+    /// stream is still replaying it is dropped with the frames around it.
+    /// Such a line printed after the last frame routed before the resume is
+    /// routed a second time.
     #[must_use]
     pub fn route(self, line: &str) -> (StreamPosition, Routed) {
         match serde_json::from_str::<Frame>(line) {
+            Err(_) if self.replaying_to > 0 => (self, Routed::AlreadyCollected),
             Err(_) => (self, Routed::Output(line.to_string())),
-            Ok(frame) if frame.seq <= self.last_seq => (self, Routed::AlreadyCollected),
+            Ok(frame) if frame.seq <= self.last_seq => (
+                StreamPosition {
+                    replaying_to: match frame.seq >= self.replaying_to {
+                        true => 0,
+                        false => self.replaying_to,
+                    },
+                    ..self
+                },
+                Routed::AlreadyCollected,
+            ),
             Ok(Frame { seq, body }) => (
-                StreamPosition { last_seq: seq },
+                StreamPosition {
+                    last_seq: seq,
+                    replaying_to: 0,
+                },
                 match body {
                     FrameBody::Event(event) => Routed::Event { seq, event },
                     FrameBody::Output(text) => Routed::Output(text),

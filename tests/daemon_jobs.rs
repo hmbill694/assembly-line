@@ -2,14 +2,21 @@
 //! cap, run on the daemon's runner, and read back with status and logs.
 
 use assembly_line::config::REPO_CONFIG_PATH;
+use assembly_line::daemon::{self, Daemon, fleet};
 use assembly_line::event::{EventKind, EventLog};
 use assembly_line::paths::RepoKey;
+use assembly_line::runner::local::LocalRound;
+use assembly_line::runner::{JobSecrets, LaunchSpec, RoundHandle, Runner, RunnerProblem};
 use assembly_line::state::JobState;
 use assert_cmd::Command;
+use chrono::{DateTime, Utc};
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use std::path::{Path, PathBuf};
-use support::daemon::{RunningDaemon, wait_for_verdict, wait_until_logged};
+use support::daemon::{RunningDaemon, wait_for_verdict, wait_until_launched, wait_until_logged};
+use tokio_util::sync::CancellationToken;
 
 mod support;
 
@@ -95,6 +102,38 @@ impl Fixture {
 
     fn on_origin(&self, args: &[&str]) -> String {
         git_in(&self.origin, args)
+    }
+}
+
+/// Stopping a daemon stops none of its rounds, so before `tmp` goes the
+/// fixture waits for every local round its daemons launched to end; one
+/// still running after thirty seconds is sent SIGTERM, as `cancel` would.
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        drop(self.daemon.take());
+        let pids: Vec<Pid> = fleet::jobs_under(&self.root())
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|(address, _)| EventLog::read(address.paths().events()).unwrap_or_default())
+            .filter_map(|event| match event.kind {
+                EventKind::RoundLaunched {
+                    handle: RoundHandle::Local { pid, .. },
+                } => Some(Pid::from_raw(pid)),
+                _ => None,
+            })
+            .collect();
+        // `run` leads its own session; a pid that no longer does is not it.
+        let still_running = || {
+            pids.iter()
+                .filter(|pid| nix::unistd::getsid(Some(**pid)) == Ok(**pid))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while still_running().next().is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        still_running().for_each(|pid| {
+            let _ = killpg(*pid, Signal::SIGTERM);
+        });
     }
 }
 
@@ -747,42 +786,256 @@ async fn the_users_repository_gains_nothing_from_a_job() {
     assert_eq!(git_in(&fx.repo, &["status", "--porcelain"]), "");
 }
 
-/// Until reattach lands, stopping the daemon ends its rounds — and says so.
-/// A job still waiting for a slot is not started on the way out: it stays
-/// queued.
+/// A repository whose agent waits for a gate file, and the daemon args and
+/// environment that point its rounds at it.
+async fn gated(daemon_args: &[&str]) -> (Fixture, PathBuf) {
+    let fx = Fixture::repository(&format!(
+        "verify = \"true\"\n{}",
+        support::config_running("gated-agent.sh")
+    ))
+    .await;
+    let gate = fx.tmp.path().join("gate");
+    let fx = fx.with_daemon(daemon_args, &[("GATE", gate.to_str().unwrap())]);
+    (fx, gate)
+}
+
+/// Stopping the daemon stops no job: the round finishes its arc without
+/// it, and the next daemon on the root collects it, adding nothing twice.
 #[tokio::test]
-async fn stopping_the_daemon_cancels_its_rounds_and_records_why() {
-    let mut fx = Fixture::running("sleeping-agent.sh", &[], &[]).await;
+async fn a_round_outlives_its_daemon_and_the_next_one_collects_it() {
+    let (mut fx, gate) = gated(&[]).await;
     fx.assembly()
         .args(["submit", "--prompt", "x"])
         .assert()
         .success();
-    wait_until_logged(&fx.job_dir(1), "sleeping-agent:");
-    fx.assembly()
-        .args(["submit", "--prompt", "waiting"])
-        .assert()
-        .success();
+    wait_until_launched(&fx.job_dir(1));
 
     assert!(fx.daemon.take().unwrap().stop().success());
+    std::fs::write(&gate, "").unwrap();
+    let fx = fx.with_daemon(&[], &[("GATE", gate.to_str().unwrap())]);
 
     let report = wait_for_verdict(&fx.job_dir(1));
-    assert_eq!(report.state, JobState::Failed);
+    assert_eq!(report.state, JobState::Passed, "{:?}", fx.events_of(1));
+    let log = std::fs::read_to_string(fx.job_dir(1).join("job.log")).unwrap();
+    assert_eq!(log.matches("gated-agent: x").count(), 1, "{log}");
+    assert_eq!(fx.on_origin(&["show", "al/job-1:agent-output.txt"]), "x");
+}
+
+/// Jobs a stopped daemon left waiting for a slot go back in line on
+/// restart, behind the round it reattaches to, oldest request first.
+#[tokio::test]
+async fn jobs_left_queued_run_after_a_restart_in_the_order_they_were_asked_for() {
+    let (mut fx, gate) = gated(&["--max-jobs", "1"]).await;
+    (0..3).for_each(|i| {
+        fx.assembly()
+            .args(["submit", "--prompt", &format!("job {i}")])
+            .assert()
+            .success();
+    });
+    wait_until_launched(&fx.job_dir(1));
+
+    assert!(fx.daemon.take().unwrap().stop().success());
+    std::fs::write(&gate, "").unwrap();
+    let fx = fx.with_daemon(&["--max-jobs", "1"], &[("GATE", gate.to_str().unwrap())]);
+
+    let started: Vec<DateTime<Utc>> = (1..=3)
+        .map(|id| {
+            assert_eq!(wait_for_verdict(&fx.job_dir(id)).state, JobState::Passed);
+            round_started_at(&fx.job_dir(id))
+        })
+        .collect();
     assert!(
-        report
-            .detail
-            .as_deref()
-            .unwrap_or_default()
-            .contains("cancelled"),
-        "{report:?}"
+        started[1] < started[2],
+        "job 3 started before job 2: {started:?}"
     );
+}
+
+/// A reattached round is the daemon's own: `cancel` reaches it, and it
+/// holds its place under the cap until its verdict.
+#[tokio::test]
+async fn a_reattached_round_can_be_cancelled_and_counts_under_the_cap() {
+    let mut fx = Fixture::running("sleeping-agent.sh", &["--max-jobs", "1"], &[]).await;
+    ["first", "second"].iter().for_each(|prompt| {
+        fx.assembly()
+            .args(["submit", "--prompt", prompt])
+            .assert()
+            .success();
+    });
+    wait_until_logged(&fx.job_dir(1), "sleeping-agent:");
+    assert!(fx.daemon.take().unwrap().stop().success());
+    let fx = fx.with_daemon(&["--max-jobs", "1"], &[]);
+
+    fx.assembly()
+        .args(["cancel", "1"])
+        .assert()
+        .success()
+        .stdout(contains("job 1: cancelling"));
+    let first = wait_for_verdict(&fx.job_dir(1));
+    wait_until_logged(&fx.job_dir(2), "sleeping-agent:");
+    fx.assembly().args(["cancel", "2"]).assert().success();
+    wait_for_verdict(&fx.job_dir(2));
+
+    assert_eq!(first.detail.as_deref(), Some("cancelled"));
+    let first_ended = verdict_at(&fx.job_dir(1));
+    let second_started = round_started_at(&fx.job_dir(2));
     assert!(
-        matches!(
-            fx.events_of(2).as_slice(),
-            [EventKind::RoundRequested { .. }]
-        ),
-        "{:?}",
-        fx.events_of(2)
+        second_started > first_ended,
+        "job 2 started at {second_started}, before job 1 ended at {first_ended}"
     );
+}
+
+/// A runner whose launch ends only when it is given up — an image pull
+/// that never finishes — marking both in `marks`.
+#[derive(Debug)]
+struct LaunchingUntilGivenUp {
+    marks: PathBuf,
+}
+
+impl Runner for LaunchingUntilGivenUp {
+    type Running = LocalRound;
+    const RUNS_IN_A_CONTAINER: bool = false;
+
+    fn reasons_it_cannot_run(&self) -> impl Future<Output = Vec<RunnerProblem>> + Send {
+        std::future::ready(Vec::new())
+    }
+
+    async fn launch(
+        &self,
+        _spec: &LaunchSpec,
+        _secrets: &JobSecrets,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<LocalRound> {
+        std::fs::write(self.marks.join("launching"), "").unwrap();
+        cancel.cancelled().await;
+        std::fs::write(self.marks.join("given-up"), "").unwrap();
+        Err(anyhow::anyhow!("cancelled before the container started"))
+    }
+
+    fn reattach(
+        &self,
+        _handle: &RoundHandle,
+    ) -> impl Future<Output = anyhow::Result<LocalRound>> + Send {
+        std::future::ready(Err(anyhow::anyhow!("nothing was ever launched")))
+    }
+}
+
+/// Until its launch is recorded a round has no handle, and a later daemon
+/// could never find it: a daemon stopping mid-launch gives the launch up,
+/// letting its runner remove what it had made, and closes the round saying
+/// so, rather than leave it running uncollected.
+#[tokio::test(flavor = "multi_thread")]
+async fn stopping_the_daemon_mid_launch_gives_the_launch_up_and_says_so() {
+    let fx = Fixture::repository(&format!(
+        "verify = \"true\"\n{}",
+        support::config_running("fake-agent.sh")
+    ))
+    .await;
+    let marks = fx.tmp.path().join("marks");
+    std::fs::create_dir_all(&marks).unwrap();
+    let lock = daemon::root::hold_root(&fx.root()).unwrap();
+    let runner = LaunchingUntilGivenUp {
+        marks: marks.clone(),
+    };
+    let prepared = Daemon::prepare(fx.root(), runner, 1, &[], |_| None)
+        .await
+        .unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn(daemon::serve(prepared, lock, async {
+        let _ = stopped.await;
+    }));
+    wait_until_exists(&daemon::root::socket_path(&fx.root()));
+
+    fx.assembly()
+        .args(["submit", "--prompt", "x"])
+        .assert()
+        .success();
+    wait_until_exists(&marks.join("launching"));
+    stop.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(20), serving)
+        .await
+        .expect("the daemon never stopped")
+        .unwrap()
+        .unwrap();
+
+    assert!(marks.join("given-up").exists(), "the launch was abandoned");
+    let report = wait_for_verdict(&fx.job_dir(1));
+    let detail = report.detail.unwrap_or_default();
+    assert!(
+        detail.contains("stopped while this round was launching")
+            && detail.contains("submit --job 1"),
+        "{detail}"
+    );
+}
+
+fn wait_until_exists(path: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} never appeared",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[tokio::test]
+async fn a_round_lost_while_launching_is_closed_on_restart() {
+    let mut fx = Fixture::running("fake-agent.sh", &[], &[]).await;
+    fx.assembly()
+        .args(["submit", "--prompt", "x"])
+        .assert()
+        .success();
+    wait_for_verdict(&fx.job_dir(1));
+    assert!(fx.daemon.take().unwrap().stop().success());
+    // A daemon that died between starting a round and launching it leaves
+    // exactly this: a request and a start, and nothing after.
+    let mut log = EventLog::open_append(fx.job_dir(1).join("events.jsonl")).unwrap();
+    log.append(first_request(&fx.job_dir(1))).unwrap();
+    log.append(EventKind::RoundStarted { round: 2 }).unwrap();
+    let fx = fx.with_daemon(&[], &[]);
+
+    let report = wait_for_verdict(&fx.job_dir(1));
+    assert_eq!(report.rounds, 2);
+    let detail = report.detail.unwrap_or_default();
+    assert!(
+        detail.contains("while this round was launching") && detail.contains("submit --job 1"),
+        "{detail}"
+    );
+}
+
+/// When `job_dir`'s latest round started.
+fn round_started_at(job_dir: &Path) -> DateTime<Utc> {
+    last_event_at(job_dir, |kind| {
+        matches!(kind, EventKind::RoundStarted { .. })
+    })
+}
+
+/// When `job_dir`'s latest round got its verdict.
+fn verdict_at(job_dir: &Path) -> DateTime<Utc> {
+    last_event_at(job_dir, |kind| {
+        matches!(kind, EventKind::RoundPassed | EventKind::RoundFailed { .. })
+    })
+}
+
+fn last_event_at(job_dir: &Path, wanted: impl Fn(&EventKind) -> bool) -> DateTime<Utc> {
+    EventLog::read(job_dir.join("events.jsonl"))
+        .unwrap()
+        .into_iter()
+        .filter(|event| wanted(&event.kind))
+        .last()
+        .map(|event| event.at)
+        .unwrap()
+}
+
+/// The request that began the job in `job_dir`, to ask for it again.
+fn first_request(job_dir: &Path) -> EventKind {
+    EventLog::read(job_dir.join("events.jsonl"))
+        .unwrap()
+        .into_iter()
+        .map(|event| event.kind)
+        .find(|kind| matches!(kind, EventKind::RoundRequested { .. }))
+        .unwrap()
 }
 
 /// A round waiting for its repository's cache, while a submit's fetch into

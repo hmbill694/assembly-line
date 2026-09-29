@@ -1,7 +1,6 @@
 use assembly_line::config::{ConfigError, REPO_CONFIG_PATH};
 use assembly_line::event::EventKind;
 use assembly_line::git::{self, head_sha};
-use assembly_line::job::JobId;
 use assembly_line::payload;
 use assembly_line::run::RunRefused;
 use assembly_line::runner::LaunchSpec;
@@ -575,7 +574,7 @@ async fn cancelling_a_round_stops_a_clone_in_progress() {
         &format!("touch {}\nsleep 60\n", cloning.display()),
     );
     let spec = LaunchSpec::for_round::<LocalRunner>(
-        JobId::from(1),
+        &h.job_paths(),
         1,
         "hang::nowhere",
         &git::pinned(&h.repo, "origin", "main").await.unwrap(),

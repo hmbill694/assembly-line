@@ -148,6 +148,28 @@ pub fn wait_until_logged(job_dir: &Path, text: &str) {
     }
 }
 
+/// Fold `job_dir`'s log until its latest round has been launched.
+///
+/// # Panics
+///
+/// If it has not within thirty seconds.
+pub fn wait_until_launched(job_dir: &Path) -> JobReport {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let events = EventLog::read(job_dir.join("events.jsonl")).unwrap_or_default();
+        let report = JobReport::from_events(0, &events);
+        if report.launched.is_some() {
+            return report;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never launched in {}: {events:?}",
+            job_dir.display()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn signal(child: &Child, signal: nix::sys::signal::Signal) {
     let _ = nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap()),

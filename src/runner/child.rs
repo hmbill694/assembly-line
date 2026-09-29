@@ -3,8 +3,6 @@
 //! k8s merges the two anyway, so every runner treats them as one stream and
 //! lets the frame parser tell `run`'s frames from anything else.
 
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
@@ -43,13 +41,6 @@ impl ChildLines {
     /// The next line on either stream, or `None` once both have closed.
     pub async fn next_line(&mut self) -> Option<String> {
         self.lines.recv().await
-    }
-
-    /// Ask the child to stop, with SIGTERM.
-    pub fn terminate(&self) {
-        if let Some(pid) = self.child.id().and_then(|id| i32::try_from(id).ok()) {
-            let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
-        }
     }
 
     /// Wait for the child, returning its exit code, or -1 when a signal

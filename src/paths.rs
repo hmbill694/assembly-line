@@ -210,6 +210,18 @@ impl JobPaths {
     pub fn log(&self) -> PathBuf {
         self.dir.join("job.log")
     }
+
+    /// Where a local round `round` writes its frames.
+    #[must_use]
+    pub fn frames(&self, round: u32) -> PathBuf {
+        self.dir.join(format!("round-{round}.frames"))
+    }
+
+    /// The last seq the collector routed for round `round`.
+    #[must_use]
+    pub fn position(&self, round: u32) -> PathBuf {
+        self.dir.join(format!("round-{round}.position"))
+    }
 }
 
 /// Create the directory layout for a new job. `AlreadyExists` when the job

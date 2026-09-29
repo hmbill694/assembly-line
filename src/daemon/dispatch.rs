@@ -2,15 +2,16 @@
 //! runner and collected into the job's log.
 
 use super::Serving;
-use crate::collect::{collect, record_launch_failure};
+use crate::collect::{cancel_and_wait_out, collect, record_launch_failure};
 use crate::config::{REPO_CONFIG_PATH, RepoConfig};
 use crate::event::{EventKind, EventLog};
 use crate::job::JobId;
 use crate::paths::{self, JobPaths, RepoKey};
 use crate::report::JobReport;
-use crate::runner::{LaunchSpec, Runner};
+use crate::runner::{LaunchSpec, RoundHandle, Runner, RunningRound};
 use crate::state::JobState;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::sync::{OwnedMutexGuard, mpsc, watch};
@@ -103,11 +104,17 @@ fn lock_cancel_table(
 }
 
 /// Jobs waiting for a slot, how many rounds are running now, and a way to
-/// stop them.
+/// stop launching more.
 #[derive(Debug)]
 pub struct JobQueue {
     pending: mpsc::UnboundedSender<JobAddress>,
     running: watch::Sender<usize>,
+    /// How many dispatched rounds have yet to be recorded as launched — or
+    /// to end without launching.
+    launching: watch::Sender<usize>,
+    /// Fired when the daemon stops. It gives up the launches in progress;
+    /// launched rounds never see it: each has a cancel of its own, fired
+    /// only by [`JobQueue::cancel`].
     stopping: CancellationToken,
     /// Held while deciding whether a job is queued or launched and acting
     /// on it — by [`JobQueue::cancel`] and by the dispatcher — so a job is
@@ -124,6 +131,7 @@ impl JobQueue {
             JobQueue {
                 pending,
                 running: watch::Sender::new(0),
+                launching: watch::Sender::new(0),
                 stopping: CancellationToken::new(),
                 cancels: CancelTable::default(),
             },
@@ -179,23 +187,36 @@ impl JobQueue {
         let already_launched = cancels
             .get(address)
             .is_some_and(|launched| launched.is_awaited_by(&report));
-        (report.state == JobState::Queued && !already_launched).then(|| {
-            let round = report.rounds + 1;
-            let cancel = self.stopping.child_token();
-            cancels.insert(
-                address.clone(),
-                LaunchedRound {
-                    round,
-                    cancel: cancel.clone(),
-                },
-            );
-            Registration {
-                cancels: Arc::clone(&self.cancels),
-                address: address.clone(),
+        (report.state == JobState::Queued && !already_launched)
+            .then(|| self.register(&mut cancels, address, report.rounds + 1))
+    }
+
+    /// Enter round `round` of `address`'s job, which an earlier daemon
+    /// launched, in the cancel table.
+    fn register_reattached(&self, address: &JobAddress, round: u32) -> Registration {
+        self.register(&mut lock_cancel_table(&self.cancels), address, round)
+    }
+
+    fn register(
+        &self,
+        cancels: &mut HashMap<JobAddress, LaunchedRound>,
+        address: &JobAddress,
+        round: u32,
+    ) -> Registration {
+        let cancel = CancellationToken::new();
+        cancels.insert(
+            address.clone(),
+            LaunchedRound {
                 round,
-                cancel,
-            }
-        })
+                cancel: cancel.clone(),
+            },
+        );
+        Registration {
+            cancels: Arc::clone(&self.cancels),
+            address: address.clone(),
+            round,
+            cancel,
+        }
     }
 
     /// Put a job in line behind every job already waiting.
@@ -205,12 +226,19 @@ impl JobQueue {
         let _ = self.pending.send(address);
     }
 
-    /// Cancel every running round and wait until each has its verdict. A
-    /// job still waiting for a slot stays queued in its log.
-    pub async fn stop_rounds_and_wait(&self) {
+    /// Launch nothing more: the dispatcher returns, a round still waiting to
+    /// start leaves its job queued in its log, and a launch in progress is
+    /// given up — its runner removing whatever it had created — and closed
+    /// as failed. Rounds already launched run on.
+    pub fn stop_launching(&self) {
         self.stopping.cancel();
+    }
+
+    /// Wait until no dispatched round is still launching. Call once the
+    /// dispatcher has returned, so it can dispatch no more.
+    pub async fn launches_settled(&self) {
         // Cannot fail: `self` holds the sender.
-        let _ = self.running.subscribe().wait_for(|n| *n == 0).await;
+        let _ = self.launching.subscribe().wait_for(|n| *n == 0).await;
     }
 }
 
@@ -268,31 +296,82 @@ pub async fn dispatch_until_stopped<R: Runner + Send + Sync + 'static>(
         let Some(registration) = queue.register_if_still_queued(&address) else {
             continue;
         };
-        let slot = Slot::taken(&queue.running);
-        let serving = Arc::clone(&serving);
-        tokio::spawn(async move {
-            let _slot = slot;
-            let (round, cancel) = (registration.round, registration.cancel.clone());
-            let _registration = registration;
-            if let Err(e) = run_queued_round(&serving, &address, round, cancel).await {
-                tracing::error!("job {} in {}: {e:#}", address.id, address.key);
+        let launching = Tally::counted_in(&queue.launching);
+        spawn_round(
+            &serving,
+            address,
+            registration,
+            RoundToRun::Queued(launching),
+        );
+    }
+}
+
+/// Collect round `round` of `address`'s job, which an earlier daemon on this
+/// root launched, as a round of this one's: in the cancel table and counted
+/// under the cap. It runs whatever the cap says — a round already running
+/// is not something the cap can prevent, only count.
+pub fn spawn_reattached<R: Runner + Send + Sync + 'static>(
+    serving: &Arc<Serving<R>>,
+    address: JobAddress,
+    round: u32,
+    handle: RoundHandle,
+) {
+    let registration = serving.queue.register_reattached(&address, round);
+    spawn_round(
+        serving,
+        address,
+        registration,
+        RoundToRun::Reattached(handle),
+    );
+}
+
+enum RoundToRun {
+    /// Counted in [`JobQueue::launching`] until it is launched.
+    Queued(Tally),
+    Reattached(RoundHandle),
+}
+
+/// Run a registered round in a task of its own, holding its place under the
+/// cap and its entry in the cancel table until the task is over.
+fn spawn_round<R: Runner + Send + Sync + 'static>(
+    serving: &Arc<Serving<R>>,
+    address: JobAddress,
+    registration: Registration,
+    to_run: RoundToRun,
+) {
+    let slot = Tally::counted_in(&serving.queue.running);
+    let serving = Arc::clone(serving);
+    tokio::spawn(async move {
+        let _slot = slot;
+        let (round, cancel) = (registration.round, registration.cancel.clone());
+        let _registration = registration;
+        let ran = match to_run {
+            RoundToRun::Queued(launching) => {
+                run_queued_round(&serving, &address, round, cancel, launching).await
             }
-        });
+            RoundToRun::Reattached(handle) => {
+                reattach_round(&serving, &address, round, &handle, cancel).await
+            }
+        };
+        if let Err(e) = ran {
+            tracing::error!("job {} in {}: {e:#}", address.id, address.key);
+        }
+    });
+}
+
+/// One entry in a count of rounds — running, or launching — taken back
+/// however the round's task ends, a panic included, or the daemon would
+/// wait on it forever.
+struct Tally(watch::Sender<usize>);
+
+impl Tally {
+    fn counted_in(count: &watch::Sender<usize>) -> Tally {
+        count.send_modify(|n| *n += 1);
+        Tally(count.clone())
     }
 }
 
-/// One running round's place under the cap, given back however the round
-/// ends — a panic included, or the daemon would wait on it forever.
-struct Slot(watch::Sender<usize>);
-
-impl Slot {
-    fn taken(running: &watch::Sender<usize>) -> Slot {
-        running.send_modify(|n| *n += 1);
-        Slot(running.clone())
-    }
-}
-
-impl Drop for Slot {
+impl Drop for Tally {
     fn drop(&mut self) {
         self.0.send_modify(|n| *n -= 1);
     }
@@ -305,11 +384,17 @@ impl Drop for Slot {
 /// cache, which a submit's fetch can hold for as long as the remote takes to
 /// answer — is not started. The daemon stopping leaves its job queued; a
 /// `cancel` closes it.
+///
+/// The daemon stopping mid-launch gives the launch up rather than leave a
+/// round running that no later daemon could find: until `RoundLaunched` is
+/// in the log there is no handle to find it by. `launching` is dropped once
+/// the launch has settled one way or the other.
 async fn run_queued_round<R: Runner>(
     serving: &Serving<R>,
     address: &JobAddress,
     round: u32,
     cancel: CancellationToken,
+    launching: Tally,
 ) -> anyhow::Result<()> {
     let report = address.report()?;
     let (Some(remote_url), Some(base), Some(prompt), Some(provider)) = (
@@ -322,12 +407,8 @@ async fn run_queued_round<R: Runner>(
     };
     let config = tokio::select! {
         biased;
-        () = cancel.cancelled() => {
-            return match serving.queue.stopping.is_cancelled() {
-                true => Ok(()),
-                false => Ok(address.record_cancelled_before_it_started()?),
-            };
-        }
+        () = cancel.cancelled() => return Ok(address.record_cancelled_before_it_started()?),
+        () = serving.queue.stopping.cancelled() => return Ok(()),
         config = config_in_cache(serving, &address.key, &base.sha) => config,
     };
     let paths = address.paths();
@@ -344,7 +425,7 @@ async fn run_queued_round<R: Runner>(
         }
     };
     let spec = LaunchSpec::for_round::<R>(
-        address.id,
+        &paths,
         round,
         &remote_url,
         &base,
@@ -352,16 +433,82 @@ async fn run_queued_round<R: Runner>(
         &provider,
         config.command_limit_secs(),
     );
-    match serving
-        .daemon
-        .runner
-        .launch(&spec, serving.daemon.secrets(), &cancel)
+    let launch_cancel = cancel.child_token();
+    let give_up_on_stopping = async {
+        serving.queue.stopping.cancelled().await;
+        launch_cancel.cancel();
+        std::future::pending::<Infallible>().await
+    };
+    let launched = tokio::select! {
+        launched = serving.daemon.runner.launch(&spec, serving.daemon.secrets(), &launch_cancel) => launched,
+        never = give_up_on_stopping => match never {},
+    };
+    let running = match (launched, serving.queue.stopping.is_cancelled()) {
+        (Ok(running), _) => running,
+        (Err(_), true) => {
+            return log
+                .append(EventKind::RoundFailed {
+                    reason: stopped_while_launching(address.id),
+                })
+                .map(|_| ())
+                .map_err(Into::into);
+        }
+        (Err(e), false) => return record_launch_failure(&mut log, &e).map(|_| ()),
+    };
+    if let Err(e) = log.append(EventKind::RoundLaunched {
+        handle: running.handle(),
+    }) {
+        // A round nobody could find again would run on uncollected.
+        cancel_and_wait_out(running).await;
+        return Err(e.into());
+    }
+    drop(launching);
+    collect(
+        running,
+        &mut log,
+        &paths.log(),
+        &paths.position(round),
+        cancel,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Why a round the daemon gave up launching as it stopped has failed.
+fn stopped_while_launching(job: JobId) -> String {
+    format!(
+        "the daemon stopped while this round was launching, so it was not started — \
+         `submit --job {job}` to try again"
+    )
+}
+
+/// Round `round`, launched by an earlier daemon and found again by
+/// `handle`, collected into its log from where that daemon left off.
+async fn reattach_round<R: Runner>(
+    serving: &Serving<R>,
+    address: &JobAddress,
+    round: u32,
+    handle: &RoundHandle,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    let paths = address.paths();
+    let mut log = EventLog::open_append(paths.events())?;
+    match serving.daemon.runner.reattach(handle).await {
+        Ok(running) => collect(
+            running,
+            &mut log,
+            &paths.log(),
+            &paths.position(round),
+            cancel,
+        )
         .await
-    {
-        Ok(running) => collect(running, &mut log, &paths.log(), cancel)
-            .await
-            .map(|_| ()),
-        Err(e) => record_launch_failure(&mut log, &e).map(|_| ()),
+        .map(|_| ()),
+        Err(e) => log
+            .append(EventKind::RoundFailed {
+                reason: format!("could not find the round again after a restart: {e:#}"),
+            })
+            .map(|_| ())
+            .map_err(Into::into),
     }
 }
 

@@ -1,7 +1,9 @@
 //! Running a round as a k8s Job, through the `kubectl` CLI.
 
 use super::child::ChildLines;
-use super::{JobSecrets, LaunchSpec, Runner, RunnerProblem, RunningRound, Termination};
+use super::{
+    JobSecrets, LaunchSpec, RoundHandle, Runner, RunnerProblem, RunningRound, Termination,
+};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -408,6 +410,25 @@ impl Runner for KubernetesRunner {
             }
         }
     }
+
+    /// Find the Job's pod — a finished one counts — and follow its log from
+    /// the beginning; the collector drops what it already has.
+    async fn reattach(&self, handle: &RoundHandle) -> anyhow::Result<KubernetesRound> {
+        let RoundHandle::Kubernetes { job } = handle else {
+            return Err(handle.launched_by_another_runner("k8s"));
+        };
+        let mut round = KubernetesRound::named(self.clone(), job.clone());
+        round.pod = match round.progress_despite_blips().await? {
+            // The handle was recorded once the pod had started, so no pod
+            // now is one deleted since, not one still to come.
+            PodProgress::Gone => anyhow::bail!("the Job {job} has no pod any more"),
+            PodProgress::Running { pod } | PodProgress::Finished { pod, .. } => pod,
+            PodProgress::Waiting { .. } => round.poll_until_started().await?,
+        };
+        round.stream = LogStream::Following(round.logs(true)?);
+        round.following_since = Some(std::time::Instant::now());
+        Ok(round)
+    }
 }
 
 /// Where a round's log is read from.
@@ -443,7 +464,7 @@ pub struct KubernetesRound {
 }
 
 impl KubernetesRound {
-    /// The handle for a Job not yet created.
+    /// The Job `name`'s round, before its pod is found or its log followed.
     fn named(runner: KubernetesRunner, name: String) -> Self {
         KubernetesRound {
             runner,
@@ -744,6 +765,12 @@ impl RunningRound for KubernetesRound {
             Ok(PodProgress::Running { .. }) => Termination::Killed {
                 reason: "the log stream ended while the pod was running".into(),
             },
+        }
+    }
+
+    fn handle(&self) -> RoundHandle {
+        RoundHandle::Kubernetes {
+            job: self.name.clone(),
         }
     }
 }

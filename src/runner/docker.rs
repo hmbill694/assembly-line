@@ -1,8 +1,11 @@
 //! Running a round in a container, through the `docker` CLI.
 
 use super::child::ChildLines;
-use super::{JobSecrets, LaunchSpec, Runner, RunnerProblem, RunningRound, Termination};
+use super::{
+    JobSecrets, LaunchSpec, RoundHandle, Runner, RunnerProblem, RunningRound, Termination,
+};
 use std::path::{Path, PathBuf};
+use std::process::{Output, Stdio};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
@@ -27,20 +30,20 @@ impl DockerRunner {
     }
 }
 
-/// `docker run`'s arguments. Only *names* of environment variables appear:
-/// `-e NAME` takes the value from the client's environment, so no secret is
-/// ever visible on a command line.
+/// `docker create`'s arguments. Only *names* of environment variables
+/// appear: `-e NAME` takes the value from the client's environment, so no
+/// secret is ever visible on a command line.
 ///
 /// No `--rm`: a container that exits non-zero is inspected first, to learn
 /// whether it was OOM-killed, and removed afterwards.
 #[must_use]
-pub fn docker_run_args(
+pub fn docker_create_args(
     image: &str,
     container: &str,
     env_names: &[&str],
     args: &[String],
 ) -> Vec<String> {
-    ["run", "--name", container]
+    ["create", "--name", container]
         .into_iter()
         .map(String::from)
         .chain(
@@ -75,32 +78,21 @@ impl Runner for DockerRunner {
         }
     }
 
-    /// Spawning the client does not wait on it, so the launch is ready at
-    /// once, with nothing for `cancel` to interrupt.
-    fn launch(
+    /// Create the container, then start it, then follow its log. `docker
+    /// create` pulls the image first, which can take minutes; a cancel
+    /// meanwhile abandons the client and removes whatever it had created, so
+    /// no container is left to start on its own later.
+    async fn launch(
         &self,
         spec: &LaunchSpec,
         secrets: &JobSecrets,
-        _cancel: &CancellationToken,
-    ) -> impl Future<Output = anyhow::Result<DockerRound>> + Send {
-        std::future::ready(self.spawn_docker_run(spec, secrets))
-    }
-}
-
-impl DockerRunner {
-    /// `docker run` as a child of this process, carrying `secrets` in its
-    /// environment.
-    fn spawn_docker_run(
-        &self,
-        spec: &LaunchSpec,
-        secrets: &JobSecrets,
+        cancel: &CancellationToken,
     ) -> anyhow::Result<DockerRound> {
         let names = secrets.names();
         let env_names: Vec<&str> = names.iter().map(String::as_str).collect();
-
-        let mut command = Command::new(&self.program);
-        command
-            .args(docker_run_args(
+        let mut create = self.docker();
+        create
+            .args(docker_create_args(
                 &self.image,
                 &spec.name,
                 &env_names,
@@ -108,13 +100,79 @@ impl DockerRunner {
             ))
             .envs(secrets.vars());
 
-        ChildLines::spawn(command).map(|lines| DockerRound {
-            lines,
-            container: spec.name.clone(),
-            program: self.program.clone(),
-            stopping: None,
+        let created = tokio::select! {
+            created = succeeded(create) => created,
+            () = cancel.cancelled() => {
+                remove_container(&self.program, &spec.name).await;
+                anyhow::bail!("cancelled before the container started");
+            }
+        };
+        let mut start = self.docker();
+        start.args(["start", &spec.name]);
+        let started = match created {
+            Ok(_) => succeeded(start).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = started {
+            remove_container(&self.program, &spec.name).await;
+            return Err(e);
+        }
+        DockerRound::following(self.program.clone(), spec.name.clone())
+    }
+
+    /// Another `docker logs -f`, which replays the container's log from its
+    /// start; the collector drops what it already has.
+    fn reattach(
+        &self,
+        handle: &RoundHandle,
+    ) -> impl Future<Output = anyhow::Result<DockerRound>> + Send {
+        std::future::ready(match handle {
+            RoundHandle::Docker { container } => {
+                DockerRound::following(self.program.clone(), container.clone())
+            }
+            other => Err(other.launched_by_another_runner("docker")),
         })
     }
+}
+
+impl DockerRunner {
+    /// `docker`, killed if the future driving it is dropped.
+    fn docker(&self) -> Command {
+        let mut command = Command::new(&self.program);
+        command.stdin(Stdio::null()).kill_on_drop(true);
+        command
+    }
+}
+
+/// `command`'s output, or an error carrying its stderr when it fails.
+async fn succeeded(mut command: Command) -> anyhow::Result<Output> {
+    let out = command.output().await.map_err(|e| {
+        anyhow::anyhow!(
+            "spawning `{}`: {e}",
+            command.as_std().get_program().display()
+        )
+    })?;
+    anyhow::ensure!(
+        out.status.success(),
+        "`docker {}` failed: {}",
+        command
+            .as_std()
+            .get_args()
+            .next()
+            .map(|verb| verb.to_string_lossy())
+            .unwrap_or_default(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(out)
+}
+
+/// Remove the container, running or not. Nothing to remove is not a failure
+/// worth reporting, so the result is ignored.
+async fn remove_container(program: &Path, container: &str) {
+    let _ = Command::new(program)
+        .args(["rm", "-f", container])
+        .output()
+        .await;
 }
 
 #[derive(Debug)]
@@ -127,13 +185,28 @@ pub struct DockerRound {
 }
 
 impl DockerRound {
-    /// Remove the container, running or not. Nothing to remove is not a
-    /// failure worth reporting, so the result is ignored.
-    async fn remove_container(program: &Path, container: &str) {
-        let _ = Command::new(program)
-            .args(["rm", "-f", container])
-            .output()
-            .await;
+    /// `docker logs -f` on `container`, from the start of its log.
+    fn following(program: PathBuf, container: String) -> anyhow::Result<DockerRound> {
+        let mut logs = Command::new(&program);
+        logs.args(["logs", "-f", &container]);
+        ChildLines::spawn(logs).map(|lines| DockerRound {
+            lines,
+            container,
+            program,
+            stopping: None,
+        })
+    }
+
+    /// The container's exit code, once it has exited, from `docker wait`.
+    async fn exit_code(program: &Path, container: &str) -> Result<i32, String> {
+        let mut wait = Command::new(program);
+        wait.args(["wait", container]);
+        let out = succeeded(wait).await.map_err(|e| format!("{e:#}"))?;
+        let printed = String::from_utf8_lossy(&out.stdout);
+        printed
+            .trim()
+            .parse()
+            .map_err(|_| format!("`docker wait` printed no exit code: {printed}"))
     }
 
     /// Whether the kernel killed the container for exceeding its memory.
@@ -151,29 +224,21 @@ impl RunningRound for DockerRound {
         self.lines.next_line().await
     }
 
-    /// Killing the `docker` client does not stop the container; `docker
-    /// stop` does, and the client exits with it. SIGTERM first, as the other
-    /// runners send it, so `run` can stop its agent, keep the work and
-    /// report the round; SIGKILL only once `STOP_GRACE_SECS` have passed.
+    /// `docker stop` sends SIGTERM first, as the other runners do, so `run`
+    /// can stop its agent, keep the work and report the round; SIGKILL only
+    /// once `STOP_GRACE_SECS` have passed.
     ///
     /// `docker stop` is started, not waited on: it returns only once the
-    /// container has exited, and a container still printing as it winds down
-    /// blocks on a full pipe unless its output keeps being read — which the
-    /// caller can only do once this returns. It is reaped, and the container
-    /// removed, at [`RunningRound::termination`].
-    ///
-    /// A cancel that arrives before the container exists — the image still
-    /// pulling — finds nothing to stop and is lost. Ctrl-C, the only cancel
-    /// today, also reaches the `docker run` client in the foreground process
-    /// group and aborts it; a daemon's cancel (F3) will need the container
-    /// created in `launch`, before this can be called.
+    /// container has exited, and the caller keeps reading the container's
+    /// log meanwhile, which it can only do once this returns. It is reaped,
+    /// and the container removed, at [`RunningRound::termination`].
     async fn cancel(&mut self) {
         self.stopping = Command::new(&self.program)
             // `-t`: its long form was `--time`, now `--timeout`, and only
             // the short flag is spelled the same in every docker release.
             .args(["stop", "-t", &STOP_GRACE_SECS.to_string(), &self.container])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .ok();
     }
@@ -185,19 +250,26 @@ impl RunningRound for DockerRound {
             program,
             stopping,
         } = self;
-        let exit_code = lines.exit_code().await;
+        lines.exit_code().await;
         if let Some(mut stop) = stopping {
             let _ = stop.wait().await;
         }
-        let termination = match exit_code {
-            code if code != 0 && DockerRound::was_oom_killed(&program, &container).await => {
+        let termination = match DockerRound::exit_code(&program, &container).await {
+            Err(reason) => Termination::Killed { reason },
+            Ok(code) if code != 0 && DockerRound::was_oom_killed(&program, &container).await => {
                 Termination::Killed {
                     reason: "out of memory".into(),
                 }
             }
-            code => Termination::Exited(code),
+            Ok(code) => Termination::Exited(code),
         };
-        DockerRound::remove_container(&program, &container).await;
+        remove_container(&program, &container).await;
         termination
+    }
+
+    fn handle(&self) -> RoundHandle {
+        RoundHandle::Docker {
+            container: self.container.clone(),
+        }
     }
 }
