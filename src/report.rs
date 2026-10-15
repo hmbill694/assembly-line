@@ -236,23 +236,40 @@ impl JobReport {
             .map(|d| format!("took {:.1}s", d.as_secs_f64()))
     }
 
-    /// Everything `status` prints: the summary, how long the last round
-    /// took once it has ended, and the branch and its pull request once
-    /// there are any.
+    /// What `run` prints once its job is over: the summary, how long the
+    /// round took, and the branch and its pull request once there are any.
+    #[must_use]
+    pub fn to_conclusion_lines(&self) -> Vec<String> {
+        std::iter::once(self.to_summary_line())
+            .chain(self.to_duration_line())
+            .chain(self.work_location_lines())
+            .collect()
+    }
+
+    /// Everything `status` prints: the conclusion's lines with the job's id
+    /// before its branch, and the command that prints its output once a
+    /// round has started — the collector creates the output log before it
+    /// records any event. `run` keeps no state for `logs` to read, which is
+    /// why the two differ.
     #[must_use]
     pub fn to_status_lines(&self) -> Vec<String> {
         std::iter::once(self.to_summary_line())
             .chain(self.to_duration_line())
-            .chain(
-                self.branch
-                    .as_ref()
-                    .map(|branch| format!("branch: {branch}")),
-            )
-            .chain(
-                self.pull_request
-                    .as_ref()
-                    .map(|url| format!("pull request: {url}")),
-            )
+            .chain(std::iter::once(format!("id: {}", self.id)))
+            .chain(self.work_location_lines())
+            .chain((self.rounds > 0).then(|| format!("logs: assembly logs {}", self.id)))
             .collect()
+    }
+
+    fn work_location_lines(&self) -> impl Iterator<Item = String> {
+        let branch = self
+            .branch
+            .as_ref()
+            .map(|branch| format!("branch: {branch}"));
+        let pull_request = self
+            .pull_request
+            .as_ref()
+            .map(|url| format!("pull request: {url}"));
+        branch.into_iter().chain(pull_request)
     }
 }

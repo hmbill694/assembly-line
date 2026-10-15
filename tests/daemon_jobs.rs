@@ -177,7 +177,9 @@ async fn a_submitted_job_is_queued_then_run_by_the_daemon() {
     fx.assembly().arg("status").assert().success().stdout(
         contains("job 1: passed (round 1")
             .and(contains("took"))
-            .and(contains("branch: al/job-1")),
+            .and(contains("id: 1\n"))
+            .and(contains("branch: al/job-1"))
+            .and(contains("logs: assembly logs 1\n")),
     );
     fx.assembly()
         .args(["logs", "1"])

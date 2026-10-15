@@ -122,7 +122,7 @@ impl JobConclusion {
         self.base_differs
             .iter()
             .map(|differs| format!("note: {differs}"))
-            .chain(self.report.to_status_lines())
+            .chain(self.report.to_conclusion_lines())
             .collect()
     }
 }

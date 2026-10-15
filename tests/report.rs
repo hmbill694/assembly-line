@@ -130,7 +130,7 @@ fn a_queued_revise_does_not_wear_the_previous_rounds_failure() {
 
     assert_eq!(
         JobReport::from_events(1, &events).to_status_lines(),
-        ["job 1: queued (round 1)"]
+        ["job 1: queued (round 1)", "id: 1", "logs: assembly logs 1"]
     );
 }
 
@@ -424,7 +424,7 @@ fn a_job_reports_the_pull_request_it_opened() {
 }
 
 #[test]
-fn status_of_a_finished_job_names_its_timing_and_branch() {
+fn status_of_a_finished_job_names_its_timing_id_branch_and_logs_command() {
     let events = timeline(vec![
         (0, EventKind::RoundStarted { round: 1 }),
         (1, committed(1, 1, 0)),
@@ -443,16 +443,42 @@ fn status_of_a_finished_job_names_its_timing_and_branch() {
         [
             "job 4: passed (round 1, 1 file +1/-0)",
             "took 3.0s",
+            "id: 4",
             "branch: al/job-4",
+            "logs: assembly logs 4",
         ]
     );
 }
 
 #[test]
-fn status_of_an_untouched_job_is_its_summary_alone() {
+fn status_of_a_job_whose_first_round_has_not_started_names_no_logs_command() {
     assert_eq!(
         JobReport::from_events(1, &[]).to_status_lines(),
-        ["job 1: pending"]
+        ["job 1: pending", "id: 1"]
+    );
+    assert_eq!(
+        JobReport::from_events(1, &timeline(vec![(0, requested("x", "a1"))])).to_status_lines(),
+        ["job 1: queued", "id: 1"]
+    );
+}
+
+#[test]
+fn a_conclusion_names_no_logs_command() {
+    let events = timeline(vec![
+        (0, EventKind::RoundStarted { round: 1 }),
+        (
+            1,
+            EventKind::BranchPushed {
+                branch: "al/job-4".into(),
+                pushed_to: "origin".into(),
+            },
+        ),
+        (3, EventKind::RoundPassed),
+    ]);
+
+    assert_eq!(
+        JobReport::from_events(4, &events).to_conclusion_lines(),
+        ["job 4: passed (round 1)", "took 3.0s", "branch: al/job-4"]
     );
 }
 
