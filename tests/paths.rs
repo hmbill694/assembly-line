@@ -1,9 +1,9 @@
 use assembly_line::job::JobId;
 use assembly_line::paths::{
-    JobMeta, create_job, git_root, job_id_past, jobs_root, latest_job_id, next_job_id, open_job,
-    read_meta, write_meta,
+    RepoKey, create_job, git_root, job_id_past, latest_job_id, open_job, state_root,
 };
 use std::fs;
+use std::path::{Path, PathBuf};
 
 #[test]
 fn finds_the_git_root_by_walking_up() {
@@ -24,54 +24,17 @@ fn returns_none_outside_a_repo() {
 }
 
 #[test]
-fn allocates_monotonic_job_ids() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = jobs_root(tmp.path());
-
-    assert_eq!(next_job_id(&root, &[]).unwrap(), JobId::from(1));
-    assert_eq!(latest_job_id(&root).unwrap(), None);
-
-    create_job(&root, JobId::from(1)).unwrap();
-    assert_eq!(next_job_id(&root, &[]).unwrap(), JobId::from(2));
-    assert_eq!(latest_job_id(&root).unwrap(), Some(JobId::from(1)));
-
-    create_job(&root, JobId::from(2)).unwrap();
-    assert_eq!(next_job_id(&root, &[]).unwrap(), JobId::from(3));
-    assert_eq!(latest_job_id(&root).unwrap(), Some(JobId::from(2)));
-}
-
-#[test]
-fn ignores_non_numeric_directories_when_allocating() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = jobs_root(tmp.path());
-    fs::create_dir_all(root.join("scratch")).unwrap();
-    create_job(&root, JobId::from(7)).unwrap();
-    assert_eq!(next_job_id(&root, &[]).unwrap(), JobId::from(8));
-}
-
-/// Job branches are shared on the remote, so a fresh clone — or a deleted
-/// `.assembly/jobs` — must not restart at 1 and collide with them.
-#[test]
-fn a_new_job_id_is_past_the_remotes_job_branches_too() {
+fn a_new_job_id_is_past_the_remotes_job_branches() {
     let remote = ["al/job-4".to_string(), "al/job-12".to_string()];
-    assert_eq!(job_id_past([], &remote), Some(JobId::from(13)));
-    assert_eq!(
-        job_id_past([JobId::from(20)], &remote),
-        Some(JobId::from(21))
-    );
-    assert_eq!(job_id_past([], &[]), Some(JobId::from(1)));
+    assert_eq!(job_id_past(&remote), Some(JobId::from(13)));
+    assert_eq!(job_id_past(&[]), Some(JobId::from(1)));
 }
 
 /// Anyone who can push can make a branch at the very last id; that is a
 /// refusal to allocate, not an overflow.
 #[test]
 fn a_branch_at_the_last_id_leaves_none_to_allocate() {
-    let tmp = tempfile::tempdir().unwrap();
-    let last = [format!("al/job-{}", u64::MAX)];
-
-    assert_eq!(job_id_past([], &last), None);
-    let err = next_job_id(&jobs_root(tmp.path()), &last).unwrap_err();
-    assert!(err.to_string().contains(&last[0]), "{err}");
+    assert_eq!(job_id_past(&[JobId::from(u64::MAX).branch_name()]), None);
 }
 
 #[test]
@@ -81,83 +44,169 @@ fn branches_that_are_not_a_jobs_are_ignored_when_allocating() {
         "al/job-x".to_string(),
         "al/jobs-9".to_string(),
         "feature/al/job-50".to_string(),
+        "al/job-2".to_string(),
     ];
-    assert_eq!(job_id_past([JobId::from(2)], &remote), Some(JobId::from(3)));
+    assert_eq!(job_id_past(&remote), Some(JobId::from(3)));
 }
 
 #[test]
-fn the_jobs_directory_and_the_remote_together_decide_the_next_id() {
+fn the_latest_job_is_the_highest_job_directory() {
     let tmp = tempfile::tempdir().unwrap();
-    let root = jobs_root(tmp.path());
-    create_job(&root, JobId::from(3)).unwrap();
+    let jobs = tmp.path().join("jobs");
+    assert_eq!(latest_job_id(&jobs).unwrap(), None);
 
-    assert_eq!(
-        next_job_id(&root, &["al/job-5".to_string()]).unwrap(),
-        JobId::from(6)
-    );
-    assert_eq!(
-        next_job_id(&root, &["al/job-1".to_string()]).unwrap(),
-        JobId::from(4)
-    );
+    create_job(&jobs, JobId::from(1)).unwrap();
+    create_job(&jobs, JobId::from(2)).unwrap();
+    assert_eq!(latest_job_id(&jobs).unwrap(), Some(JobId::from(2)));
+}
+
+#[test]
+fn the_latest_job_ignores_directories_that_are_not_a_jobs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let jobs = tmp.path().join("jobs");
+    create_job(&jobs, JobId::from(7)).unwrap();
+    fs::create_dir_all(jobs.join("notes")).unwrap();
+
+    assert_eq!(latest_job_id(&jobs).unwrap(), Some(JobId::from(7)));
 }
 
 #[test]
 fn create_job_lays_out_the_directory() {
     let tmp = tempfile::tempdir().unwrap();
-    let root = jobs_root(tmp.path());
-    let p = create_job(&root, JobId::from(42)).unwrap();
+    let jobs = tmp.path().join("jobs");
+    let p = create_job(&jobs, JobId::from(42)).unwrap();
 
     assert_eq!(p.id, JobId::from(42));
-    assert_eq!(p.dir, root.join("42"));
+    assert_eq!(p.dir, jobs.join("42"));
     assert!(p.dir.is_dir());
     assert_eq!(p.events(), p.dir.join("events.jsonl"));
-    assert_eq!(p.meta(), p.dir.join("meta.json"));
     assert_eq!(p.log(), p.dir.join("job.log"), "one job, one log");
 
-    assert_eq!(open_job(&root, JobId::from(42)).unwrap().dir, p.dir);
+    assert_eq!(open_job(&jobs, JobId::from(42)).unwrap().dir, p.dir);
+}
+
+#[test]
+fn a_job_directory_that_exists_is_not_created_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let jobs = tmp.path().join("jobs");
+    create_job(&jobs, JobId::from(1)).unwrap();
+
+    let err = create_job(&jobs, JobId::from(1)).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
 }
 
 #[test]
 fn open_job_fails_for_a_missing_job() {
     let tmp = tempfile::tempdir().unwrap();
-    assert!(open_job(&jobs_root(tmp.path()), JobId::from(99)).is_err());
+    assert!(open_job(&tmp.path().join("jobs"), JobId::from(99)).is_err());
+}
+
+fn key(url: &str) -> String {
+    RepoKey::from_remote_url(url).unwrap().to_string()
 }
 
 #[test]
-fn meta_round_trips() {
-    let tmp = tempfile::tempdir().unwrap();
-    let p = create_job(&jobs_root(tmp.path()), JobId::from(1)).unwrap();
-    write_meta(
-        &p,
-        &JobMeta {
-            repo: "/work/acme".into(),
-            base_ref: "main".into(),
-            prompt: "add authentication".into(),
-            provider: "claude".into(),
-        },
-    )
-    .unwrap();
-
-    let back = read_meta(&p).unwrap();
-    assert_eq!(back.repo, std::path::PathBuf::from("/work/acme"));
-    assert_eq!(back.base_ref, "main");
-    assert_eq!(back.prompt, "add authentication");
-    assert_eq!(back.provider, "claude");
+fn a_hosted_repository_is_keyed_by_host_owner_and_name() {
+    assert_eq!(key("https://github.com/o/r.git"), "github.com/o/r");
+    assert_eq!(key("https://github.com/o/r"), "github.com/o/r");
+    assert_eq!(key("https://github.com/o/r/"), "github.com/o/r");
 }
 
-/// `revise` needs the prompt and the ref by id alone, which is exactly why
-/// they live here rather than only in the event log.
+/// Review focus 2: one repository, spelled two ways, is one set of jobs.
 #[test]
-fn meta_written_by_an_older_version_still_loads() {
-    let tmp = tempfile::tempdir().unwrap();
-    let job = create_job(&jobs_root(tmp.path()), JobId::from(1)).unwrap();
-    fs::write(
-        job.meta(),
-        r#"{"repo":"/work/acme","base_ref":"main","prompt":"go","provider":"claude","branch":"al/job-1"}"#,
-    )
-    .unwrap();
+fn ssh_and_https_spellings_of_one_repository_share_a_key() {
+    for url in [
+        "git@github.com:o/r.git",
+        "ssh://git@github.com/o/r.git",
+        "ssh://git@github.com:22/o/r.git",
+        "https://GitHub.com/o/r.git",
+    ] {
+        assert_eq!(key(url), "github.com/o/r", "{url}");
+    }
+}
 
-    let meta = read_meta(&job).unwrap();
-    assert_eq!(meta.prompt, "go");
-    assert_eq!(meta.base_ref, "main");
+#[test]
+fn a_repository_on_this_machine_is_keyed_under_local() {
+    assert_eq!(key("/srv/git/origin.git"), "local/srv/git/origin");
+    assert_eq!(key("file:///srv/git/origin.git"), "local/srv/git/origin");
+}
+
+#[test]
+fn a_url_that_cannot_name_a_directory_is_refused_by_name() {
+    for url in [
+        "../origin",
+        "https://github.com/o/../r",
+        "https://github.com/o/r r",
+        "",
+    ] {
+        let err = RepoKey::from_remote_url(url).unwrap_err();
+        assert!(err.to_string().contains(url), "{url}: {err}");
+    }
+}
+
+#[test]
+fn a_keys_jobs_and_cache_live_under_the_root() {
+    let key = RepoKey::from_remote_url("git@github.com:o/r.git").unwrap();
+
+    assert_eq!(
+        key.jobs_dir(Path::new("/state")),
+        PathBuf::from("/state/jobs/github.com/o/r")
+    );
+    assert_eq!(
+        key.repo_cache(Path::new("/state")),
+        PathBuf::from("/state/repos/github.com/o/r.git")
+    );
+}
+
+fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+    let pairs: Vec<(String, String)> = pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+    move |name| {
+        pairs
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+    }
+}
+
+#[test]
+fn a_named_root_wins_over_the_environment() {
+    let root = state_root(Some("/named".into()), env_of(&[("HOME", "/home/u")])).unwrap();
+    assert_eq!(root, PathBuf::from("/named"));
+}
+
+#[test]
+fn the_default_root_follows_xdg_then_home() {
+    assert_eq!(
+        state_root(
+            None,
+            env_of(&[("XDG_STATE_HOME", "/xdg"), ("HOME", "/home/u")])
+        )
+        .unwrap(),
+        PathBuf::from("/xdg/assembly-line")
+    );
+    assert_eq!(
+        state_root(None, env_of(&[("HOME", "/home/u")])).unwrap(),
+        PathBuf::from("/home/u/.local/state/assembly-line")
+    );
+}
+
+#[test]
+fn a_relative_xdg_state_home_is_ignored() {
+    assert_eq!(
+        state_root(
+            None,
+            env_of(&[("XDG_STATE_HOME", "state"), ("HOME", "/home/u")])
+        )
+        .unwrap(),
+        PathBuf::from("/home/u/.local/state/assembly-line")
+    );
+}
+
+#[test]
+fn with_no_home_the_root_must_be_named() {
+    let err = state_root(None, env_of(&[])).unwrap_err();
+    assert!(err.to_string().contains("--root"), "{err}");
 }

@@ -132,6 +132,14 @@ pub async fn sha_at_ref(repo: impl AsRef<Path>, git_ref: &str) -> anyhow::Result
     .await
 }
 
+/// Whether `repo` has `sha` as a commit.
+pub async fn has_commit(repo: impl AsRef<Path>, sha: &str) -> anyhow::Result<bool> {
+    let spec = format!("{sha}^{{commit}}");
+    Ok(run_allowing_failure(repo, &["cat-file", "-e", &spec])
+        .await?
+        .succeeded())
+}
+
 /// One file's contents as of `git_ref`, or `None` when that ref does not carry
 /// it.
 ///
@@ -157,6 +165,59 @@ pub async fn file_at_ref(
             .stdout_verbatim_or_error(&format!("show {spec}"))
             .map(Some),
     }
+}
+
+/// A bare repository at `path`, made if nothing is there yet — the daemon's
+/// cache for one remote, which never has a working tree.
+pub async fn init_bare_if_absent(path: &Path) -> anyhow::Result<()> {
+    if path.join("HEAD").exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(path)?;
+    run_expecting_success(path, &["init", "--bare", "--quiet"], "init --bare")
+        .await
+        .map(|_| ())
+}
+
+/// The commit `git_ref` names on `remote`, asked without fetching anything
+/// into `repo` — or `None` when the remote has no such ref.
+///
+/// `ls-remote` matches a pattern against the tail of every ref, so
+/// `x/main` would answer for `main`. The ref is resolved the way a fetch of
+/// it is instead — as a full name, then under `refs/`, then as a tag, then
+/// a branch — and an annotated tag is peeled to its commit.
+pub async fn sha_on_remote(
+    repo: impl AsRef<Path>,
+    remote: &str,
+    git_ref: &str,
+) -> anyhow::Result<Option<String>> {
+    let peeled_pattern = format!("{git_ref}^{{}}");
+    let listed = run_expecting_success(
+        repo,
+        &["ls-remote", remote, git_ref, &peeled_pattern],
+        "ls-remote",
+    )
+    .await?;
+    // "<sha>\t<ref>" per line; an annotated tag's commit on a line of its
+    // own, named "<tag>^{}".
+    let refs: Vec<(&str, &str)> = listed
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .collect();
+    let sha_named = |name: &str| {
+        refs.iter()
+            .find(|(_, listed)| *listed == name)
+            .map(|(sha, _)| (*sha).to_string())
+    };
+    let candidates = [
+        git_ref.to_string(),
+        format!("refs/{git_ref}"),
+        format!("refs/tags/{git_ref}"),
+        format!("refs/heads/{git_ref}"),
+    ];
+    Ok(candidates.iter().find_map(|candidate| {
+        sha_named(&format!("{candidate}^{{}}")).or_else(|| sha_named(candidate))
+    }))
 }
 
 /// A ref name and the commit it named when the job was planned.
@@ -432,7 +493,7 @@ pub async fn current_branch(repo: impl AsRef<Path>) -> anyhow::Result<Option<Str
 ///
 /// `HEAD`, not the local `branch`: the agent is free to check out another
 /// branch, and what gets pushed must be the commit everything before the push
-/// inspected — the seeded-file check and the recorded sha both read `HEAD`.
+/// inspected — the recorded sha reads `HEAD`.
 ///
 /// Deliberately without `--set-upstream`: that would write `branch.*.remote`
 /// into the repository's config. A later round pushes the same branch name
@@ -461,125 +522,102 @@ pub async fn push_head_as(
     .map(|_| ())
 }
 
-/// Commit everything except `never_commit`, which stay on disk for the agent
-/// to read but are kept out of every commit since `since`.
+/// Create `branch` on `remote` at `sha`, only if `remote` has no such branch.
+/// `false` means somebody already has it.
 ///
-/// Staging is controlled directly rather than through `info/exclude` or a
-/// `.gitignore`: both are files in the scratch clone, which the agent is free
-/// to rewrite, so an ignore rule there is only as good as the agent's
-/// restraint. Unstaging each path depends on nothing the agent can edit, and
-/// the check afterwards sees the commits a push would send. Together they
-/// keep the paths out of history by accident; they cannot stop an agent
-/// copying their contents into some other file, or pushing them itself.
-///
-/// # Errors
-///
-/// Beyond the usual git failures, an error if a commit since `since` touched
-/// a `never_commit` path — meaning the agent committed it itself, even if a
-/// later commit removed it again.
-pub async fn commit_all_except(
-    clone: impl AsRef<Path>,
-    message: &str,
-    never_commit: &[String],
-    since: &str,
-) -> anyhow::Result<Option<String>> {
+/// Neither the exit code nor the lease decides this alone. A push of the
+/// commit a branch already points at exits 0 as "up to date", lease or not,
+/// so only the porcelain line's `*` (a new branch) counts as created. The
+/// lease — `--force-with-lease=<ref>:`, expecting no such ref — stops the
+/// push fast-forwarding a branch that sits at an ancestor of `sha`. And a
+/// push that lost its race on the remote itself, after both sides saw the
+/// ref absent, reports "reference already exists" rather than a lost lease.
+/// No hooks run, as for [`push_head_as`].
+pub async fn create_branch_if_absent(
+    repo: impl AsRef<Path>,
+    remote: &str,
+    sha: &str,
+    branch: &str,
+) -> anyhow::Result<bool> {
+    let target = format!("refs/heads/{branch}");
+    let lease = format!("--force-with-lease={target}:");
+    let refspec = format!("{sha}:{target}");
+    let pushed = run_allowing_failure(
+        repo,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "push",
+            "--porcelain",
+            &lease,
+            remote,
+            &refspec,
+        ],
+    )
+    .await?;
+    // "<flag>\t<from>:<to>\t<summary>" per ref.
+    let flag_and_summary = pushed.stdout.lines().find_map(|line| {
+        let mut fields = line.split('\t');
+        let (flag, refs, summary) = (fields.next()?, fields.next()?, fields.next()?);
+        refs.strip_suffix(target.as_str())?
+            .ends_with(':')
+            .then_some((flag, summary))
+    });
+    match flag_and_summary {
+        Some(("*", _)) => Ok(true),
+        Some(("=", _)) => Ok(false),
+        Some(("!", summary))
+            if summary.starts_with("[rejected]")
+                || summary.ends_with("(reference already exists)") =>
+        {
+            Ok(false)
+        }
+        refused => Err(anyhow::anyhow!(
+            "creating {branch} on '{remote}' failed (exit {}): {}",
+            pushed.exit_code,
+            [
+                refused.map_or("", |(_, summary)| summary),
+                pushed.stderr.trim()
+            ]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+        )),
+    }
+}
+
+/// Stage everything in `clone` and commit it, returning the new commit, or
+/// `None` when there was nothing to commit.
+pub async fn commit_all(clone: impl AsRef<Path>, message: &str) -> anyhow::Result<Option<String>> {
     let clone = clone.as_ref();
     run_expecting_success(clone, &["add", "-A"], "add -A").await?;
-
-    // `run_allowing_failure`: unstaging a path that was never staged is a
-    // no-op worth ignoring, not an error.
-    for path in never_commit {
-        run_allowing_failure(clone, &["reset", "--quiet", "--", path]).await?;
-    }
 
     let nothing_staged = run_allowing_failure(clone, &["diff", "--cached", "--quiet"])
         .await?
         .succeeded();
-    let committed = if nothing_staged {
-        None
-    } else {
-        run_expecting_success(clone, &["commit", "--no-verify", "-m", message], "commit").await?;
-        Some(head_sha(clone).await?)
-    };
-
-    // Whether or not anything was left to commit: the agent may have
-    // committed a seeded file itself and left the tree clean.
-    ensure_never_committed_since(clone, since, never_commit).await?;
-    Ok(committed)
+    if nothing_staged {
+        return Ok(None);
+    }
+    run_expecting_success(clone, &["commit", "--no-verify", "-m", message], "commit").await?;
+    head_sha(clone).await.map(Some)
 }
 
 /// Whether `HEAD` carries any commit that `since` does not — work the round
 /// made, whoever committed it.
 pub async fn head_is_ahead_of(repo: impl AsRef<Path>, since: &str) -> anyhow::Result<bool> {
-    let range = format!("{since}..HEAD");
-    let count = run_expecting_success(repo, &["rev-list", "--count", &range], "rev-list").await?;
-    Ok(count != "0")
+    commit_is_ahead_of(repo, "HEAD", since).await
 }
 
-/// Unstaging covers the commit assembly-line makes; this catches the agent
-/// committing a seeded file itself, in any commit since `since` — one that a
-/// later commit deleted again still carries it to the remote. Fatal, because
-/// a failed round is far better than a leaked credential on a branch bound for
-/// a remote.
-///
-/// Plumbing, not `git log`: the clone's config is the agent's to write, and
-/// `log.*` settings change what a log shows — `log.diffMerges=off` hides a
-/// merge's diff, `log.showRoot=false` a root commit's. `--no-replace-objects`,
-/// because a replace ref changes what the clone shows for a commit but not
-/// what a push sends. Each commit is diffed on its own, `-m` against every
-/// parent and `--root` against nothing, so a merge or a root commit that
-/// introduces the file names it.
-async fn ensure_never_committed_since(
-    clone: &Path,
+/// Whether `commit` carries any commit that `since` does not.
+pub async fn commit_is_ahead_of(
+    repo: impl AsRef<Path>,
+    commit: &str,
     since: &str,
-    never_commit: &[String],
-) -> anyhow::Result<()> {
-    if never_commit.is_empty() {
-        return Ok(());
-    }
-
-    let range = format!("{since}..HEAD");
-    let commits = run_expecting_success(
-        clone,
-        &["--no-replace-objects", "rev-list", &range],
-        "rev-list",
-    )
-    .await?;
-
-    // A loop: each commit is one `git` call, and the first that touched a
-    // seeded path ends the check.
-    for commit in commits.lines() {
-        let args: Vec<&str> = [
-            "--no-replace-objects",
-            "diff-tree",
-            "-m",
-            "-r",
-            "--root",
-            "--name-only",
-            "--no-commit-id",
-            commit,
-            "--",
-        ]
-        .into_iter()
-        .chain(never_commit.iter().map(String::as_str))
-        .collect();
-        let touched: std::collections::BTreeSet<String> =
-            run_expecting_success(clone, &args, "diff-tree")
-                .await?
-                .lines()
-                .filter(|line| !line.is_empty())
-                .map(String::from)
-                .collect();
-
-        if !touched.is_empty() {
-            return Err(anyhow::anyhow!(
-                "refusing to continue: commit {commit} carries seeded file(s) the agent \
-                 committed: {}",
-                touched.into_iter().collect::<Vec<_>>().join(", ")
-            ));
-        }
-    }
-    Ok(())
+) -> anyhow::Result<bool> {
+    let range = format!("{since}..{commit}");
+    let count = run_expecting_success(repo, &["rev-list", "--count", &range], "rev-list").await?;
+    Ok(count != "0")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

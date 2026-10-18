@@ -10,10 +10,6 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Where a repository declares its factory settings.
-///
-/// Until a later milestone moves job state out of the repository entirely,
-/// a repository that commits this file must also ignore `.assembly/jobs/`
-/// itself — nothing else does that for it.
 pub const REPO_CONFIG_PATH: &str = ".assembly/config.toml";
 
 /// A setting that makes a repository unrunnable as it stands.
@@ -22,6 +18,7 @@ pub enum ConfigError {
     UnknownProvider(String),
     NoProviderDeclared,
     UnparseableMaxDuration(String),
+    CopyRetired,
 }
 
 impl std::fmt::Display for ConfigError {
@@ -38,6 +35,12 @@ impl std::fmt::Display for ConfigError {
             Self::UnparseableMaxDuration(value) => {
                 write!(f, "max_duration '{value}' is not a duration like \"20m\"")
             }
+            Self::CopyRetired => write!(
+                f,
+                "`copy` is no longer supported — commit the file to the repository, or supply \
+                 a secret as an environment variable: a local round inherits yours, a \
+                 container round takes it with --pass-env"
+            ),
         }
     }
 }
@@ -82,9 +85,10 @@ pub struct RepoConfig {
     /// makes it to `verify` can take up to 2x this long end to end, not just
     /// this long.
     pub max_duration: Option<String>,
-    /// Untracked files a job's checkout needs — `.env`, local settings.
-    #[serde(default)]
-    pub copy: Vec<String>,
+    /// `copy`, no longer supported. Parsed only so that a config still
+    /// declaring it hears what to do instead, rather than just "unknown field".
+    #[serde(default, rename = "copy")]
+    pub retired_copy: Option<toml::Value>,
     #[serde(default)]
     pub providers: BTreeMap<String, Provider>,
     #[serde(default)]
@@ -136,6 +140,11 @@ impl RepoConfig {
         undeclared
             .into_iter()
             .chain(self.unparseable_max_duration())
+            .chain(
+                self.retired_copy
+                    .is_some()
+                    .then_some(ConfigError::CopyRetired),
+            )
             .collect()
     }
 
@@ -144,6 +153,15 @@ impl RepoConfig {
         parse_duration(value)
             .is_err()
             .then(|| ConfigError::UnparseableMaxDuration(value.to_string()))
+    }
+
+    /// `max_duration` in whole seconds, when it is set and parses.
+    #[must_use]
+    pub fn command_limit_secs(&self) -> Option<u64> {
+        self.max_duration
+            .as_deref()
+            .and_then(|value| parse_duration(value).ok())
+            .map(|limit| limit.as_secs())
     }
 
     /// Settings worth telling the user about, none of which stop a job.

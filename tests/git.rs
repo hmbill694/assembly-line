@@ -1,6 +1,6 @@
 use assembly_line::git::{
-    self, DiffStat, check_out_new_branch, clone_into, commit_all_except, commit_as_assembly_line,
-    diff_stat_against, head_sha,
+    self, DiffStat, check_out_new_branch, clone_into, commit_as_assembly_line, diff_stat_against,
+    head_sha,
 };
 use std::path::{Path, PathBuf};
 use support::commit_all;
@@ -48,8 +48,8 @@ impl Fixture {
 }
 
 /// Clone `source` into a fresh directory under `into`, and check `branch` out
-/// at `at`. The same two calls `workspace::create` makes to build a job's
-/// scratch checkout.
+/// at `at`. The same two steps `run` takes to build a job's scratch
+/// checkout.
 async fn clone_checked_out(
     source: &Path,
     into: &Path,
@@ -117,265 +117,6 @@ async fn diff_stat_of_an_unchanged_clone_is_empty() {
 }
 
 #[tokio::test]
-async fn seeded_files_stay_on_disk_but_out_of_the_commit() {
-    let fx = Fixture::new().await;
-    let node = fx.clone_on_branch("secret", "al/job-3").await;
-
-    std::fs::write(node.join(".env"), "API_KEY=hunter2\n").unwrap();
-    std::fs::write(node.join("code.txt"), "real work\n").unwrap();
-
-    commit_all_except(&node, "work", &[".env".to_string()], &fx.base().await)
-        .await
-        .unwrap()
-        .expect("a commit");
-
-    let tracked = git::run_allowing_failure(&node, &["ls-files"])
-        .await
-        .unwrap()
-        .stdout;
-    assert!(tracked.contains("code.txt"), "{tracked}");
-    assert!(
-        !tracked.contains(".env"),
-        "the seeded secret was committed: {tracked}"
-    );
-    assert!(
-        node.join(".env").is_file(),
-        "the agent still needs to be able to read it"
-    );
-}
-
-#[tokio::test]
-async fn a_commit_containing_only_seeded_files_is_no_commit_at_all() {
-    let fx = Fixture::new().await;
-    let node = fx.clone_on_branch("only-secret", "al/job-4").await;
-
-    std::fs::write(node.join(".env"), "API_KEY=hunter2\n").unwrap();
-
-    assert!(
-        commit_all_except(&node, "work", &[".env".to_string()], &fx.base().await)
-            .await
-            .unwrap()
-            .is_none(),
-        "excluding the only change should leave nothing to commit"
-    );
-}
-
-/// Unstaging protects the commits assembly-line makes. If the agent committed
-/// the secret itself, that has to fail loudly rather than reach a remote.
-#[tokio::test]
-async fn a_secret_committed_by_the_agent_fails_the_round() {
-    let fx = Fixture::new().await;
-    let node = fx.clone_on_branch("agent-commit", "al/job-5").await;
-
-    std::fs::write(node.join(".env"), "API_KEY=hunter2\n").unwrap();
-    git::run_allowing_failure(&node, &["add", "-A"])
-        .await
-        .unwrap();
-    git::run_allowing_failure(&node, &["commit", "--no-verify", "-m", "agent commit"])
-        .await
-        .unwrap();
-
-    std::fs::write(node.join("more.txt"), "later work\n").unwrap();
-    let err = commit_all_except(&node, "work", &[".env".to_string()], &fx.base().await)
-        .await
-        .unwrap_err()
-        .to_string();
-
-    assert!(err.contains(".env"), "{err}");
-}
-
-/// A secret the agent committed and then untracked again is no longer in the
-/// index, but it is still in history — which is what reaches the remote.
-#[tokio::test]
-async fn a_secret_the_agent_committed_and_then_removed_still_fails_the_round() {
-    let fx = Fixture::new().await;
-    let node = fx.clone_on_branch("agent-hides", "al/job-6").await;
-
-    std::fs::write(node.join(".env"), "API_KEY=hunter2\n").unwrap();
-    for args in [
-        ["add", ".env"].as_slice(),
-        &["commit", "--no-verify", "-m", "leak"],
-        &["rm", "--cached", "--quiet", ".env"],
-        &["commit", "--no-verify", "-m", "hide"],
-    ] {
-        git::run_allowing_failure(&node, args).await.unwrap();
-    }
-
-    std::fs::write(node.join("more.txt"), "later work\n").unwrap();
-    let err = commit_all_except(&node, "work", &[".env".to_string()], &fx.base().await)
-        .await
-        .unwrap_err()
-        .to_string();
-
-    assert!(err.contains(".env"), "{err}");
-}
-
-/// A side branch that adds the secret and deletes it again changes nothing
-/// about the path once merged — but the merge carries the side branch's
-/// commits, secret included, to the remote.
-#[tokio::test]
-async fn a_secret_committed_on_a_merged_side_branch_still_fails_the_round() {
-    let fx = Fixture::new().await;
-    let node = fx.clone_on_branch("agent-merges", "al/job-7").await;
-
-    std::fs::write(node.join(".env"), "API_KEY=hunter2\n").unwrap();
-    std::fs::write(node.join("mainline.txt"), "mainline work\n").unwrap();
-    for args in [
-        ["checkout", "--quiet", "-b", "side"].as_slice(),
-        &["add", ".env"],
-        &["commit", "--no-verify", "-m", "leak"],
-        &["rm", "--cached", "--quiet", ".env"],
-        &["commit", "--no-verify", "-m", "hide"],
-        &["checkout", "--quiet", "al/job-7"],
-        &["add", "mainline.txt"],
-        &["commit", "--no-verify", "-m", "mainline"],
-        &["merge", "--no-ff", "-m", "merge", "side"],
-    ] {
-        git::run_allowing_failure(&node, args).await.unwrap();
-    }
-
-    std::fs::write(node.join("more.txt"), "later work\n").unwrap();
-    let err = commit_all_except(&node, "work", &[".env".to_string()], &fx.base().await)
-        .await
-        .unwrap_err()
-        .to_string();
-
-    assert!(err.contains(".env"), "{err}");
-}
-
-/// A merge commit can introduce a file neither parent has, and a log shows no
-/// diff for a merge unless asked to.
-#[tokio::test]
-async fn a_secret_introduced_by_a_merge_commit_itself_fails_the_round() {
-    let fx = Fixture::new().await;
-    let node = fx.clone_on_branch("agent-evil-merge", "al/job-8").await;
-
-    std::fs::write(node.join("side.txt"), "side work\n").unwrap();
-    for args in [
-        ["checkout", "--quiet", "-b", "side"].as_slice(),
-        &["add", "side.txt"],
-        &["commit", "--no-verify", "-m", "side"],
-        &["checkout", "--quiet", "al/job-8"],
-        &["merge", "--quiet", "--no-ff", "--no-commit", "side"],
-    ] {
-        git::run_allowing_failure(&node, args).await.unwrap();
-    }
-    std::fs::write(node.join(".env"), "API_KEY=hunter2\n").unwrap();
-    for args in [
-        ["add", ".env"].as_slice(),
-        &["commit", "--no-verify", "-m", "merge"],
-    ] {
-        git::run_allowing_failure(&node, args).await.unwrap();
-    }
-
-    std::fs::write(node.join("more.txt"), "later work\n").unwrap();
-    let err = commit_all_except(&node, "work", &[".env".to_string()], &fx.base().await)
-        .await
-        .unwrap_err()
-        .to_string();
-
-    assert!(err.contains(".env"), "{err}");
-}
-
-/// A replace ref changes what the clone shows for a commit, not what a push
-/// sends — so a leaking commit dressed up as a clean one still leaks.
-#[tokio::test]
-async fn a_secret_behind_a_replace_ref_still_fails_the_round() {
-    let fx = Fixture::new().await;
-    let base = fx.base().await;
-    let node = fx.clone_on_branch("agent-replaces", "al/job-9").await;
-
-    std::fs::write(node.join(".env"), "API_KEY=hunter2\n").unwrap();
-    for args in [
-        ["add", ".env"].as_slice(),
-        &["commit", "--no-verify", "-m", "leak"],
-        &["rm", "--cached", "--quiet", ".env"],
-        &["commit", "--no-verify", "-m", "hide"],
-    ] {
-        git::run_allowing_failure(&node, args).await.unwrap();
-    }
-    let disguise = git::run_allowing_failure(
-        &node,
-        &["commit-tree", "-p", &base, "-m", "leak", "HEAD^{tree}"],
-    )
-    .await
-    .unwrap();
-    assert!(disguise.succeeded(), "{}", disguise.stderr);
-    git::run_allowing_failure(&node, &["replace", "HEAD~1", disguise.stdout.trim()])
-        .await
-        .unwrap();
-
-    let err = commit_all_except(&node, "work", &[".env".to_string()], &base)
-        .await
-        .unwrap_err()
-        .to_string();
-
-    assert!(err.contains(".env"), "{err}");
-}
-
-/// The clone's config is the agent's to write, and `log.diffMerges=off`
-/// would hide a merge that adds the secret and another that removes it.
-#[tokio::test]
-async fn a_secret_merged_in_and_out_under_the_agents_config_still_fails_the_round() {
-    let fx = Fixture::new().await;
-    let node = fx.clone_on_branch("agent-configures", "al/job-10").await;
-
-    for args in [
-        ["config", "log.diffMerges", "off"].as_slice(),
-        &["checkout", "--quiet", "-b", "in"],
-        &["commit", "--no-verify", "--allow-empty", "-m", "in"],
-        &["checkout", "--quiet", "-b", "out"],
-        &["commit", "--no-verify", "--allow-empty", "-m", "out"],
-        &["checkout", "--quiet", "al/job-10"],
-        &["merge", "--quiet", "--no-ff", "--no-commit", "in"],
-    ] {
-        git::run_allowing_failure(&node, args).await.unwrap();
-    }
-    std::fs::write(node.join(".env"), "API_KEY=hunter2\n").unwrap();
-    for args in [
-        ["add", ".env"].as_slice(),
-        &["commit", "--no-verify", "-m", "merge in"],
-        &["merge", "--quiet", "--no-ff", "--no-commit", "out"],
-        &["rm", "--cached", "--quiet", ".env"],
-        &["commit", "--no-verify", "-m", "merge out"],
-    ] {
-        git::run_allowing_failure(&node, args).await.unwrap();
-    }
-
-    let err = commit_all_except(&node, "work", &[".env".to_string()], &fx.base().await)
-        .await
-        .unwrap_err()
-        .to_string();
-
-    assert!(err.contains(".env"), "{err}");
-}
-
-/// A root commit has no parent to differ from, and `log.showRoot=false` would
-/// show it as touching nothing.
-#[tokio::test]
-async fn a_secret_in_an_orphan_root_commit_still_fails_the_round() {
-    let fx = Fixture::new().await;
-    let node = fx.clone_on_branch("agent-orphans", "al/job-11").await;
-
-    std::fs::write(node.join(".env"), "API_KEY=hunter2\n").unwrap();
-    for args in [
-        ["config", "log.showRoot", "false"].as_slice(),
-        &["checkout", "--quiet", "--orphan", "rootless"],
-        &["add", ".env"],
-        &["commit", "--no-verify", "-m", "root"],
-    ] {
-        git::run_allowing_failure(&node, args).await.unwrap();
-    }
-
-    let err = commit_all_except(&node, "work", &[".env".to_string()], &fx.base().await)
-        .await
-        .unwrap_err()
-        .to_string();
-
-    assert!(err.contains(".env"), "{err}");
-}
-
-#[tokio::test]
 async fn a_failed_git_command_carries_gits_own_message() {
     let fx = Fixture::new().await;
 
@@ -412,7 +153,7 @@ async fn remote_carries(origin: &Path, branch: &str) -> bool {
 
 /// A push happens from a job's own clone, not from the repository it was cut
 /// from — so this pushes from a clone of `origin`, exactly as
-/// `workspace::create` builds one.
+/// `run` builds one.
 #[tokio::test]
 async fn pushing_a_branch_puts_it_on_the_remote() {
     let fx = Fixture::new().await;
@@ -453,6 +194,84 @@ async fn pushing_a_branch_again_after_another_commit_fast_forwards() {
         .await
         .unwrap();
     assert_eq!(on_remote.stdout.trim(), second);
+}
+
+/// Pushing the commit a branch already points at exits 0 as "up to date",
+/// lease or not — which must still read as taken.
+#[tokio::test]
+async fn a_branch_already_at_the_commit_is_not_created_again() {
+    let fx = Fixture::new().await;
+    let _origin = fx.with_origin().await;
+    let base = fx.base().await;
+
+    assert!(
+        git::create_branch_if_absent(&fx.repo, "origin", &base, "al/job-1")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !git::create_branch_if_absent(&fx.repo, "origin", &base, "al/job-1")
+            .await
+            .unwrap()
+    );
+}
+
+/// A plain push would fast-forward a branch sitting at an ancestor — taking
+/// over somebody else's job.
+#[tokio::test]
+async fn a_branch_at_an_ancestor_is_taken_not_fast_forwarded() {
+    let fx = Fixture::new().await;
+    let origin = fx.with_origin().await;
+    let ancestor = fx.base().await;
+    git::push_head_as(&fx.repo, "origin", "al/job-1")
+        .await
+        .unwrap();
+    let descendant = write_and_commit(&fx.repo, "more.txt", "more\n", "more").await;
+
+    assert!(
+        !git::create_branch_if_absent(&fx.repo, "origin", &descendant, "al/job-1")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        git::sha_at_ref(&origin, "al/job-1").await.unwrap(),
+        ancestor
+    );
+}
+
+/// Pushes that all saw the branch absent lose on the remote itself, which
+/// reports "reference already exists" rather than a lost lease.
+#[tokio::test]
+async fn of_pushes_racing_to_create_one_branch_exactly_one_creates_it() {
+    let fx = Fixture::new().await;
+    let _origin = fx.with_origin().await;
+    let base = fx.base().await;
+
+    let pushes: Vec<_> = (0..12)
+        .map(|_| {
+            let (repo, base) = (fx.repo.clone(), base.clone());
+            tokio::spawn(async move {
+                git::create_branch_if_absent(&repo, "origin", &base, "al/job-1").await
+            })
+        })
+        .collect();
+    let mut created = 0;
+    for push in pushes {
+        created += usize::from(push.await.unwrap().unwrap());
+    }
+
+    assert_eq!(created, 1);
+}
+
+#[tokio::test]
+async fn creating_a_branch_on_a_missing_remote_is_an_error() {
+    let fx = Fixture::new().await;
+    let base = fx.base().await;
+
+    let err = git::create_branch_if_absent(&fx.repo, "origin", &base, "al/job-1")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("al/job-1"), "{err}");
 }
 
 #[tokio::test]
@@ -645,6 +464,72 @@ async fn a_ref_the_remote_does_not_have_cannot_be_pinned() {
         .unwrap_err();
     assert!(err.to_string().contains("never-pushed"), "{err}");
     assert!(err.to_string().contains("push it first"), "{err}");
+}
+
+/// The daemon's cache: pinning into a bare repository fetches the ref's
+/// commit there, and a second init leaves what was fetched alone.
+#[tokio::test]
+async fn a_bare_cache_is_made_once_and_can_pin_a_ref() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let origin = tmp.path().join("origin.git");
+    support::init_git_repo(&repo).await;
+    support::add_origin(&repo, &origin).await;
+    support::publish_main(&repo).await;
+    let cache = tmp.path().join("cache/r.git");
+
+    git::init_bare_if_absent(&cache).await.unwrap();
+    let pinned = git::pinned(&cache, origin.to_str().unwrap(), "main")
+        .await
+        .unwrap();
+    git::init_bare_if_absent(&cache).await.unwrap();
+
+    assert_eq!(pinned.sha, head_sha(&repo).await.unwrap());
+    assert!(git::has_commit(&cache, &pinned.sha).await.unwrap());
+}
+
+/// Asked without fetching, and by the ref's own name: a branch whose name
+/// merely ends in it is not it, and a tag is the commit it tags.
+#[tokio::test]
+async fn a_refs_commit_on_the_remote_is_read_without_fetching() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    support::init_git_repo(&repo).await;
+    support::add_origin(&repo, &tmp.path().join("origin.git")).await;
+    support::publish_main(&repo).await;
+    let published = head_sha(&repo).await.unwrap();
+    std::fs::write(repo.join("other.txt"), "other\n").unwrap();
+    commit_all(&repo, "elsewhere").await.unwrap().unwrap();
+    git::push_head_as(&repo, "origin", "feature/main")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        git::sha_on_remote(&repo, "origin", "main").await.unwrap(),
+        Some(published.clone())
+    );
+    let tagged =
+        git::run_allowing_failure(&repo, &["tag", "-a", "v1", "-m", "a release", &published])
+            .await
+            .unwrap();
+    assert!(tagged.succeeded(), "{}", tagged.stderr);
+    git::run_allowing_failure(&repo, &["push", "--quiet", "origin", "v1"])
+        .await
+        .unwrap();
+    for spelling in ["v1", "tags/v1", "refs/tags/v1"] {
+        assert_eq!(
+            git::sha_on_remote(&repo, "origin", spelling).await.unwrap(),
+            Some(published.clone()),
+            "an annotated tag spelled {spelling} is its commit, not the tag object"
+        );
+    }
+    assert_eq!(
+        git::sha_on_remote(&repo, "origin", "never-pushed")
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(!repo.join(".git/FETCH_HEAD").exists());
 }
 
 /// Pushing cannot fix a remote that does not answer, so a fetch that failed

@@ -1,14 +1,18 @@
 use assembly_line::cli::{Cli, Command, RunnerArgs, RunnerKind};
-use assembly_line::frame::FrameWriter;
-use assembly_line::lifecycle::{self, Note, Prepared, Refusal, RevisionRequest, StartRequest};
-use assembly_line::payload::RoundPayload;
-use assembly_line::round::{Verdict, run_round};
+use assembly_line::daemon::api::{CancelRequest, Cancelling, Queued};
+use assembly_line::daemon::client::{DaemonClient, Reply};
+use assembly_line::daemon::{self, Daemon};
+use assembly_line::frame::{FrameWriter, ReadableFrames};
+use assembly_line::round::Verdict;
+use assembly_line::run::{self, RunRefused, RunRequest};
 use assembly_line::runner::docker::DockerRunner;
 use assembly_line::runner::kubernetes::KubernetesRunner;
 use assembly_line::runner::local::LocalRunner;
 use assembly_line::runner::{self, Runner};
+use assembly_line::submission::{self, SubmitRequest};
+use assembly_line::{locate, paths};
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use tokio_util::sync::CancellationToken;
 
@@ -20,44 +24,74 @@ const EXIT_ROUND_FAILED: u8 = 1;
 fn main() -> ExitCode {
     install_tracing();
 
-    match Cli::parse().command {
-        Command::Run {
-            prompt,
-            prompt_file,
-            repo,
-            base_ref,
-            provider,
-            runner,
-        } => in_async_runtime(run_work_on_chosen_runner(
-            runner,
-            Work::Start(StartRequest {
+    let cli = Cli::parse();
+    let root = paths::state_root(cli.root, |name| std::env::var(name).ok());
+    // `run` keeps no state, so a round inside a container with no `$HOME`
+    // still runs.
+    match (cli.command, root) {
+        (
+            Command::Run {
+                prompt,
+                prompt_file,
+                repo,
+                base_ref,
+                job,
+                provider,
+                frames,
+                provision_toolchain,
+            },
+            _,
+        ) => in_async_runtime(run_whole_job(
+            RunRequest {
+                repo,
+                base_ref,
+                job,
+                prompt,
+                prompt_file,
+                provider,
+                provision_toolchain,
+            },
+            frames,
+        )),
+        (_, Err(e)) => fail_with_usage_error(e),
+        (
+            Command::Submit {
                 prompt,
                 prompt_file,
                 repo,
                 base_ref,
                 provider,
-            }),
-        )),
-        Command::Revise {
-            job_id,
-            feedback,
-            repo,
-            runner,
-        } => in_async_runtime(run_work_on_chosen_runner(
-            runner,
-            Work::Revise(RevisionRequest {
-                job_id,
-                feedback,
+                job,
+            },
+            Ok(root),
+        ) => in_async_runtime(submit_to_daemon(
+            &root,
+            SubmitRequest {
+                prompt,
+                prompt_file,
                 repo,
-            }),
+                base_ref,
+                provider,
+                job,
+            },
         )),
-        Command::Status { job_id, repo } => print_job_status(job_id, repo),
-        Command::Logs {
-            job_id,
-            follow,
-            repo,
-        } => print_job_log(job_id, follow, repo),
-        Command::JobExec => in_async_runtime(execute_payload_from_environment()),
+        (Command::Daemon { runner, max_jobs }, Ok(root)) => {
+            in_async_runtime(serve_daemon_on_chosen_runner(&runner, root, max_jobs))
+        }
+        (Command::Status { job_id, repo }, Ok(root)) => {
+            in_async_runtime(print_job_status(&root, job_id, repo))
+        }
+        (
+            Command::Logs {
+                job_id,
+                follow,
+                repo,
+            },
+            Ok(root),
+        ) => in_async_runtime(print_job_log(&root, job_id, follow, repo)),
+        (Command::Cancel { job_id, repo }, Ok(root)) => {
+            in_async_runtime(cancel_with_daemon(&root, job_id, repo))
+        }
     }
 }
 
@@ -73,122 +107,216 @@ fn install_tracing() {
         .init();
 }
 
-/// `job-exec`: read the payload, run the round, report it on stdout.
-///
-/// The exit code mirrors the round, but the collector decides from the
+/// `run`: prepare, announce, run, conclude. With frames, stdout carries them
+/// and everything a person reads goes to stderr; without, a person reads
+/// stdout. The exit code mirrors the job, but a collector decides from the
 /// frames — the code only matters when the frames never said.
-async fn execute_payload_from_environment() -> Result<ExitCode, String> {
-    let payload = RoundPayload::from_environment().map_err(|e| e.to_string())?;
-
-    let frames = FrameWriter::new(std::io::stdout());
+async fn run_whole_job(request: RunRequest, as_frames: bool) -> Result<ExitCode, String> {
     let cancel = CancellationToken::new();
-    cancel_on_termination_signal(cancel.clone());
-
-    run_round(&payload, &frames, &std::env::temp_dir(), cancel)
+    cancel_on_termination_signal(cancel.clone()).map_err(|e| format!("handling SIGTERM: {e}"))?;
+    let ready = run::prepare_run(request, &std::env::temp_dir(), &cancel)
         .await
-        .map(exit_code_for)
-        .map_err(|e| e.to_string())
+        .map_err(|refused| report_run_refusal(&refused))?;
+
+    let conclusion = if as_frames {
+        eprintln!("{}", ready.to_announcement_line());
+        ready
+            .run(&FrameWriter::new(std::io::stdout()), cancel)
+            .await
+    } else {
+        println!("{}", ready.to_announcement_line());
+        ready
+            .run(
+                &FrameWriter::new(ReadableFrames::new(std::io::stdout())),
+                cancel,
+            )
+            .await
+    }
+    .map_err(|e| e.to_string())?;
+
+    let lines = conclusion.to_lines();
+    match as_frames {
+        true => lines.iter().for_each(|line| eprintln!("{line}")),
+        false => lines.iter().for_each(|line| println!("{line}")),
+    }
+    Ok(exit_code_for(conclusion.verdict))
+}
+
+fn report_run_refusal(refused: &RunRefused) -> String {
+    refused
+        .itemized_reasons()
+        .iter()
+        .for_each(|reason| eprintln!("error: {reason}"));
+    refused.to_string()
 }
 
 /// SIGTERM is how the local runner cancels, SIGINT is Ctrl-C reaching the
 /// whole foreground process group, and SIGHUP is the terminal closing — which
 /// the agent, leading a session of its own, never hears. Any of them cancels
 /// the round, which then still reports itself.
-fn cancel_on_termination_signal(cancel: CancellationToken) {
-    use tokio::signal::unix::{SignalKind, signal};
-
+fn cancel_on_termination_signal(cancel: CancellationToken) -> std::io::Result<()> {
+    use tokio::signal::unix::SignalKind;
+    let requested = any_signal_of([
+        SignalKind::terminate(),
+        SignalKind::interrupt(),
+        SignalKind::hangup(),
+    ])?;
     tokio::spawn(async move {
-        let (Ok(mut terminate), Ok(mut hangup)) = (
-            signal(SignalKind::terminate()),
-            signal(SignalKind::hangup()),
-        ) else {
-            return;
-        };
-        tokio::select! {
-            _ = terminate.recv() => {}
-            _ = hangup.recv() => {}
-            _ = tokio::signal::ctrl_c() => {}
-        }
+        requested.await;
         cancel.cancel();
     });
+    Ok(())
 }
 
-/// What `run` and `revise` do, independent of where the round runs.
-enum Work {
-    Start(StartRequest),
-    Revise(RevisionRequest),
+/// The runner `RunnerArgs` chose, built.
+enum ChosenRunner {
+    Local(LocalRunner),
+    Docker(DockerRunner),
+    K8s(KubernetesRunner),
 }
 
 /// The one place flags become a concrete runner; everything after it is
 /// generic over [`Runner`].
-async fn run_work_on_chosen_runner(args: RunnerArgs, work: Work) -> Result<ExitCode, String> {
+fn chosen_runner(args: &RunnerArgs) -> Result<ChosenRunner, String> {
     if let Some(inapplicable) = args.inapplicable_flags() {
         return Err(inapplicable.to_string());
     }
+    let image = || args.image.clone().unwrap_or_else(runner::published_image);
     match args.runner {
-        RunnerKind::Local => {
-            run_work(
-                &LocalRunner::current_binary().map_err(|e| e.to_string())?,
-                &[],
-                work,
-            )
-            .await
-        }
-        RunnerKind::Docker => {
-            let image = args.image.unwrap_or_else(runner::published_image);
-            run_work(&DockerRunner::new(image), &args.pass_env, work).await
-        }
-        RunnerKind::K8s => {
-            let image = args.image.unwrap_or_else(runner::published_image);
-            // clap has already required a namespace for k8s, so the default
-            // is never taken.
-            let namespace = args.namespace.unwrap_or_default();
-            run_work(
-                &KubernetesRunner::new(image, namespace, args.context),
-                &args.pass_env,
-                work,
-            )
-            .await
-        }
+        RunnerKind::Local => LocalRunner::current_binary()
+            .map(ChosenRunner::Local)
+            .map_err(|e| e.to_string()),
+        RunnerKind::Docker => Ok(ChosenRunner::Docker(DockerRunner::new(image()))),
+        // clap has already required a namespace for k8s, so the default is
+        // never taken.
+        RunnerKind::K8s => Ok(ChosenRunner::K8s(KubernetesRunner::new(
+            image(),
+            args.namespace.clone().unwrap_or_default(),
+            args.context.clone(),
+        ))),
     }
 }
 
-async fn run_work<R: Runner>(
-    runner: &R,
-    pass_env: &[String],
-    work: Work,
+async fn serve_daemon_on_chosen_runner(
+    args: &RunnerArgs,
+    root: PathBuf,
+    max_jobs: usize,
 ) -> Result<ExitCode, String> {
-    let Prepared { notes, round } = match work {
-        Work::Start(request) => lifecycle::prepare_start(runner, pass_env, request).await,
-        Work::Revise(request) => lifecycle::prepare_revision(runner, pass_env, request).await,
-    };
-    notes.iter().for_each(|note| match note {
-        Note::LocalRefDiffers { .. } => println!("{note}"),
-        Note::ConfigWarning(_) => eprintln!("{note}"),
-    });
-
-    let ready = round.map_err(|refusal| report_refusal(&refusal))?;
-    if let Some(announcement) = ready.to_announcement_line() {
-        println!("{announcement}");
+    match chosen_runner(args)? {
+        ChosenRunner::Local(runner) => serve_daemon(root, runner, max_jobs, &args.pass_env).await,
+        ChosenRunner::Docker(runner) => serve_daemon(root, runner, max_jobs, &args.pass_env).await,
+        ChosenRunner::K8s(runner) => serve_daemon(root, runner, max_jobs, &args.pass_env).await,
     }
+}
 
-    let conclusion = lifecycle::run(ready, cancel_on_ctrl_c())
+/// Hold the root, check the runner, and serve until SIGTERM or Ctrl-C.
+async fn serve_daemon<R: Runner + Send + Sync + 'static>(
+    root: PathBuf,
+    runner: R,
+    max_jobs: usize,
+    pass_env: &[String],
+) -> Result<ExitCode, String> {
+    let lock = daemon::root::hold_root(&root).map_err(|e| e.to_string())?;
+    let daemon = Daemon::prepare(root, runner, max_jobs, pass_env, |name| {
+        std::env::var(name).ok()
+    })
+    .await
+    .map_err(|problems| {
+        problems
+            .iter()
+            .for_each(|problem| eprintln!("error: {problem}"));
+        "the daemon's runner cannot run".to_string()
+    })?;
+    let shutdown = termination_requested().map_err(|e| format!("handling SIGTERM: {e}"))?;
+    eprintln!(
+        "listening on {}",
+        daemon::root::socket_path(&daemon.root).display()
+    );
+    daemon::serve(daemon, lock, shutdown)
+        .await
+        .map(|()| ExitCode::SUCCESS)
+        .map_err(|e| e.to_string())
+}
+
+/// Resolves on SIGTERM or Ctrl-C.
+fn termination_requested() -> std::io::Result<impl Future<Output = ()> + Send + 'static> {
+    use tokio::signal::unix::SignalKind;
+    any_signal_of([SignalKind::terminate(), SignalKind::interrupt()])
+}
+
+/// Resolves when any of `kinds` arrives. Every handler is installed before
+/// this returns, not when the future is first polled: until then each of
+/// these signals still has its default action, which kills the process
+/// before it can clean up or report.
+fn any_signal_of(
+    kinds: impl IntoIterator<Item = tokio::signal::unix::SignalKind>,
+) -> std::io::Result<impl Future<Output = ()> + Send + 'static> {
+    let mut signals = kinds
+        .into_iter()
+        .map(tokio::signal::unix::signal)
+        .collect::<std::io::Result<Vec<_>>>()?;
+    Ok(std::future::poll_fn(move |cx| {
+        match signals.iter_mut().any(|s| s.poll_recv(cx).is_ready()) {
+            true => std::task::Poll::Ready(()),
+            false => std::task::Poll::Pending,
+        }
+    }))
+}
+
+/// `submit`: resolve, post to the daemon, report what it said.
+async fn submit_to_daemon(root: &Path, request: SubmitRequest) -> Result<ExitCode, String> {
+    let prepared = submission::prepare_submission(request)
         .await
         .map_err(|e| e.to_string())?;
-    conclusion
-        .to_lines()
-        .iter()
-        .for_each(|line| println!("{line}"));
-    Ok(exit_code_for(conclusion.verdict))
+    prepared.notes.iter().for_each(|note| println!("{note}"));
+    match DaemonClient::for_root(root)
+        .post_json::<_, Queued>("/jobs", &prepared.submission)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        Reply::Accepted(queued) => {
+            queued
+                .warnings
+                .iter()
+                .for_each(|warning| eprintln!("warn: {warning}"));
+            println!("{queued}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Reply::Refused(refused) => {
+            refused
+                .reasons
+                .iter()
+                .for_each(|reason| eprintln!("error: {reason}"));
+            Err(refused.summary)
+        }
+    }
 }
 
-/// Every reason on its own line; the refusal itself becomes the usage error.
-fn report_refusal(refusal: &Refusal) -> String {
-    refusal
-        .itemized_reasons()
-        .iter()
-        .for_each(|reason| eprintln!("error: {reason}"));
-    refusal.to_string()
+async fn cancel_with_daemon(
+    root: &Path,
+    job_id: u64,
+    repo: Option<String>,
+) -> Result<ExitCode, String> {
+    let remote_url = locate::remote_url_named_or_enclosing(repo)
+        .await
+        .map_err(|e| e.to_string())?;
+    match DaemonClient::for_root(root)
+        .post_json::<_, Cancelling>(
+            "/cancel",
+            &CancelRequest {
+                remote_url,
+                job: job_id,
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        Reply::Accepted(cancelling) => {
+            println!("{cancelling}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Reply::Refused(refused) => Err(refused.summary),
+    }
 }
 
 /// Where every async command's usage error is reported, so none of them has to
@@ -208,19 +336,6 @@ fn fail_with_usage_error(message: impl std::fmt::Display) -> ExitCode {
     ExitCode::from(EXIT_USAGE)
 }
 
-/// A token that Ctrl-C cancels, for the round about to run.
-fn cancel_on_ctrl_c() -> CancellationToken {
-    let cancel = CancellationToken::new();
-    let on_interrupt = cancel.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            eprintln!("\ninterrupted — cancelling the running agent");
-            on_interrupt.cancel();
-        }
-    });
-    cancel
-}
-
 fn exit_code_for(verdict: Verdict) -> ExitCode {
     match verdict {
         Verdict::Failed => ExitCode::from(EXIT_ROUND_FAILED),
@@ -228,42 +343,45 @@ fn exit_code_for(verdict: Verdict) -> ExitCode {
     }
 }
 
-fn print_job_status(job_id: Option<u64>, repo: Option<PathBuf>) -> ExitCode {
-    match lifecycle::report_for_job(job_id, repo) {
-        Ok(report) => {
-            report
-                .to_status_lines()
-                .iter()
-                .for_each(|line| println!("{line}"));
-            ExitCode::SUCCESS
-        }
-        Err(e) => fail_with_usage_error(e),
-    }
+async fn print_job_status(
+    root: &Path,
+    job_id: Option<u64>,
+    repo: Option<String>,
+) -> Result<ExitCode, String> {
+    let report = locate::report_for_job(root, job_id, repo)
+        .await
+        .map_err(|e| e.to_string())?;
+    report
+        .to_status_lines()
+        .iter()
+        .for_each(|line| println!("{line}"));
+    Ok(ExitCode::SUCCESS)
 }
 
-fn print_job_log(job_id: u64, follow: bool, repo: Option<PathBuf>) -> ExitCode {
-    let path = match lifecycle::output_log_of(job_id, repo) {
-        Ok(path) => path,
-        Err(e) => return fail_with_usage_error(e),
-    };
+async fn print_job_log(
+    root: &Path,
+    job_id: u64,
+    follow: bool,
+    repo: Option<String>,
+) -> Result<ExitCode, String> {
+    let path = locate::output_log_of(root, job_id, repo)
+        .await
+        .map_err(|e| e.to_string())?;
 
     match follow {
         // Delegated to `tail` rather than reimplemented; a machine without it
         // gets the spawn error.
-        true => match std::process::Command::new("tail")
+        true => std::process::Command::new("tail")
             .arg("-f")
             .arg(&path)
             .status()
-        {
-            Ok(_) => ExitCode::SUCCESS,
-            Err(e) => fail_with_usage_error(e),
-        },
-        false => match std::fs::read_to_string(&path) {
-            Ok(body) => {
+            .map(|_| ExitCode::SUCCESS)
+            .map_err(|e| e.to_string()),
+        false => std::fs::read_to_string(&path)
+            .map(|body| {
                 print!("{body}");
                 ExitCode::SUCCESS
-            }
-            Err(e) => fail_with_usage_error(e),
-        },
+            })
+            .map_err(|e| e.to_string()),
     }
 }

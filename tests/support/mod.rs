@@ -5,24 +5,27 @@
 //! items only some of them use are expected to look unused here.
 #![allow(dead_code)]
 
+pub mod daemon;
+
+use assembly_line::claim;
 use assembly_line::config::RepoConfig;
-use assembly_line::event::{EventKind, EventLog};
+use assembly_line::event::EventKind;
+use assembly_line::frame::{FrameWriter, ReadableFrames};
 use assembly_line::git;
 use assembly_line::job::JobId;
-use assembly_line::lifecycle::{
-    self, Prepared, Refusal, RevisionRequest, StartRequest, prepare_revision, prepare_start,
-};
 use assembly_line::paths::{self, JobPaths};
-use assembly_line::payload::{RoundPayload, RoundRequest};
-use assembly_line::report::JobReport;
+use assembly_line::run::{RunRefused, RunRequest, prepare_run};
+use assembly_line::runner::LaunchSpec;
 use assembly_line::runner::local::LocalRunner;
 use assembly_line::state::JobState;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Output;
 use tokio_util::sync::CancellationToken;
 
-/// The job id of [`Harness::payload_for`] and [`Harness::job_paths`]. A job
-/// run through the lifecycle gets whatever id the lifecycle allocates.
+/// The job id of [`Harness::job_paths`]. A job run through
+/// [`Harness::run_job`] gets whatever id it claims.
 const THE_JOB: u64 = 1;
 
 /// Path to one of the fake-agent scripts under `tests/fixtures`.
@@ -73,7 +76,7 @@ pub fn config_running(script: &str) -> String {
 
 /// Stage everything in `repo` and commit it. `None` means the tree was clean.
 pub async fn commit_all(repo: &Path, message: &str) -> anyhow::Result<Option<String>> {
-    git::commit_all_except(repo, message, &[], "HEAD").await
+    git::commit_all(repo, message).await
 }
 
 /// Turn `at` into a git repository with one commit, so a job has somewhere to
@@ -120,7 +123,7 @@ pub async fn repo_with_initial_commit() -> tempfile::TempDir {
     tmp
 }
 
-/// A repository that has opted in, and the runner its jobs run on.
+/// A repository that has opted in, with a remote its jobs push to.
 pub struct Harness {
     tmp: tempfile::TempDir,
     /// The repository a job runs against.
@@ -128,7 +131,9 @@ pub struct Harness {
     /// The bare remote the repository's `main` is published to, which every
     /// job clones from and pushes its branch back to.
     pub origin: PathBuf,
-    runner: LocalRunner,
+    /// A state root for tests that keep a job's state the way a host does.
+    /// [`Harness::run_job`] keeps none.
+    pub root: PathBuf,
 }
 
 impl Harness {
@@ -157,23 +162,18 @@ impl Harness {
             .await
             .unwrap()
             .unwrap();
-        // Job state lives in the repository, and a test asserts its working
-        // tree stays clean, the way an opted-in repository's own ignore does.
-        std::fs::write(repo.join(".git/info/exclude"), ".assembly/jobs/\n").unwrap();
 
         let origin = tmp.path().join("origin.git");
         add_origin(&repo, &origin).await;
         publish_main(&repo).await;
 
-        let runner = assembly_with_scratch_under(
-            &tmp.path().join("scratch"),
-            &tmp.path().join("assembly-bin"),
-        );
+        // Tests hand this to child processes as their TMPDIR.
+        std::fs::create_dir_all(tmp.path().join("scratch")).unwrap();
         Harness {
+            root: tmp.path().join("root"),
             tmp,
             repo,
             origin,
-            runner,
         }
     }
 
@@ -201,128 +201,127 @@ impl Harness {
     }
 
     /// A job directory outside the repository, for tests that drive a runner
-    /// or `job-exec` directly rather than through the lifecycle.
+    /// directly and collect what it reports.
     pub fn job_paths(&self) -> JobPaths {
-        paths::create_job(&paths::jobs_root(self.tmp.path()), THE_JOB.into()).unwrap()
+        let jobs_dir = self.tmp.path().join("jobs");
+        paths::open_job(&jobs_dir, THE_JOB.into())
+            .or_else(|_| paths::create_job(&jobs_dir, THE_JOB.into()))
+            .unwrap()
     }
 
-    /// Run one job against this repository, with `prompt`, from `main`.
+    /// Run one job against this repository, with `prompt`, from `main` —
+    /// in this process, as `assembly run` does.
     pub async fn run_job(&self, prompt: &str) -> Outcome {
-        self.run(self.prepare_job(prompt).await).await
-    }
-
-    /// A new job with `prompt`, checked but not yet run, so a test can change
-    /// the world between the two.
-    pub async fn prepare_job(&self, prompt: &str) -> Prepared<'_, LocalRunner> {
-        prepare_start(&self.runner, &[], self.start(prompt, None, None)).await
+        self.run(self.request(prompt, None, None)).await
     }
 
     /// Run one job cut from a named ref rather than `main`.
     pub async fn run_job_from(&self, prompt: &str, base_ref: &str) -> Outcome {
-        self.run(prepare_start(&self.runner, &[], self.start(prompt, None, Some(base_ref))).await)
-            .await
+        self.run(self.request(prompt, None, Some(base_ref))).await
     }
 
     /// Another round on job `job_id`, continuing its branch.
-    pub async fn revise_job(&self, job_id: JobId, feedback: &str) -> Outcome {
-        let request = RevisionRequest {
-            job_id: job_id.into(),
-            feedback: feedback.to_string(),
-            repo: Some(self.repo.clone()),
-        };
-        self.run(prepare_revision(&self.runner, &[], request).await)
-            .await
+    pub async fn revise_job(&self, job_id: JobId, prompt: &str) -> Outcome {
+        self.run(RunRequest {
+            job: Some(job_id.into()),
+            ..self.request(prompt, None, None)
+        })
+        .await
     }
 
-    /// Why a job with `provider` would not start: the refusals that stop a
-    /// job before it has a directory, as distinct from a job that failed.
-    pub async fn refusal_to_start(&self, prompt: &str, provider: Option<&str>) -> Refusal {
-        let prepared = prepare_start(&self.runner, &[], self.start(prompt, provider, None)).await;
-        match prepared.round {
-            Ok(_) => panic!("the job was ready to run, not refused"),
-            Err(refusal) => refusal,
-        }
-    }
-
-    /// A realistic round-1 payload for this repository, for tests that hand
-    /// one to a runner or to `job-exec` directly.
-    pub async fn payload_for(&self, prompt: &str) -> RoundPayload {
-        let start = git::pinned(&self.repo, "origin", "main").await.unwrap();
-        let config = RepoConfig::from_ref(&self.repo, &start.sha).await.unwrap();
-
-        RoundPayload::for_round(
-            &config,
-            RoundRequest {
-                job_id: THE_JOB.into(),
-                round: 1,
-                prompt,
-                provider: config.provider.as_deref().unwrap_or_default(),
-                start,
-                remote_name: "origin",
-                remote_url: self.origin.to_string_lossy().into_owned(),
-                seed_from: &self.repo,
-            },
+    /// Why a job with `provider` would not start: a refusal before anything
+    /// was claimed, as distinct from a job that failed.
+    pub async fn refusal_to_start(&self, prompt: &str, provider: Option<&str>) -> RunRefused {
+        match prepare_run(
+            self.request(prompt, provider, None),
+            &self.scratch_root(),
+            &CancellationToken::new(),
         )
-        .unwrap()
-    }
-
-    fn start(&self, prompt: &str, provider: Option<&str>, base_ref: Option<&str>) -> StartRequest {
-        StartRequest {
-            prompt: Some(prompt.to_string()),
-            prompt_file: None,
-            repo: Some(self.repo.clone()),
-            base_ref: base_ref.map(str::to_string),
-            provider: provider.map(str::to_string),
+        .await
+        {
+            Ok(_) => panic!("the job was ready to run, not refused"),
+            Err(refused) => refused,
         }
     }
 
-    /// Run a prepared job, which must have been ready rather than refused.
-    pub async fn run(&self, prepared: Prepared<'_, LocalRunner>) -> Outcome {
-        let ready = match prepared.round {
-            Ok(ready) => ready,
-            Err(refusal) => panic!(
-                "the job was refused: {refusal} {:?}",
-                refusal.itemized_reasons()
-            ),
-        };
-        let conclusion = lifecycle::run(ready, CancellationToken::new())
+    /// A claimed job and the launch spec for its first round, for tests
+    /// that hand a round to a runner directly.
+    pub async fn launch_spec_for(&self, prompt: &str) -> LaunchSpec {
+        let base = git::pinned(&self.repo, "origin", "main").await.unwrap();
+        let config = RepoConfig::from_ref(&self.repo, &base.sha).await.unwrap();
+        let job = claim::claim_job(&self.repo, "origin", &base.sha)
             .await
             .unwrap();
-        let events = EventLog::read(conclusion.job.events()).unwrap();
+        LaunchSpec::for_round::<LocalRunner>(
+            &JobPaths {
+                id: job,
+                dir: self.tmp.path().join("jobs").join(job.to_string()),
+            },
+            1,
+            self.origin.to_str().unwrap(),
+            &base,
+            prompt,
+            config.provider.as_deref().unwrap_or_default(),
+            None,
+        )
+    }
+
+    /// `assembly` run by hand with a launch spec's arguments, as a runner
+    /// would run it, with `extra_env` on top of this process's environment.
+    pub async fn run_frames(&self, prompt: &str, extra_env: &[(&str, &str)]) -> Output {
+        std::process::Command::new(env!("CARGO_BIN_EXE_assembly"))
+            .args(self.launch_spec_for(prompt).await.args)
+            .env("TMPDIR", self.scratch_root())
+            .envs(extra_env.iter().copied())
+            .output()
+            .unwrap()
+    }
+
+    fn request(&self, prompt: &str, provider: Option<&str>, base_ref: Option<&str>) -> RunRequest {
+        RunRequest {
+            repo: Some(self.repo.to_string_lossy().into_owned()),
+            base_ref: base_ref.map(str::to_string),
+            prompt: Some(prompt.to_string()),
+            provider: provider.map(str::to_string),
+            ..RunRequest::default()
+        }
+    }
+
+    /// Run a job that must be ready rather than refused, its frames kept in
+    /// memory.
+    async fn run(&self, request: RunRequest) -> Outcome {
+        let cancel = CancellationToken::new();
+        let ready = match prepare_run(request, &self.scratch_root(), &cancel).await {
+            Ok(ready) => ready,
+            Err(refused) => panic!(
+                "the job was refused: {refused} {:?}",
+                refused.itemized_reasons()
+            ),
+        };
+        let frames = FrameWriter::new(Vec::new());
+        let conclusion = ready.run(&frames, cancel).await.unwrap();
+        let mut readable = ReadableFrames::new(Vec::new());
+        readable.write_all(&frames.copy_of_sink()).unwrap();
 
         Outcome {
             passed: conclusion.verdict.passed(),
-            job_id: conclusion.job.id,
-            state: JobReport::from_events(conclusion.job.id.into(), &events).state,
-            events: events.into_iter().map(|e| e.kind).collect(),
-            output: std::fs::read_to_string(conclusion.job.log()).unwrap_or_default(),
+            job_id: conclusion.job,
+            state: conclusion.report.state,
+            events: frames.events_so_far().into_iter().map(|e| e.kind).collect(),
+            output: String::from_utf8(readable.into_text()).unwrap(),
         }
     }
 }
 
-/// The `assembly` binary cargo built, making its scratch clones under
-/// `scratch_root`, so a test can see whether a round left one behind.
-fn assembly_with_scratch_under(scratch_root: &Path, bin_dir: &Path) -> LocalRunner {
-    std::fs::create_dir_all(scratch_root).unwrap();
-    LocalRunner::using(fake_cli(
-        bin_dir,
-        "assembly",
-        &format!(
-            "TMPDIR='{}' exec '{}' \"$@\"\n",
-            scratch_root.display(),
-            env!("CARGO_BIN_EXE_assembly")
-        ),
-    ))
-}
-
-/// What a finished job left in its event log.
+/// What a finished job reported.
 #[derive(Debug)]
 pub struct Outcome {
     pub passed: bool,
     pub job_id: JobId,
     pub state: JobState,
+    /// The events of this run alone: an earlier round's are not among them.
     pub events: Vec<EventKind>,
-    /// Everything the job's output log captured.
+    /// Every output line the run printed: its commands', and its own.
     pub output: String,
 }
 

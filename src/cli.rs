@@ -8,15 +8,22 @@ use std::path::PathBuf;
     about = "Run one coding-agent job and keep the branch it leaves"
 )]
 pub struct Cli {
+    /// Where job state lives. Defaults to $XDG_STATE_HOME/assembly-line,
+    /// or ~/.local/state/assembly-line.
+    #[arg(long, global = true, env = "ASSEMBLY_ROOT")]
+    pub root: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Run one job: an agent, a prompt, and the branch it leaves
+    /// Do one whole job, here, in this process: clone, agent, verify, push,
+    /// pull request. What every runner launches.
     Run {
-        /// What the agent is asked to do
+        /// What the agent is asked to do. Give it as --prompt=TEXT when it
+        /// begins with '-'.
         #[arg(
             long,
             conflicts_with = "prompt_file",
@@ -26,41 +33,80 @@ pub enum Command {
         /// Read the prompt from a file instead
         #[arg(long)]
         prompt_file: Option<PathBuf>,
-        /// The repository to work in. Defaults to the enclosing one.
+        /// A checkout, or a remote URL. Defaults to the enclosing checkout.
         #[arg(long)]
-        repo: Option<PathBuf>,
-        /// What to branch from. Defaults to the checked-out branch.
+        repo: Option<String>,
+        /// What to start from: a ref, or REF@SHA to pin it. Defaults to the
+        /// checkout's branch.
         #[arg(long = "ref")]
         base_ref: Option<String>,
+        /// Work on this job's branch instead of claiming a new job
+        #[arg(long)]
+        job: Option<u64>,
         /// Overrides the repository's declared provider
         #[arg(long)]
         provider: Option<String>,
-        #[command(flatten)]
-        runner: RunnerArgs,
+        /// Report as NDJSON frames on stdout, for a collector
+        #[arg(long)]
+        frames: bool,
+        /// Install the repository's toolchain with mise first. Set by
+        /// container runners.
+        #[arg(long, hide = true)]
+        provision_toolchain: bool,
     },
 
-    /// Run another round of a job, based on its own branch, with feedback
-    ///
-    /// A new round, not a resumption: the agent's prior work arrives as files
-    /// on disk, and this round appends to the job's branch.
-    Revise {
-        job_id: u64,
-        /// What to change about the previous round's work
-        feedback: String,
-        /// The repository the job belongs to. Defaults to the enclosing one.
+    /// Hand a job to the daemon: a new job, or with --job, another round of
+    /// an existing one
+    Submit {
+        /// What the agent is asked to do — for a revise, what to change
+        #[arg(
+            long,
+            conflicts_with = "prompt_file",
+            required_unless_present = "prompt_file"
+        )]
+        prompt: Option<String>,
+        /// Read the prompt from a file instead
         #[arg(long)]
-        repo: Option<PathBuf>,
+        prompt_file: Option<PathBuf>,
+        /// A checkout, or a remote URL. Defaults to the enclosing checkout.
+        #[arg(long)]
+        repo: Option<String>,
+        /// What to branch from. Defaults to the checked-out branch.
+        #[arg(long = "ref", conflicts_with = "job")]
+        base_ref: Option<String>,
+        /// Overrides the repository's declared provider
+        #[arg(long, conflicts_with = "job")]
+        provider: Option<String>,
+        /// Another round of this job, on its own branch, instead of a new job
+        ///
+        /// A new round, not a resumption: the agent's prior work arrives as
+        /// files on disk, and this round appends to the job's branch.
+        #[arg(long)]
+        job: Option<u64>,
+    },
+
+    /// Run the daemon: one root, one runner, rounds launched and watched on
+    /// behalf of `submit`
+    Daemon {
         #[command(flatten)]
         runner: RunnerArgs,
+        /// How many rounds may run at once
+        #[arg(
+            long,
+            default_value_t = 1,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+        )]
+        max_jobs: usize,
     },
 
     /// Show a job's state, timing and diff
     Status {
         /// Defaults to the most recent job
         job_id: Option<u64>,
-        /// The repository to look in. Defaults to the enclosing one.
+        /// The repository whose jobs to look at: a checkout, or a remote
+        /// URL. Defaults to the enclosing checkout.
         #[arg(long)]
-        repo: Option<PathBuf>,
+        repo: Option<String>,
     },
 
     /// Print a job's captured output
@@ -69,15 +115,21 @@ pub enum Command {
         /// Follow the log as it grows
         #[arg(short, long)]
         follow: bool,
-        /// The repository the job belongs to. Defaults to the enclosing one.
+        /// The repository whose jobs to look at: a checkout, or a remote
+        /// URL. Defaults to the enclosing checkout.
         #[arg(long)]
-        repo: Option<PathBuf>,
+        repo: Option<String>,
     },
 
-    /// Run the round in `ASSEMBLY_JOB` and report it as frames on stdout.
-    /// Started by a runner, never by hand.
-    #[command(name = "job-exec", hide = true)]
-    JobExec,
+    /// Stop a queued or running job. A running round keeps what its agent
+    /// did so far, on the job's branch.
+    Cancel {
+        job_id: u64,
+        /// The repository the job belongs to: a checkout, or a remote URL.
+        /// Defaults to the enclosing checkout.
+        #[arg(long)]
+        repo: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -91,8 +143,7 @@ pub enum RunnerKind {
     K8s,
 }
 
-/// Where a round runs. Shared by `run` and `revise`: a revise is a new round
-/// cut from the job's branch, so it may run somewhere the first round did not.
+/// Where the daemon runs every round it launches.
 #[derive(Debug, clap::Args)]
 pub struct RunnerArgs {
     #[arg(long, value_enum, default_value_t = RunnerKind::Local)]
@@ -101,7 +152,7 @@ pub struct RunnerArgs {
     #[arg(long)]
     pub image: Option<String>,
     /// Pass this variable from your environment into the round's container.
-    /// Repeatable. `ASSEMBLY_GIT_TOKEN` is always passed.
+    /// Repeatable. `ASSEMBLY_GIT_TOKEN` and `GH_TOKEN` are always passed.
     #[arg(long = "pass-env", value_name = "NAME")]
     pub pass_env: Vec<String>,
     /// Where k8s Jobs and their Secrets are created. Required for k8s.

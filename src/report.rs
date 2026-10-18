@@ -1,4 +1,6 @@
 use crate::event::{Event, EventKind};
+use crate::git::PinnedRef;
+use crate::runner::RoundHandle;
 use crate::state::JobState;
 use chrono::{DateTime, Utc};
 use std::time::Duration;
@@ -33,7 +35,7 @@ pub struct JobReport {
     pub id: u64,
     pub state: JobState,
     /// How many rounds this job has had: the highest round any
-    /// `RoundStarted` records, and at least 1.
+    /// `RoundStarted` records; 0 when none does.
     pub rounds: u32,
     /// Wall time of the most recent round.
     pub duration: Option<Duration>,
@@ -42,9 +44,27 @@ pub struct JobReport {
     pub diff: Option<DiffSummary>,
     /// Failure reason, when there is one.
     pub detail: Option<String>,
-    /// The branch the job's work is on, once it has been pushed. `None` is
-    /// a job that has not produced anything yet.
+    /// The branch the job's work is on, once a round has pushed some. `None`
+    /// is a job that has not produced anything yet, even though its claimed
+    /// branch exists.
     pub branch: Option<String>,
+    /// Where the job clones from and pushes to, from its first request.
+    pub remote_url: Option<String>,
+    /// The job's base as its latest round asked for it. A revise starts from
+    /// the job's branch, not from here.
+    pub base: Option<PinnedRef>,
+    /// What the job was first asked to do.
+    pub first_prompt: Option<String>,
+    /// What the job's latest round was asked to do.
+    pub latest_prompt: Option<String>,
+    /// The provider its latest round was asked to use.
+    pub provider: Option<String>,
+    /// The URL of the branch's pull request, once one is open.
+    pub pull_request: Option<String>,
+    /// How to find the latest round on its runner, once it has launched.
+    pub launched: Option<RoundHandle>,
+    /// When the job's latest round was asked for.
+    pub requested_at: Option<DateTime<Utc>>,
 }
 
 /// A job's facts, accumulated as its event stream is folded.
@@ -57,11 +77,41 @@ struct JobProgress {
     committed_diff: Option<DiffSummary>,
     detail: Option<String>,
     branch: Option<String>,
+    remote_url: Option<String>,
+    base: Option<PinnedRef>,
+    first_prompt: Option<String>,
+    latest_prompt: Option<String>,
+    provider: Option<String>,
+    pull_request: Option<String>,
+    launched: Option<RoundHandle>,
+    requested_at: Option<DateTime<Utc>>,
 }
 
 impl JobProgress {
     fn after_event(self, event: &Event) -> Self {
         match &event.kind {
+            EventKind::RoundRequested {
+                remote_url,
+                base,
+                prompt,
+                provider,
+            } => JobProgress {
+                // What waits is the round just asked for, so the previous
+                // round's reason, diff and timing no longer describe it.
+                state: JobState::Queued,
+                round_started_at: None,
+                last_round_duration: None,
+                committed_diff: None,
+                detail: None,
+                launched: None,
+                requested_at: Some(event.at),
+                remote_url: self.remote_url.or_else(|| Some(remote_url.clone())),
+                first_prompt: self.first_prompt.or_else(|| Some(prompt.clone())),
+                latest_prompt: Some(prompt.clone()),
+                base: Some(base.clone()),
+                provider: Some(provider.clone()),
+                ..self
+            },
             // A new round restarts the clock and clears the previous round's
             // reason and diff, so a revised job reports its final round.
             EventKind::RoundStarted { round } => JobProgress {
@@ -70,6 +120,11 @@ impl JobProgress {
                 round_started_at: Some(event.at),
                 committed_diff: None,
                 detail: None,
+                launched: None,
+                ..self
+            },
+            EventKind::RoundLaunched { handle } => JobProgress {
+                launched: Some(handle.clone()),
                 ..self
             },
             EventKind::RoundCommitted {
@@ -87,6 +142,10 @@ impl JobProgress {
             },
             EventKind::BranchPushed { branch, .. } => JobProgress {
                 branch: Some(branch.clone()),
+                ..self
+            },
+            EventKind::PullRequestOpened { url } => JobProgress {
+                pull_request: Some(url.clone()),
                 ..self
             },
             // The `RoundFailed` that follows carries the reason, worded by
@@ -115,7 +174,7 @@ impl JobProgress {
 impl JobReport {
     /// Fold a job's event stream into the account `status` prints.
     ///
-    /// A job with no events yet reports as `Pending` with one round, which is
+    /// A job with no events yet reports as `Pending` with no rounds, which is
     /// what a directory allocated but not yet run looks like.
     pub fn from_events<'a>(id: u64, events: impl IntoIterator<Item = &'a Event>) -> Self {
         let progress = events
@@ -125,29 +184,41 @@ impl JobReport {
         JobReport {
             id,
             state: progress.state,
-            rounds: progress.rounds.max(1),
+            rounds: progress.rounds,
             duration: progress.last_round_duration,
             diff: progress.committed_diff,
             detail: progress.detail,
             branch: progress.branch,
+            remote_url: progress.remote_url,
+            base: progress.base,
+            first_prompt: progress.first_prompt,
+            latest_prompt: progress.latest_prompt,
+            provider: progress.provider,
+            pull_request: progress.pull_request,
+            launched: progress.launched,
+            requested_at: progress.requested_at,
         }
     }
 
     /// The single line printed at the end of a round:
-    /// `job 7: failed (round 2, 3 files +40/-2) — verify failed`.
+    /// `job 7: failed (round 2, 3 files +40/-2) — verify failed`. A report
+    /// that saw no round start names no round.
     #[must_use]
     pub fn to_summary_line(&self) -> String {
-        let facts = [
-            Some(format!("round {}", self.rounds)),
+        let facts: Vec<String> = [
+            (self.rounds > 0).then(|| format!("round {}", self.rounds)),
             self.diff.map(|d| d.to_string()),
         ]
         .into_iter()
         .flatten()
-        .collect::<Vec<_>>()
-        .join(", ");
+        .collect();
+        let facts = match facts.is_empty() {
+            true => String::new(),
+            false => format!(" ({})", facts.join(", ")),
+        };
 
         format!(
-            "job {}: {} ({facts}){}",
+            "job {}: {}{facts}{}",
             self.id,
             self.state.label(),
             self.detail
@@ -165,17 +236,40 @@ impl JobReport {
             .map(|d| format!("took {:.1}s", d.as_secs_f64()))
     }
 
-    /// Everything `status` prints: the summary, how long the last round
-    /// took once it has ended, and the branch once there is one.
+    /// What `run` prints once its job is over: the summary, how long the
+    /// round took, and the branch and its pull request once there are any.
+    #[must_use]
+    pub fn to_conclusion_lines(&self) -> Vec<String> {
+        std::iter::once(self.to_summary_line())
+            .chain(self.to_duration_line())
+            .chain(self.work_location_lines())
+            .collect()
+    }
+
+    /// Everything `status` prints: the conclusion's lines with the job's id
+    /// before its branch, and the command that prints its output once a
+    /// round has started — the collector creates the output log before it
+    /// records any event. `run` keeps no state for `logs` to read, which is
+    /// why the two differ.
     #[must_use]
     pub fn to_status_lines(&self) -> Vec<String> {
         std::iter::once(self.to_summary_line())
             .chain(self.to_duration_line())
-            .chain(
-                self.branch
-                    .as_ref()
-                    .map(|branch| format!("branch: {branch}")),
-            )
+            .chain(std::iter::once(format!("id: {}", self.id)))
+            .chain(self.work_location_lines())
+            .chain((self.rounds > 0).then(|| format!("logs: assembly logs {}", self.id)))
             .collect()
+    }
+
+    fn work_location_lines(&self) -> impl Iterator<Item = String> {
+        let branch = self
+            .branch
+            .as_ref()
+            .map(|branch| format!("branch: {branch}"));
+        let pull_request = self
+            .pull_request
+            .as_ref()
+            .map(|url| format!("pull request: {url}"));
+        branch.into_iter().chain(pull_request)
     }
 }

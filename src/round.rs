@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 /// How long cloning and provisioning may take together. Not `max_duration`:
 /// that is the repository's statement about its own commands, and a cold
 /// toolchain install should not eat the agent's budget.
-const PROVISIONING_LIMIT: Duration = Duration::from_mins(15);
+pub const PROVISIONING_LIMIT: Duration = Duration::from_mins(15);
 
 /// `mise trust` first: `mise` refuses to act on a `mise.toml` in a directory
 /// it has not been told to trust, and a fresh clone is exactly that.
@@ -75,32 +75,47 @@ enum RoundResult {
     },
 }
 
-/// Run one round of a job end to end: scratch clone, agent, commit, push,
-/// `verify`, discard.
+/// Remove the round's checkout. That is housekeeping: failing at it neither
+/// undoes a pushed branch nor says anything about the work, so it is
+/// reported as output rather than allowed to replace what the round did.
 ///
 /// # Errors
 ///
-/// Returns an error only if the round cannot be *administered* — its frames
-/// cannot be written. An agent that fails, a clone that fails, and a push
-/// that fails are all [`Verdict::Failed`], reported as events.
-pub async fn run_round<W: Write + Send + 'static>(
-    payload: &RoundPayload,
+/// Only when the report cannot be written.
+pub fn discard_reporting_failure<W: Write>(
+    ws: RoundWorkspace,
     frames: &FrameWriter<W>,
-    scratch_root: &Path,
+) -> std::io::Result<()> {
+    match workspace::discard(ws) {
+        Ok(()) => Ok(()),
+        Err(e) => frames.append_output(&format!("could not remove the scratch checkout: {e}")),
+    }
+}
+
+/// One round in `ws`, which the caller cloned and will discard: provision,
+/// agent, commit, push, `verify`, and the events that record them. No
+/// `RoundStarted`: whoever collects the round numbers it.
+///
+/// `provisioning_deadline` is what is left of the budget the clone and
+/// provisioning share, fixed before the clone began.
+///
+/// # Errors
+///
+/// Only when the round's frames cannot be written. An agent that fails and a
+/// push that fails are both [`Verdict::Failed`], reported as events.
+pub async fn run_round_in<W: Write + Send + 'static>(
+    payload: &RoundPayload,
+    ws: &RoundWorkspace,
+    frames: &FrameWriter<W>,
+    provisioning_deadline: Instant,
     cancel: CancellationToken,
 ) -> anyhow::Result<Verdict> {
     let timeout = payload.command_limit_secs.map(Duration::from_secs);
-
-    frames.append_event(EventKind::RoundStarted {
-        round: payload.round,
-    })?;
-
-    let result = round_result(payload, frames, scratch_root, timeout, cancel)
+    let result = result_in_workspace(payload, ws, frames, provisioning_deadline, timeout, cancel)
         .await
-        // The round could not be administered at all — the clone or
-        // provisioning failed, a git step before the push could not run, or
-        // the push failed and took the work with it. Either way there is no
-        // branch to name.
+        // The round could not be administered at all — provisioning failed,
+        // a git step before the push could not run, or the push failed and
+        // took the work with it. Either way there is no branch to name.
         .unwrap_or_else(|e| RoundResult::Failed {
             reason: e.to_string(),
             work: None,
@@ -109,51 +124,52 @@ pub async fn run_round<W: Write + Send + 'static>(
     record_completion(frames, result)
 }
 
-/// One round, from empty checkout to discarded checkout.
+/// `cloning`, cut off at [`PROVISIONING_LIMIT`] or by `cancel`.
 ///
-/// The agent's work is committed and published *before* success is decided:
-/// an unrecorded change would be a lost change, and a failure that produced a
-/// diff is exactly the case where the diff is worth reading.
-async fn round_result<W: Write + Send + 'static>(
-    payload: &RoundPayload,
-    frames: &FrameWriter<W>,
-    scratch_root: &Path,
-    timeout: Option<Duration>,
-    cancel: CancellationToken,
-) -> anyhow::Result<RoundResult> {
-    // Set before the clone, so a slow clone leaves less of the shared budget
-    // for provisioning rather than a fresh 15 minutes of its own.
-    let provisioning_deadline = Instant::now() + PROVISIONING_LIMIT;
-    // Unlike `mise` below, the clone may be dropped from outside — timed out
-    // or cancelled — because dropping `git` kills its whole process group
-    // (`git::run_allowing_failure`).
-    let cloning = tokio::time::timeout(
-        PROVISIONING_LIMIT,
-        workspace::create(
-            &payload.remote_url,
-            &payload.start,
-            &payload.branch,
-            &payload.seed_from,
-            &payload.copy,
-            scratch_root,
-            // A container runner always sends the token, having no other
-            // credentials to offer; without one, git uses whatever this
-            // environment already has.
-            std::env::var_os(GIT_TOKEN_VAR)
-                .is_some()
-                .then_some(git::TOKEN_CREDENTIAL_HELPER),
-        ),
-    );
-    let ws = tokio::select! {
-        cloned = cloning => cloned.map_err(|_| {
+/// Unlike `mise`, a clone may be dropped from outside, because dropping
+/// `git` kills its whole process group (`git::run_allowing_failure`).
+///
+/// # Errors
+///
+/// The clone's own error, or one saying it timed out or was cancelled.
+pub async fn within_provisioning_limit<T>(
+    cloning: impl Future<Output = anyhow::Result<T>>,
+    cancel: &CancellationToken,
+) -> anyhow::Result<T> {
+    tokio::select! {
+        cloned = tokio::time::timeout(PROVISIONING_LIMIT, cloning) => cloned.map_err(|_| {
             anyhow::anyhow!(
                 "provisioning timed out after {}",
                 humantime::format_duration(PROVISIONING_LIMIT)
             )
-        })??,
-        () = cancel.cancelled() => anyhow::bail!("cancelled"),
-    };
+        })?,
+        () = cancel.cancelled() => Err(anyhow::anyhow!("cancelled")),
+    }
+}
 
+/// The credential helper a job's clone authenticates with. A container
+/// runner always sends the token, having no other credentials to offer;
+/// without one, git uses whatever this environment already has.
+#[must_use]
+pub fn credential_helper_for_this_environment() -> Option<&'static str> {
+    std::env::var_os(GIT_TOKEN_VAR)
+        .is_some()
+        .then_some(git::TOKEN_CREDENTIAL_HELPER)
+}
+
+/// One round in a checkout it is handed.
+///
+/// The agent's work is committed and published *before* success is decided:
+/// an unrecorded change would be a lost change, and a failure that produced a
+/// diff is exactly the case where the diff is worth reading.
+async fn result_in_workspace<W: Write + Send + 'static>(
+    payload: &RoundPayload,
+    ws: &RoundWorkspace,
+    frames: &FrameWriter<W>,
+    provisioning_deadline: Instant,
+    timeout: Option<Duration>,
+    cancel: CancellationToken,
+) -> anyhow::Result<RoundResult> {
     provision_toolchain(
         payload,
         ws.path(),
@@ -169,8 +185,7 @@ async fn round_result<W: Write + Send + 'static>(
         run_command(&payload.command, ws.path(), frames, timeout, cancel.clone()).await,
     );
 
-    // Bound before the literal: both borrow `ws`, which `discard` consumes.
-    let preserved = agent_work_on_branch(payload, &ws).await;
+    let preserved = agent_work_on_branch(payload, ws).await;
     let ruling = match agent_failure {
         Some(_) => VerifyRuling::NoObjection,
         None => {
@@ -184,12 +199,6 @@ async fn round_result<W: Write + Send + 'static>(
             .await
         }
     };
-    // Removing the checkout is housekeeping: failing at it neither undoes a
-    // pushed branch nor says anything about the work, so it is reported
-    // rather than allowed to replace what the round did.
-    if let Err(e) = workspace::discard(ws) {
-        frames.append_output(&format!("could not remove the scratch checkout: {e}"))?;
-    }
     let work = preserved?;
 
     Ok(match (agent_failure, ruling) {
@@ -407,7 +416,7 @@ fn events_for_completion(result: RoundResult) -> (Vec<EventKind>, Verdict) {
 #[cfg(test)]
 mod provisioning_tests {
     //! `provision_toolchain` is private, and the deadline it takes
-    //! cannot be exercised through the public `job-exec` surface without
+    //! cannot be exercised through the public `run` surface without
     //! either waiting out the real 15-minute `PROVISIONING_LIMIT` or making
     //! it configurable — both ruled out. This calls the internal function
     //! directly instead, which needs no subprocess: a deadline that has
@@ -416,12 +425,10 @@ mod provisioning_tests {
 
     use super::*;
     use crate::git::PinnedRef;
-    use std::path::PathBuf;
 
     fn payload_asking_for_provisioning() -> RoundPayload {
         RoundPayload {
             job_id: 1.into(),
-            round: 1,
             remote_url: "does-not-matter".to_string(),
             remote_name: "origin".to_string(),
             start: PinnedRef {
@@ -436,8 +443,6 @@ mod provisioning_tests {
             commit_message: "job 1".to_string(),
             verify: None,
             command_limit_secs: None,
-            copy: Vec::new(),
-            seed_from: PathBuf::from("."),
             provision_toolchain: true,
         }
     }

@@ -40,6 +40,7 @@ pub enum FrameBody {
 struct Numbered<W> {
     sink: W,
     last_seq: u64,
+    events: Vec<Event>,
 }
 
 /// The round's side of the stream. Cloning shares it: the round appends events
@@ -61,7 +62,11 @@ impl<W: Write> Clone for FrameWriter<W> {
 impl<W: Write> FrameWriter<W> {
     pub fn new(sink: W) -> Self {
         FrameWriter {
-            shared: Arc::new(Mutex::new(Numbered { sink, last_seq: 0 })),
+            shared: Arc::new(Mutex::new(Numbered {
+                sink,
+                last_seq: 0,
+                events: Vec::new(),
+            })),
         }
     }
 
@@ -104,7 +109,25 @@ impl<W: Write> FrameWriter<W> {
         numbered.sink.write_all(b"\n")?;
         numbered.sink.flush()?;
         numbered.last_seq = frame.seq;
+        if let FrameBody::Event(event) = frame.body {
+            numbered.events.push(event);
+        }
         Ok(())
+    }
+
+    /// Every event this writer has sent, in order — what the round reported,
+    /// for a conclusion drawn in the same process.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a writer panicked while holding the lock.
+    #[must_use]
+    pub fn events_so_far(&self) -> Vec<Event> {
+        self.shared
+            .lock()
+            .expect("frame writer lock")
+            .events
+            .clone()
     }
 
     /// What has been written so far — for tests, which write into a `Vec`.
@@ -118,6 +141,70 @@ impl<W: Write> FrameWriter<W> {
         W: Clone,
     {
         self.shared.lock().expect("frame writer lock").sink.clone()
+    }
+
+    /// The sink, once this is the last clone of the writer.
+    #[must_use]
+    pub fn into_sink(self) -> Option<W> {
+        Arc::try_unwrap(self.shared)
+            .ok()
+            .and_then(|numbered| numbered.into_inner().ok())
+            .map(|numbered| numbered.sink)
+    }
+}
+
+/// A frame sink for a person at a terminal: the text of every output frame,
+/// one per line, and nothing of the events — the conclusion reports those.
+#[derive(Debug)]
+pub struct ReadableFrames<W: Write> {
+    text: W,
+    /// A line split across writes, waiting for the rest of it.
+    partial: Vec<u8>,
+}
+
+impl<W: Write> ReadableFrames<W> {
+    pub fn new(text: W) -> Self {
+        ReadableFrames {
+            text,
+            partial: Vec::new(),
+        }
+    }
+
+    pub fn into_text(self) -> W {
+        self.text
+    }
+
+    fn write_readable(&mut self, line: &[u8]) -> io::Result<()> {
+        match serde_json::from_slice::<Frame>(line) {
+            Ok(Frame {
+                body: FrameBody::Output(text),
+                ..
+            }) => writeln!(self.text, "{text}"),
+            Ok(Frame {
+                body: FrameBody::Event(_),
+                ..
+            }) => Ok(()),
+            Err(_) => {
+                self.text.write_all(line)?;
+                self.text.write_all(b"\n")
+            }
+        }
+    }
+}
+
+impl<W: Write> Write for ReadableFrames<W> {
+    /// A loop: each complete line is written before the next is looked for.
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.partial.extend_from_slice(buf);
+        while let Some(end) = self.partial.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = self.partial.drain(..=end).collect();
+            self.write_readable(&line[..end])?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.text.flush()
     }
 }
 
@@ -136,21 +223,55 @@ pub enum Routed {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StreamPosition {
     last_seq: u64,
+    /// For a collection resuming a stream that replays from its start: the
+    /// frame the replay has yet to reach, 0 once it has. Until then a line
+    /// that is not a frame was collected before too.
+    replaying_to: u64,
 }
 
 impl StreamPosition {
+    /// A position past `last_seq`, for a collection resuming a stream.
+    #[must_use]
+    pub fn after(last_seq: u64) -> StreamPosition {
+        StreamPosition {
+            last_seq,
+            replaying_to: last_seq,
+        }
+    }
+
+    #[must_use]
+    pub fn last_seq(self) -> u64 {
+        self.last_seq
+    }
+
     /// Where `line` goes, and where the stream stands after it.
     ///
-    /// A line that is not a frame is output: `job-exec`'s own stderr, or a
+    /// A line that is not a frame is output: `run`'s own stderr, or a
     /// crash backtrace, merged into the stream by a runner that cannot keep
-    /// the two apart. It does not move the position.
+    /// the two apart. It does not move the position, and while a resumed
+    /// stream is still replaying it is dropped with the frames around it.
+    /// Such a line printed after the last frame routed before the resume is
+    /// routed a second time.
     #[must_use]
     pub fn route(self, line: &str) -> (StreamPosition, Routed) {
         match serde_json::from_str::<Frame>(line) {
+            Err(_) if self.replaying_to > 0 => (self, Routed::AlreadyCollected),
             Err(_) => (self, Routed::Output(line.to_string())),
-            Ok(frame) if frame.seq <= self.last_seq => (self, Routed::AlreadyCollected),
+            Ok(frame) if frame.seq <= self.last_seq => (
+                StreamPosition {
+                    replaying_to: match frame.seq >= self.replaying_to {
+                        true => 0,
+                        false => self.replaying_to,
+                    },
+                    ..self
+                },
+                Routed::AlreadyCollected,
+            ),
             Ok(Frame { seq, body }) => (
-                StreamPosition { last_seq: seq },
+                StreamPosition {
+                    last_seq: seq,
+                    replaying_to: 0,
+                },
                 match body {
                     FrameBody::Event(event) => Routed::Event { seq, event },
                     FrameBody::Output(text) => Routed::Output(text),
@@ -162,7 +283,7 @@ impl StreamPosition {
 
 /// The failure a collector records itself when a round's stream ended
 /// without saying how it went — a pod OOM-killed, a runner that never
-/// started it, a `job-exec` that panicked. `None` when the round reported its
+/// started it, a `run` that panicked. `None` when the round reported its
 /// own verdict.
 ///
 /// `collected` is this round's events only: an earlier round's verdict says

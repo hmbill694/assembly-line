@@ -1,14 +1,11 @@
 use assembly_line::collect::collect;
 use assembly_line::event::{Event, EventKind, EventLog};
 use assembly_line::frame::FrameWriter;
-use assembly_line::git::PinnedRef;
-use assembly_line::payload::RoundPayload;
-use assembly_line::provider::CommandSpec;
 use assembly_line::runner::kubernetes::{
     KubernetesRunner, LogReadPosition, PodProgress, active_deadline_secs, job_manifest,
     pod_progress, secret_manifest, split_timestamp,
 };
-use assembly_line::runner::{JobSecrets, Runner, RunningRound};
+use assembly_line::runner::{JobSecrets, RoundHandle, Runner, RunningRound};
 use serde_json::json;
 use std::collections::BTreeMap;
 use support::{Harness, fake_cli};
@@ -16,34 +13,14 @@ use tokio_util::sync::CancellationToken;
 
 mod support;
 
-/// A payload whose only meaningful field is its command limit.
-fn payload_with_command_limit(command_limit_secs: Option<u64>) -> RoundPayload {
-    RoundPayload {
-        job_id: 1.into(),
-        round: 1,
-        remote_url: "remote-url".into(),
-        remote_name: "origin".into(),
-        start: PinnedRef {
-            name: "main".into(),
-            sha: "sha".into(),
-        },
-        branch: "al/job-1".into(),
-        command: CommandSpec {
-            program: "agent".into(),
-            args: Vec::new(),
-        },
-        commit_message: "message".into(),
-        verify: None,
-        command_limit_secs,
-        copy: Vec::new(),
-        seed_from: "seed".into(),
-        provision_toolchain: true,
-    }
-}
-
 #[test]
 fn a_job_manifest_never_retries_and_reads_its_environment_from_its_secret() {
-    let job = job_manifest("al-1-1-abc", "img:1", Some(4200));
+    let job = job_manifest(
+        "al-1-1-abc",
+        "img:1",
+        &["run".into(), "--job=1".into()],
+        Some(4200),
+    );
 
     assert_eq!(job["kind"], "Job");
     assert_eq!(job["spec"]["backoffLimit"], 0);
@@ -51,13 +28,13 @@ fn a_job_manifest_never_retries_and_reads_its_environment_from_its_secret() {
     assert_eq!(job["spec"]["template"]["spec"]["restartPolicy"], "Never");
     let container = &job["spec"]["template"]["spec"]["containers"][0];
     assert_eq!(container["image"], "img:1");
-    assert_eq!(container["command"], json!(["assembly", "job-exec"]));
+    assert_eq!(container["command"], json!(["assembly", "run", "--job=1"]));
     assert_eq!(container["envFrom"][0]["secretRef"]["name"], "al-1-1-abc");
 }
 
 #[test]
 fn a_job_pod_is_given_no_service_account_token() {
-    let job = job_manifest("al-1-1-abc", "img:1", None);
+    let job = job_manifest("al-1-1-abc", "img:1", &[], None);
 
     assert_eq!(
         job["spec"]["template"]["spec"]["automountServiceAccountToken"],
@@ -68,7 +45,7 @@ fn a_job_pod_is_given_no_service_account_token() {
 #[test]
 fn a_job_with_no_max_duration_has_no_active_deadline() {
     assert!(
-        job_manifest("n", "i", None)["spec"]
+        job_manifest("n", "i", &[], None)["spec"]
             .get("activeDeadlineSeconds")
             .is_none()
     );
@@ -77,24 +54,20 @@ fn a_job_with_no_max_duration_has_no_active_deadline() {
 /// Owned by the Job, so deleting the Job — on completion or cancel —
 /// deletes the credentials with it.
 #[test]
-fn a_secret_is_owned_by_its_job_and_carries_the_payload() {
-    let vars = BTreeMap::from([("ASSEMBLY_JOB".to_string(), "{}".to_string())]);
+fn a_secret_is_owned_by_its_job_and_carries_the_tokens() {
+    let vars = BTreeMap::from([("GH_TOKEN".to_string(), "t0ken".to_string())]);
     let secret = secret_manifest("al-1-1-abc", "uid-9", &vars);
 
     assert_eq!(secret["kind"], "Secret");
     assert_eq!(secret["metadata"]["ownerReferences"][0]["uid"], "uid-9");
     assert_eq!(secret["metadata"]["ownerReferences"][0]["kind"], "Job");
-    assert_eq!(secret["stringData"]["ASSEMBLY_JOB"], "{}");
+    assert_eq!(secret["stringData"]["GH_TOKEN"], "t0ken");
 }
 
 #[test]
 fn the_backstop_deadline_is_twice_the_command_limit_plus_half_an_hour() {
-    let payload = payload_with_command_limit(Some(1200));
-    assert_eq!(active_deadline_secs(&payload), Some(2 * 1200 + 1800));
-    assert_eq!(
-        active_deadline_secs(&payload_with_command_limit(None)),
-        None
-    );
+    assert_eq!(active_deadline_secs(Some(1200)), Some(2 * 1200 + 1800));
+    assert_eq!(active_deadline_secs(None), None);
 }
 
 fn pods(pod: &serde_json::Value) -> serde_json::Value {
@@ -304,7 +277,7 @@ async fn a_pod_that_never_starts_fails_at_the_scheduling_deadline_with_its_reaso
 
     let err = k8s
         .launch(
-            &h.payload_for("x").await,
+            &h.launch_spec_for("x").await,
             &JobSecrets::default(),
             &CancellationToken::new(),
         )
@@ -406,7 +379,7 @@ async fn collected_round(h: &Harness, k8s: &KubernetesRunner) -> (bool, Vec<Even
     let mut log = EventLog::open_append(paths.events()).unwrap();
     let running = k8s
         .launch(
-            &h.payload_for("x").await,
+            &h.launch_spec_for("x").await,
             &JobSecrets::default(),
             &CancellationToken::new(),
         )
@@ -414,7 +387,13 @@ async fn collected_round(h: &Harness, k8s: &KubernetesRunner) -> (bool, Vec<Even
         .unwrap();
     let verdict = tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        collect(running, &mut log, &paths.log(), 1, CancellationToken::new()),
+        collect(
+            running,
+            &mut log,
+            &paths.log(),
+            &paths.position(1),
+            CancellationToken::new(),
+        ),
     )
     .await
     .expect("collection never ended")
@@ -437,7 +416,7 @@ async fn a_job_create_that_fails_still_deletes_the_job_by_name() {
 
     let err = k8s
         .launch(
-            &h.payload_for("x").await,
+            &h.launch_spec_for("x").await,
             &JobSecrets::default(),
             &CancellationToken::new(),
         )
@@ -479,6 +458,43 @@ async fn neither_the_job_nor_its_secret_is_applied() {
     assert!(!argv.contains("apply"), "{argv}");
 }
 
+/// The pod's command line is the round's whole instruction: `assembly` and
+/// the launch spec's arguments, nothing added or dropped.
+#[tokio::test]
+async fn the_job_runs_assembly_with_the_launch_specs_arguments() {
+    let h = Harness::new().await;
+    let fakes = h.scratch_root().with_file_name("fakes");
+    let k8s = runner(kubectl_answering(
+        &fakes,
+        &format!("{{ cat; echo; }} >> manifests; echo '{CREATED_JOB}'"),
+        &format!("echo '{SUCCEEDED_POD}'"),
+        "cat frames",
+    ));
+    let spec = h.launch_spec_for("--frames and \"quotes\"").await;
+
+    let running = k8s
+        .launch(&spec, &JobSecrets::default(), &CancellationToken::new())
+        .await
+        .unwrap();
+    running.termination().await;
+
+    let job: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(fakes.join("manifests"))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    let expected: Vec<&str> = std::iter::once("assembly")
+        .chain(spec.args.iter().map(String::as_str))
+        .collect();
+    assert_eq!(
+        job["spec"]["template"]["spec"]["containers"][0]["command"],
+        json!(expected)
+    );
+}
+
 #[tokio::test]
 async fn a_launch_that_fails_after_the_job_exists_deletes_the_job() {
     let h = Harness::new().await;
@@ -497,7 +513,7 @@ async fn a_launch_that_fails_after_the_job_exists_deletes_the_job() {
 
     let err = k8s
         .launch(
-            &h.payload_for("x").await,
+            &h.launch_spec_for("x").await,
             &JobSecrets::default(),
             &CancellationToken::new(),
         )
@@ -605,7 +621,7 @@ async fn a_log_stream_that_only_replays_ends_the_round_and_logs_the_line_once() 
         &fakes,
         &format!("cat >/dev/null; echo '{CREATED_JOB}'"),
         &format!("echo '{RUNNING_POD}'"),
-        "echo '2026-09-21T10:00:00Z job-exec: something unframed'",
+        "echo '2026-09-21T10:00:00Z run: something unframed'",
     ));
 
     let (passed, events) = collected_round(&h, &k8s).await;
@@ -679,7 +695,7 @@ async fn cancelling_a_launch_whose_pod_is_pending_deletes_the_job_and_its_secret
         ))
     };
     let cancel = CancellationToken::new();
-    let payload = h.payload_for("x").await;
+    let spec = h.launch_spec_for("x").await;
     let interrupt = cancel.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -688,7 +704,7 @@ async fn cancelling_a_launch_whose_pod_is_pending_deletes_the_job_and_its_secret
 
     let err = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        k8s.launch(&payload, &JobSecrets::default(), &cancel),
+        k8s.launch(&spec, &JobSecrets::default(), &cancel),
     )
     .await
     .expect("the launch waited out the scheduling deadline despite the cancel")
@@ -722,7 +738,7 @@ async fn cancelling_a_running_job_deletes_the_job_and_its_secret() {
 
     let mut running = k8s
         .launch(
-            &h.payload_for("x").await,
+            &h.launch_spec_for("x").await,
             &JobSecrets::default(),
             &CancellationToken::new(),
         )
@@ -733,4 +749,75 @@ async fn cancelling_a_running_job_deletes_the_job_and_its_secret() {
     let argv = std::fs::read_to_string(fakes.join("argv")).unwrap();
     assert!(argv.contains("delete job"), "{argv}");
     assert!(argv.contains("delete secret"), "{argv}");
+}
+
+#[tokio::test]
+async fn a_kubernetes_round_is_reattached_by_its_job_name() {
+    let h = Harness::new().await;
+    let fakes = h.scratch_root().with_file_name("fakes");
+    let k8s = runner(kubectl_answering(
+        &fakes,
+        &format!("cat >/dev/null; echo '{CREATED_JOB}'"),
+        &format!("echo '{SUCCEEDED_POD}'"),
+        "cat frames",
+    ));
+    let spec = h.launch_spec_for("x").await;
+    let first = k8s
+        .launch(&spec, &JobSecrets::default(), &CancellationToken::new())
+        .await
+        .unwrap();
+    let handle = first.handle();
+    drop(first);
+
+    let again = k8s.reattach(&handle).await.unwrap();
+    let paths = h.job_paths();
+    let mut log = EventLog::open_append(paths.events()).unwrap();
+    let verdict = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        collect(
+            again,
+            &mut log,
+            &paths.log(),
+            &paths.position(1),
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("collection never ended")
+    .unwrap();
+
+    assert!(verdict.passed());
+    let output = std::fs::read_to_string(paths.log()).unwrap();
+    assert_eq!(output.matches("agent working").count(), 1, "{output}");
+    let argv = std::fs::read_to_string(fakes.join("argv")).unwrap();
+    assert_eq!(
+        argv.lines()
+            .filter(|call| call.contains("create -f -"))
+            .count(),
+        2,
+        "the reattach created something: {argv}"
+    );
+}
+
+/// The handle is recorded once the pod has started, so a Job with no pod
+/// when the daemon comes back has lost it for good.
+#[tokio::test]
+async fn a_kubernetes_round_whose_pod_is_gone_cannot_be_reattached() {
+    let tmp = tempfile::tempdir().unwrap();
+    let k8s = runner(kubectl_answering(
+        tmp.path(),
+        "exit 1",
+        "echo '{\"items\":[]}'",
+        "exit 1",
+    ));
+
+    let err = k8s
+        .reattach(&RoundHandle::Kubernetes {
+            job: "al-1-1-x".into(),
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("al-1-1-x has no pod"), "{err}");
 }

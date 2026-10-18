@@ -1,4 +1,5 @@
 use assembly_line::event::{Event, EventKind};
+use assembly_line::git::PinnedRef;
 use assembly_line::report::JobReport;
 use assembly_line::state::JobState;
 use chrono::{DateTime, TimeDelta, Utc};
@@ -27,6 +28,18 @@ fn committed(files: usize, insertions: usize, deletions: usize) -> EventKind {
 fn state_after(kinds: Vec<EventKind>) -> JobState {
     let events = timeline(kinds.into_iter().map(|kind| (0, kind)).collect());
     JobReport::from_events(1, &events).state
+}
+
+fn requested(prompt: &str, sha: &str) -> EventKind {
+    EventKind::RoundRequested {
+        remote_url: "git@github.com:o/r.git".into(),
+        base: PinnedRef {
+            name: "main".into(),
+            sha: sha.into(),
+        },
+        prompt: prompt.into(),
+        provider: "claude".into(),
+    }
 }
 
 fn pushed() -> EventKind {
@@ -88,6 +101,60 @@ fn pushing_a_branch_does_not_decide_the_verdict() {
 }
 
 #[test]
+fn a_requested_round_is_queued_until_it_starts() {
+    assert_eq!(state_after(vec![requested("x", "a1")]), JobState::Queued);
+
+    let revised = vec![
+        requested("x", "a1"),
+        EventKind::RoundStarted { round: 1 },
+        EventKind::RoundPassed,
+        requested("more", "b2"),
+    ];
+    assert_eq!(state_after(revised), JobState::Queued);
+}
+
+#[test]
+fn a_queued_revise_does_not_wear_the_previous_rounds_failure() {
+    let events = timeline(vec![
+        (0, requested("x", "a1")),
+        (0, EventKind::RoundStarted { round: 1 }),
+        (1, committed(1, 2, 0)),
+        (
+            4,
+            EventKind::RoundFailed {
+                reason: "verify failed".into(),
+            },
+        ),
+        (5, requested("more", "b2")),
+    ]);
+
+    assert_eq!(
+        JobReport::from_events(1, &events).to_status_lines(),
+        ["job 1: queued (round 1)", "id: 1", "logs: assembly logs 1"]
+    );
+}
+
+#[test]
+fn a_revise_cancelled_before_it_started_took_no_time() {
+    let events = timeline(vec![
+        (0, requested("x", "a1")),
+        (0, EventKind::RoundStarted { round: 1 }),
+        (4, EventKind::RoundPassed),
+        (60, requested("more", "b2")),
+        (
+            61,
+            EventKind::RoundFailed {
+                reason: "cancelled before it started".into(),
+            },
+        ),
+    ]);
+
+    let report = JobReport::from_events(1, &events);
+    assert_eq!(report.state, JobState::Failed);
+    assert_eq!(report.duration, None);
+}
+
+#[test]
 fn a_revise_round_puts_a_finished_job_back_into_running() {
     let st = state_after(vec![
         EventKind::RoundStarted { round: 1 },
@@ -113,6 +180,7 @@ fn the_final_state_is_reconstructed_from_the_log_alone() {
 #[test]
 fn every_state_has_a_label() {
     assert_eq!(JobState::Pending.label(), "pending");
+    assert_eq!(JobState::Queued.label(), "queued");
     assert_eq!(JobState::Running.label(), "running");
     assert_eq!(JobState::Passed.label(), "passed");
     assert_eq!(JobState::Failed.label(), "failed");
@@ -144,7 +212,7 @@ fn a_job_with_no_events_is_pending() {
     let report = JobReport::from_events(1, &[]);
 
     assert_eq!(report.state, JobState::Pending);
-    assert_eq!(report.rounds, 1);
+    assert_eq!(report.rounds, 0);
     assert!(report.duration.is_none());
     assert!(report.diff.is_none());
     assert!(report.branch.is_none());
@@ -317,12 +385,46 @@ fn the_summary_line_names_the_round_the_diff_and_the_reason() {
 fn the_summary_line_of_an_untouched_job_says_pending() {
     assert_eq!(
         JobReport::from_events(1, &[]).to_summary_line(),
-        "job 1: pending (round 1)"
+        "job 1: pending"
+    );
+}
+
+/// `run` numbers no rounds, so a report folded from its events alone has
+/// seen none — and must not claim round 1 of a job it may be revising.
+#[test]
+fn a_report_that_saw_no_round_start_names_no_round() {
+    let events = timeline(vec![(0, EventKind::RoundPassed)]);
+
+    assert_eq!(
+        JobReport::from_events(3, &events).to_summary_line(),
+        "job 3: passed"
     );
 }
 
 #[test]
-fn status_of_a_finished_job_names_its_timing_and_branch() {
+fn a_job_reports_the_pull_request_it_opened() {
+    let events = timeline(vec![(
+        0,
+        EventKind::PullRequestOpened {
+            url: "https://github.com/o/r/pull/7".into(),
+        },
+    )]);
+
+    let report = JobReport::from_events(7, &events);
+
+    assert_eq!(
+        report.pull_request.as_deref(),
+        Some("https://github.com/o/r/pull/7")
+    );
+    assert!(
+        report
+            .to_status_lines()
+            .contains(&"pull request: https://github.com/o/r/pull/7".to_string())
+    );
+}
+
+#[test]
+fn status_of_a_finished_job_names_its_timing_id_branch_and_logs_command() {
     let events = timeline(vec![
         (0, EventKind::RoundStarted { round: 1 }),
         (1, committed(1, 1, 0)),
@@ -341,16 +443,42 @@ fn status_of_a_finished_job_names_its_timing_and_branch() {
         [
             "job 4: passed (round 1, 1 file +1/-0)",
             "took 3.0s",
+            "id: 4",
             "branch: al/job-4",
+            "logs: assembly logs 4",
         ]
     );
 }
 
 #[test]
-fn status_of_an_untouched_job_is_its_summary_alone() {
+fn status_of_a_job_whose_first_round_has_not_started_names_no_logs_command() {
     assert_eq!(
         JobReport::from_events(1, &[]).to_status_lines(),
-        ["job 1: pending (round 1)"]
+        ["job 1: pending", "id: 1"]
+    );
+    assert_eq!(
+        JobReport::from_events(1, &timeline(vec![(0, requested("x", "a1"))])).to_status_lines(),
+        ["job 1: queued", "id: 1"]
+    );
+}
+
+#[test]
+fn a_conclusion_names_no_logs_command() {
+    let events = timeline(vec![
+        (0, EventKind::RoundStarted { round: 1 }),
+        (
+            1,
+            EventKind::BranchPushed {
+                branch: "al/job-4".into(),
+                pushed_to: "origin".into(),
+            },
+        ),
+        (3, EventKind::RoundPassed),
+    ]);
+
+    assert_eq!(
+        JobReport::from_events(4, &events).to_conclusion_lines(),
+        ["job 4: passed (round 1)", "took 3.0s", "branch: al/job-4"]
     );
 }
 
@@ -373,4 +501,20 @@ fn timing_is_reported_only_once_a_round_has_ended() {
             .unwrap(),
         "took 2.0s"
     );
+}
+
+#[test]
+fn a_jobs_identity_is_its_first_requested_round() {
+    let events = timeline(vec![
+        (0, requested("add auth", "a1")),
+        (1, requested("use sessions", "b2")),
+    ]);
+
+    let report = JobReport::from_events(1, &events);
+
+    assert_eq!(report.remote_url.as_deref(), Some("git@github.com:o/r.git"));
+    assert_eq!(report.first_prompt.as_deref(), Some("add auth"));
+    assert_eq!(report.latest_prompt.as_deref(), Some("use sessions"));
+    assert_eq!(report.base.map(|base| base.sha).as_deref(), Some("b2"));
+    assert_eq!(report.provider.as_deref(), Some("claude"));
 }

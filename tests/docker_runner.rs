@@ -1,6 +1,6 @@
 use assembly_line::collect::collect;
 use assembly_line::event::{EventKind, EventLog};
-use assembly_line::payload::GIT_TOKEN_VAR;
+use assembly_line::payload::{FORGE_TOKEN_VAR, GIT_TOKEN_VAR};
 use assembly_line::runner::docker::DockerRunner;
 use assembly_line::runner::{JobSecrets, Runner, RunnerProblem, RunningRound};
 use std::path::{Path, PathBuf};
@@ -9,33 +9,93 @@ use tokio_util::sync::CancellationToken;
 
 mod support;
 
-/// A `docker` that records its argv and, for `run`, executes `job-exec`
-/// directly — the environment `docker run -e NAME` would forward is already
-/// the environment this script inherits. `stop` sends that `job-exec`
-/// SIGTERM, as the daemon would send the container's.
+/// A `docker` that records its argv and runs `assembly` as the container.
 fn fake_docker(dir: &Path, argv_log: &Path, oom: bool) -> PathBuf {
+    fake_docker_running(
+        dir,
+        argv_log,
+        Path::new(env!("CARGO_BIN_EXE_assembly")),
+        oom,
+    )
+}
+
+/// A `docker` that records its argv and keeps each container's state in
+/// files under `dir`. `create` keeps the arguments after `assembly`, and
+/// the values of the variables `-e` names, as `docker create -e NAME` takes
+/// them from the client's environment; `start` runs `entrypoint` with them
+/// in the background, its output to the container's log; `logs -f` follows
+/// that log until the container exits; `wait` prints its exit code; and
+/// `stop` sends it SIGTERM and returns once it has exited, as the real one
+/// does.
+fn fake_docker_running(dir: &Path, argv_log: &Path, entrypoint: &Path, oom: bool) -> PathBuf {
     fake_cli(
         dir,
         "docker",
         &format!(
-            "echo \"$*\" >> {log}\n\
-             case \"$1\" in\n\
-               run) echo $$ > {pid}; exec {bin} job-exec ;;\n\
-               stop) kill -TERM \"$(cat {pid})\" ;;\n\
-               version) echo 27.0.0 ;;\n\
-               inspect) echo {oom} ;;\n\
-               *) ;;\n\
-             esac\n",
+            r#"echo "$*" >> {log}
+state={state}
+mkdir -p "$state"
+case "$1" in
+  create)
+    shift; name=""
+    while [ "$1" != assembly ]; do
+      case "$1" in
+        --name) name=$2; shift ;;
+        -e) printf 'export %s=%q\n' "$2" "${{!2-}}" >> "$state/env.tmp"; shift ;;
+      esac
+      shift
+    done
+    shift
+    mv "$state/env.tmp" "$state/$name.env" 2>/dev/null || : > "$state/$name.env"
+    printf '%q ' "$@" > "$state/$name.args"
+    echo "$name" ;;
+  start)
+    name=$2
+    : > "$state/$name.log"
+    ( . "$state/$name.env"
+      eval "set -- $(cat "$state/$name.args")"
+      status=0
+      {entrypoint} "$@" > "$state/$name.log" 2>&1 || status=$?
+      echo "$status" > "$state/$name.exit" ) > /dev/null 2>&1 < /dev/null &
+    echo $! > "$state/$name.pid" ;;
+  logs)
+    name=$3; shown=0
+    while :; do
+      ended=no
+      if [ -e "$state/$name.exit" ]; then ended=yes; fi
+      total=$(wc -l < "$state/$name.log" | tr -d ' ')
+      if [ "$total" -gt "$shown" ]; then
+        sed -n "$((shown + 1)),${{total}}p" "$state/$name.log"
+        shown=$total
+      fi
+      if [ "$ended" = yes ]; then break; fi
+      sleep 0.05
+    done ;;
+  wait)
+    name=$2
+    while [ ! -e "$state/$name.exit" ]; do sleep 0.05; done
+    cat "$state/$name.exit" ;;
+  stop)
+    name=$4
+    pkill -TERM -P "$(cat "$state/$name.pid")" || true
+    while [ ! -e "$state/$name.exit" ]; do sleep 0.05; done ;;
+  version) echo 27.0.0 ;;
+  inspect) echo {oom} ;;
+  *) ;;
+esac
+"#,
             log = argv_log.display(),
-            pid = dir.join("job-exec.pid").display(),
-            bin = env!("CARGO_BIN_EXE_assembly"),
+            state = dir.join("containers").display(),
+            entrypoint = entrypoint.display(),
         ),
     )
 }
 
 fn token() -> JobSecrets {
     JobSecrets::from_lookup(&[], |name| {
-        (name == GIT_TOKEN_VAR).then(|| TOKEN_VALUE.to_string())
+        [GIT_TOKEN_VAR, FORGE_TOKEN_VAR]
+            .contains(&name)
+            .then(|| TOKEN_VALUE.to_string())
     })
     .0
 }
@@ -51,17 +111,23 @@ async fn a_round_in_docker_is_launched_collected_and_cleaned_up() {
         program: fake_docker(&fakes, &argv, false),
         image: "img:1".into(),
     };
-    let payload = h.payload_for("write a file").await;
+    let spec = h.launch_spec_for("write a file").await;
     let paths = h.job_paths();
     let mut log = EventLog::open_append(paths.events()).unwrap();
 
     let running = runner
-        .launch(&payload, &token(), &CancellationToken::new())
+        .launch(&spec, &token(), &CancellationToken::new())
         .await
         .unwrap();
-    let verdict = collect(running, &mut log, &paths.log(), 1, CancellationToken::new())
-        .await
-        .unwrap();
+    let verdict = collect(
+        running,
+        &mut log,
+        &paths.log(),
+        &paths.position(1),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
 
     assert!(
         verdict.passed(),
@@ -69,7 +135,11 @@ async fn a_round_in_docker_is_launched_collected_and_cleaned_up() {
         EventLog::read(paths.events()).unwrap()
     );
     let calls = std::fs::read_to_string(&argv).unwrap();
-    assert!(calls.contains("run --name al-1-1-"), "{calls}");
+    assert!(calls.contains("create --name al-1-1-"), "{calls}");
+    assert!(
+        calls.lines().any(|l| l.starts_with("start al-1-1-")),
+        "{calls}"
+    );
     assert!(calls.contains("-e ASSEMBLY_GIT_TOKEN"), "{calls}");
     assert!(
         !calls.contains(TOKEN_VALUE),
@@ -81,11 +151,11 @@ async fn a_round_in_docker_is_launched_collected_and_cleaned_up() {
     );
 }
 
-/// `job-exec` holds the token — the fake `docker` hands it the secrets the
-/// way `-e` would — and the agent it starts still sees neither the token nor
-/// the payload in its own environment.
+/// `run` holds both tokens — the fake `docker` hands it the secrets the way
+/// `-e` would — and the agent it starts sees neither in its own
+/// environment.
 #[tokio::test]
-async fn the_agent_sees_neither_the_git_token_nor_the_payload() {
+async fn the_agent_sees_neither_token() {
     let h = Harness::with_config(&support::config_running("env-reporting-agent.sh")).await;
     let fakes = h.scratch_root().with_file_name("fakes");
     let runner = DockerRunner {
@@ -97,18 +167,24 @@ async fn the_agent_sees_neither_the_git_token_nor_the_payload() {
 
     let running = runner
         .launch(
-            &h.payload_for("x").await,
+            &h.launch_spec_for("x").await,
             &token(),
             &CancellationToken::new(),
         )
         .await
         .unwrap();
-    collect(running, &mut log, &paths.log(), 1, CancellationToken::new())
-        .await
-        .unwrap();
+    collect(
+        running,
+        &mut log,
+        &paths.log(),
+        &paths.position(1),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
 
     let output = std::fs::read_to_string(paths.log()).unwrap();
-    assert!(output.contains("token=absent payload=absent"), "{output}");
+    assert!(output.contains("token=absent forge=absent"), "{output}");
 }
 
 /// A collector that cannot write its logs gives up — but not before stopping
@@ -128,13 +204,20 @@ async fn a_collector_that_cannot_write_removes_the_container_before_giving_up() 
 
     let running = runner
         .launch(
-            &h.payload_for("x").await,
+            &h.launch_spec_for("x").await,
             &token(),
             &CancellationToken::new(),
         )
         .await
         .unwrap();
-    let collected = collect(running, &mut log, &unwritable, 1, CancellationToken::new()).await;
+    let collected = collect(
+        running,
+        &mut log,
+        &unwritable,
+        &paths.position(1),
+        CancellationToken::new(),
+    )
+    .await;
 
     assert!(collected.is_err());
     let calls = std::fs::read_to_string(&argv).unwrap();
@@ -148,11 +231,11 @@ async fn a_collector_that_cannot_write_removes_the_container_before_giving_up() 
     );
 }
 
-/// Cancelling stops the container gracefully, so `job-exec` stops its agent
-/// and reports the round itself — as it does under the other runners —
-/// rather than being killed with its verdict unsaid.
+/// Cancelling stops the container gracefully, so `run` stops its agent and
+/// reports the round itself — as it does under the other runners — rather
+/// than being killed with its verdict unsaid.
 #[tokio::test]
-async fn cancelling_stops_the_container_so_job_exec_reports_the_round() {
+async fn cancelling_stops_the_container_so_run_reports_the_round() {
     let h = Harness::with_config(&support::config_running("sleeping-agent.sh")).await;
     let fakes = h.scratch_root().with_file_name("fakes");
     let argv = fakes.join("argv");
@@ -175,13 +258,13 @@ async fn cancelling_stops_the_container_so_job_exec_reports_the_round() {
 
     let running = runner
         .launch(
-            &h.payload_for("x").await,
+            &h.launch_spec_for("x").await,
             &token(),
             &CancellationToken::new(),
         )
         .await
         .unwrap();
-    let verdict = collect(running, &mut log, &paths.log(), 1, cancel)
+    let verdict = collect(running, &mut log, &paths.log(), &paths.position(1), cancel)
         .await
         .unwrap();
 
@@ -205,31 +288,20 @@ async fn cancelling_stops_the_container_so_job_exec_reports_the_round() {
 }
 
 /// A `docker` whose container prints far more than a pipe holds once told to
-/// stop, and whose `stop`, like the real one, returns only after the
-/// container has exited.
+/// stop.
 fn fake_docker_flooding_as_it_stops(dir: &Path, argv_log: &Path) -> PathBuf {
-    fake_cli(
+    let container = fake_cli(
         dir,
-        "docker",
-        &format!(
-            "echo \"$*\" >> {log}\n\
-             case \"$1\" in\n\
-               run) echo $$ > {pid}\n\
-                    trap 'yes winding-down | head -n 200000; exit 143' TERM\n\
-                    echo started\n\
-                    while :; do sleep 0.05; done ;;\n\
-               stop) kill -TERM \"$(cat {pid})\"\n\
-                     while kill -0 \"$(cat {pid})\" 2>/dev/null; do sleep 0.05; done ;;\n\
-               *) ;;\n\
-             esac\n",
-            log = argv_log.display(),
-            pid = dir.join("container.pid").display(),
-        ),
-    )
+        "container",
+        "trap 'yes winding-down | head -n 200000; exit 143' TERM\n\
+         echo started\n\
+         while :; do sleep 0.05; done\n",
+    );
+    fake_docker_running(dir, argv_log, &container, false)
 }
 
-/// Were the stream left unread while `docker stop` ran, the container would
-/// block writing and `docker stop` would wait on it for good.
+/// A cancelled container that floods its log on the way out still ends its
+/// round, and is removed.
 #[tokio::test]
 async fn cancelling_a_container_that_prints_as_it_stops_still_ends_the_round() {
     let h = Harness::new().await;
@@ -253,7 +325,7 @@ async fn cancelling_a_container_that_prints_as_it_stops_still_ends_the_round() {
 
     let running = runner
         .launch(
-            &h.payload_for("x").await,
+            &h.launch_spec_for("x").await,
             &token(),
             &CancellationToken::new(),
         )
@@ -261,7 +333,7 @@ async fn cancelling_a_container_that_prints_as_it_stops_still_ends_the_round() {
         .unwrap();
     let collected = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        collect(running, &mut log, &paths.log(), 1, cancel),
+        collect(running, &mut log, &paths.log(), &paths.position(1), cancel),
     )
     .await;
 
@@ -283,7 +355,7 @@ async fn an_oom_killed_container_is_reported_by_its_reason() {
     };
     let mut running = runner
         .launch(
-            &h.payload_for("x").await,
+            &h.launch_spec_for("x").await,
             &token(),
             &CancellationToken::new(),
         )
@@ -319,4 +391,103 @@ async fn an_unreachable_docker_is_a_preflight_problem() {
         ),
         "{problems:?}"
     );
+}
+
+#[tokio::test]
+async fn a_docker_round_is_reattached_by_its_container_name() {
+    let h = Harness::new().await;
+    let fakes = h.scratch_root().with_file_name("fakes");
+    let argv = fakes.join("argv");
+    let runner = DockerRunner {
+        program: fake_docker(&fakes, &argv, false),
+        image: "img:1".into(),
+    };
+    let first = runner
+        .launch(
+            &h.launch_spec_for("write a file").await,
+            &token(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let handle = first.handle();
+    drop(first);
+
+    let again = runner.reattach(&handle).await.unwrap();
+    let paths = h.job_paths();
+    let mut log = EventLog::open_append(paths.events()).unwrap();
+    let verdict = collect(
+        again,
+        &mut log,
+        &paths.log(),
+        &paths.position(1),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert!(verdict.passed());
+    let output = std::fs::read_to_string(paths.log()).unwrap();
+    assert_eq!(
+        output.matches("fake-agent: write a file").count(),
+        1,
+        "{output}"
+    );
+    let calls = std::fs::read_to_string(&argv).unwrap();
+    assert_eq!(
+        calls.lines().filter(|l| l.starts_with("create")).count(),
+        1,
+        "{calls}"
+    );
+}
+
+/// Accepted risk 12, closed: a cancel while the image is still pulling
+/// leaves no container behind to start later.
+#[tokio::test]
+async fn a_round_cancelled_while_its_container_is_being_created_leaves_none() {
+    let h = Harness::new().await;
+    let fakes = h.scratch_root().with_file_name("fakes");
+    let argv = fakes.join("argv");
+    let creating = fakes.join("creating");
+    let runner = DockerRunner {
+        program: fake_cli(
+            &fakes,
+            "docker",
+            &format!(
+                "echo \"$*\" >> {argv}\n\
+                 if [ \"$1\" = create ]; then touch {creating}; exec sleep 30; fi\n",
+                argv = argv.display(),
+                creating = creating.display(),
+            ),
+        ),
+        image: "img:1".into(),
+    };
+    let spec = h.launch_spec_for("x").await;
+    let cancel = CancellationToken::new();
+    let cancel_once_pulling = cancel.clone();
+    tokio::spawn(async move {
+        while !creating.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        cancel_once_pulling.cancel();
+    });
+
+    let launched = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        runner.launch(&spec, &token(), &cancel),
+    )
+    .await
+    .expect("the cancel waited out the pull");
+
+    let err = launched.unwrap_err().to_string();
+    assert!(
+        err.contains("cancelled before the container started"),
+        "{err}"
+    );
+    let calls = std::fs::read_to_string(&argv).unwrap();
+    assert!(
+        calls.lines().any(|l| l == format!("rm -f {}", spec.name)),
+        "{calls}"
+    );
+    assert!(!calls.lines().any(|l| l.starts_with("start")), "{calls}");
 }

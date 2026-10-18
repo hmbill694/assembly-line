@@ -2,10 +2,13 @@
 /// stream.
 ///
 /// Nothing may live here that cannot be reconstructed from `events.jsonl`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum JobState {
     #[default]
     Pending,
+    /// Asked for, and waiting for a slot to run in.
+    Queued,
     Running,
     Passed,
     Failed,
@@ -16,6 +19,7 @@ impl JobState {
     pub fn label(self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::Queued => "queued",
             Self::Running => "running",
             Self::Passed => "passed",
             Self::Failed => "failed",

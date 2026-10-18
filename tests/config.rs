@@ -6,7 +6,6 @@ provider = "claude"
 verify = "cargo test"
 base = "develop"
 max_duration = "20m"
-copy = [".env", ".claude/settings.local.json"]
 
 [delivery]
 mode = "none"
@@ -24,7 +23,6 @@ fn parses_everything_a_repository_can_declare() {
     assert_eq!(config.verify.as_deref(), Some("cargo test"));
     assert_eq!(config.base.as_deref(), Some("develop"));
     assert_eq!(config.max_duration.as_deref(), Some("20m"));
-    assert_eq!(config.copy.len(), 2);
     assert_eq!(config.providers["claude"].cmd, "claude");
     assert_eq!(config.providers["claude"].args, vec!["-p", "{prompt}"]);
 }
@@ -101,6 +99,15 @@ fn rejects_an_unparseable_max_duration() {
 }
 
 #[test]
+fn a_command_limit_is_max_duration_in_whole_seconds_when_it_parses() {
+    let parsed = |body: &str| RepoConfig::parse(body).unwrap().command_limit_secs();
+
+    assert_eq!(parsed(FULL), Some(20 * 60));
+    assert_eq!(parsed("max_duration = \"soon\"\n"), None);
+    assert_eq!(parsed(""), None);
+}
+
+#[test]
 fn reports_every_problem_at_once() {
     let config = RepoConfig::parse("max_duration = \"soon\"\n").unwrap();
 
@@ -130,6 +137,23 @@ fn every_config_error_says_what_to_do_about_it() {
         ConfigError::UnparseableMaxDuration("soon".into())
             .to_string()
             .contains("20m")
+    );
+    assert!(ConfigError::CopyRetired.to_string().contains("--pass-env"));
+}
+
+#[test]
+fn a_config_that_still_declares_copy_is_told_what_to_do_instead() {
+    let config =
+        RepoConfig::parse("provider = \"p\"\ncopy = [\".env\"]\n[providers.p]\ncmd = \"p\"\n")
+            .expect("a retired field still parses, so it can be explained");
+
+    let problems = config.reasons_it_cannot_run("p");
+
+    assert_eq!(problems, [ConfigError::CopyRetired]);
+    let said = problems[0].to_string();
+    assert!(
+        said.contains("commit") && said.contains("--pass-env"),
+        "{said}"
     );
 }
 
