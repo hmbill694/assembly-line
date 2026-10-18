@@ -89,8 +89,7 @@ impl LaunchedRound {
     /// or running — rather than one past its verdict.
     fn is_awaited_by(&self, report: &JobReport) -> bool {
         match report.state {
-            JobState::Queued => report.rounds + 1 == self.round,
-            JobState::Running => report.rounds == self.round,
+            JobState::Queued | JobState::Running => report.rounds == self.round,
             JobState::Pending | JobState::Passed | JobState::Failed => false,
         }
     }
@@ -171,7 +170,7 @@ impl JobQueue {
         }
     }
 
-    /// Enter `address`'s next round in the cancel table, unless its job is
+    /// Enter `address`'s queued round in the cancel table, unless its job is
     /// no longer queued — cancelled while it waited — or that round was
     /// already launched from an earlier place in line: a job cancelled while
     /// queued and then revised is in line twice.
@@ -188,7 +187,7 @@ impl JobQueue {
             .get(address)
             .is_some_and(|launched| launched.is_awaited_by(&report));
         (report.state == JobState::Queued && !already_launched)
-            .then(|| self.register(&mut cancels, address, report.rounds + 1))
+            .then(|| self.register(&mut cancels, address, report.rounds))
     }
 
     /// Enter round `round` of `address`'s job, which an earlier daemon

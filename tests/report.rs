@@ -130,8 +130,77 @@ fn a_queued_revise_does_not_wear_the_previous_rounds_failure() {
 
     assert_eq!(
         JobReport::from_events(1, &events).to_status_lines(),
-        ["job 1: queued (round 1)", "id: 1", "logs: assembly logs 1"]
+        ["job 1: queued (round 2)", "id: 1", "logs: assembly logs 1"]
     );
+}
+
+#[test]
+fn a_round_cancelled_before_it_started_is_named_in_the_summary() {
+    let events = timeline(vec![
+        (0, requested("x", "a1")),
+        (
+            1,
+            EventKind::RoundFailed {
+                reason: "cancelled before it started".into(),
+            },
+        ),
+    ]);
+
+    assert_eq!(
+        JobReport::from_events(1, &events).to_summary_line(),
+        "job 1: failed (round 1) — cancelled before it started"
+    );
+}
+
+#[test]
+fn a_revise_cancelled_before_it_started_is_named_as_the_next_round() {
+    let events = timeline(vec![
+        (0, requested("x", "a1")),
+        (0, EventKind::RoundStarted { round: 1 }),
+        (4, EventKind::RoundPassed),
+        (60, requested("more", "b2")),
+        (
+            61,
+            EventKind::RoundFailed {
+                reason: "cancelled before it started".into(),
+            },
+        ),
+    ]);
+
+    assert_eq!(
+        JobReport::from_events(1, &events).to_summary_line(),
+        "job 1: failed (round 2) — cancelled before it started"
+    );
+}
+
+#[test]
+fn the_round_after_a_cancelled_one_takes_the_next_number() {
+    let events = timeline(vec![
+        (0, requested("x", "a1")),
+        (
+            1,
+            EventKind::RoundFailed {
+                reason: "cancelled before it started".into(),
+            },
+        ),
+        (2, requested("again", "a1")),
+    ]);
+
+    assert_eq!(JobReport::from_events(1, &events).rounds, 2);
+}
+
+/// A start recorded past the requests that survive a torn log keeps the next
+/// request from reusing its number.
+#[test]
+fn a_request_is_numbered_past_the_highest_round_started() {
+    let events = timeline(vec![
+        (0, requested("x", "a1")),
+        (0, EventKind::RoundStarted { round: 3 }),
+        (1, EventKind::RoundPassed),
+        (2, requested("more", "b2")),
+    ]);
+
+    assert_eq!(JobReport::from_events(1, &events).rounds, 4);
 }
 
 #[test]
@@ -458,7 +527,28 @@ fn status_of_a_job_whose_first_round_has_not_started_names_no_logs_command() {
     );
     assert_eq!(
         JobReport::from_events(1, &timeline(vec![(0, requested("x", "a1"))])).to_status_lines(),
-        ["job 1: queued", "id: 1"]
+        ["job 1: queued (round 1)", "id: 1"]
+    );
+}
+
+#[test]
+fn status_of_a_job_cancelled_before_its_first_round_names_no_logs_command() {
+    let events = timeline(vec![
+        (0, requested("x", "a1")),
+        (
+            1,
+            EventKind::RoundFailed {
+                reason: "cancelled before it started".into(),
+            },
+        ),
+    ]);
+
+    assert_eq!(
+        JobReport::from_events(2, &events).to_status_lines(),
+        [
+            "job 2: failed (round 1) — cancelled before it started",
+            "id: 2"
+        ]
     );
 }
 

@@ -442,7 +442,10 @@ async fn cancelling_a_queued_job_means_it_never_runs() {
     fx.assembly().args(["cancel", "3"]).assert().success();
 
     let second = wait_for_verdict(&fx.job_dir(2));
-    assert_eq!(second.rounds, 0, "the cancelled job was started anyway");
+    assert!(
+        !second.any_round_started,
+        "the cancelled job was started anyway"
+    );
     assert_eq!(
         second.detail.as_deref(),
         Some("cancelled before it started")
@@ -458,6 +461,44 @@ async fn cancelling_a_queued_job_means_it_never_runs() {
         "{:?}",
         fx.events_of(2)
     );
+}
+
+/// The round a cancel closed before it started keeps its number, so the
+/// revise after it is the job's second round, not a second first one.
+#[tokio::test]
+async fn a_revise_after_a_cancelled_queued_round_is_the_jobs_second_round() {
+    let fx = Fixture::running("sleeping-agent.sh", &["--max-jobs", "1"], &[]).await;
+    ["first", "second"].iter().for_each(|prompt| {
+        fx.assembly()
+            .args(["submit", "--prompt", prompt])
+            .assert()
+            .success();
+    });
+    wait_until_logged(&fx.job_dir(1), "sleeping-agent:");
+    fx.assembly().args(["cancel", "2"]).assert().success();
+    fx.assembly()
+        .args(["status", "2"])
+        .assert()
+        .success()
+        .stdout(contains(
+            "job 2: failed (round 1) — cancelled before it started",
+        ));
+    fx.assembly()
+        .args(["submit", "--job", "2", "--prompt", "again"])
+        .assert()
+        .success();
+
+    fx.assembly().args(["cancel", "1"]).assert().success();
+    wait_until_logged(&fx.job_dir(2), "sleeping-agent:");
+    fx.assembly().args(["cancel", "2"]).assert().success();
+
+    assert_eq!(wait_for_verdict(&fx.job_dir(2)).rounds, 2);
+    let starts: Vec<EventKind> = fx
+        .events_of(2)
+        .into_iter()
+        .filter(|kind| matches!(kind, EventKind::RoundStarted { .. }))
+        .collect();
+    assert_eq!(starts, [EventKind::RoundStarted { round: 2 }]);
 }
 
 /// A job whose round was dispatched but is still reading its config has not
@@ -488,7 +529,7 @@ async fn cancelling_a_job_still_reading_its_config_closes_it() {
 
     let second = wait_for_verdict(&fx.job_dir(2));
     std::fs::remove_file(&stall).unwrap();
-    assert_eq!(second.rounds, 0);
+    assert!(!second.any_round_started);
     assert_eq!(
         second.detail.as_deref(),
         Some("cancelled before it started")
@@ -549,7 +590,7 @@ async fn a_job_in_line_twice_is_launched_once() {
     fx.assembly().args(["cancel", "3"]).assert().success();
     let third = wait_for_verdict(&fx.job_dir(3));
     std::fs::remove_file(&stall).unwrap();
-    assert_eq!(third.rounds, 0, "{:?}", fx.events_of(3));
+    assert!(!third.any_round_started, "{:?}", fx.events_of(3));
 }
 
 /// A round's verdict is recorded before `run` has delivered it. From then

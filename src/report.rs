@@ -34,9 +34,14 @@ impl std::fmt::Display for DiffSummary {
 pub struct JobReport {
     pub id: u64,
     pub state: JobState,
-    /// How many rounds this job has had: the highest round any
-    /// `RoundStarted` records; 0 when none does.
+    /// How many rounds this job has had, which is also its latest round's
+    /// number: each `RoundRequested` takes the next one, whether or not that
+    /// round ever starts. A `RoundStarted` past it raises it, so that a
+    /// request lost to a torn log line cannot hand its number out again.
     pub rounds: u32,
+    /// Whether any round has started. Until one has, nothing can have been
+    /// captured for `assembly logs` to show.
+    pub any_round_started: bool,
     /// Wall time of the most recent round.
     pub duration: Option<Duration>,
     /// What the latest round committed, or `None` if its agent changed
@@ -72,6 +77,7 @@ pub struct JobReport {
 struct JobProgress {
     state: JobState,
     rounds: u32,
+    any_round_started: bool,
     round_started_at: Option<DateTime<Utc>>,
     last_round_duration: Option<Duration>,
     committed_diff: Option<DiffSummary>,
@@ -99,6 +105,7 @@ impl JobProgress {
                 // What waits is the round just asked for, so the previous
                 // round's reason, diff and timing no longer describe it.
                 state: JobState::Queued,
+                rounds: self.rounds + 1,
                 round_started_at: None,
                 last_round_duration: None,
                 committed_diff: None,
@@ -117,6 +124,7 @@ impl JobProgress {
             EventKind::RoundStarted { round } => JobProgress {
                 state: JobState::Running,
                 rounds: (*round).max(self.rounds),
+                any_round_started: true,
                 round_started_at: Some(event.at),
                 committed_diff: None,
                 detail: None,
@@ -185,6 +193,7 @@ impl JobReport {
             id,
             state: progress.state,
             rounds: progress.rounds,
+            any_round_started: progress.any_round_started,
             duration: progress.last_round_duration,
             diff: progress.committed_diff,
             detail: progress.detail,
@@ -202,7 +211,7 @@ impl JobReport {
 
     /// The single line printed at the end of a round:
     /// `job 7: failed (round 2, 3 files +40/-2) — verify failed`. A report
-    /// that saw no round start names no round.
+    /// that saw no round requested or started names no round.
     #[must_use]
     pub fn to_summary_line(&self) -> String {
         let facts: Vec<String> = [
@@ -248,16 +257,20 @@ impl JobReport {
 
     /// Everything `status` prints: the conclusion's lines with the job's id
     /// before its branch, and the command that prints its output once a
-    /// round has started — the collector creates the output log before it
-    /// records any event. `run` keeps no state for `logs` to read, which is
-    /// why the two differ.
+    /// round has started. A round that fails reading its config or launching
+    /// has started without capturing anything, so `logs` can still have
+    /// nothing to show. `run` keeps no state for `logs` to read, which is why
+    /// the two differ.
     #[must_use]
     pub fn to_status_lines(&self) -> Vec<String> {
         std::iter::once(self.to_summary_line())
             .chain(self.to_duration_line())
             .chain(std::iter::once(format!("id: {}", self.id)))
             .chain(self.work_location_lines())
-            .chain((self.rounds > 0).then(|| format!("logs: assembly logs {}", self.id)))
+            .chain(
+                self.any_round_started
+                    .then(|| format!("logs: assembly logs {}", self.id)),
+            )
             .collect()
     }
 
