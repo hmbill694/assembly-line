@@ -74,8 +74,8 @@ impl RepoLocks {
     }
 }
 
-/// Each launched round, until its task is over — which can be well after
-/// its verdict, while `run` delivers and cleans up.
+/// Each launched round, until its task is over. That is a little after its
+/// verdict: all `run` does past it is discard its clone.
 type CancelTable = Arc<Mutex<HashMap<JobAddress, LaunchedRound>>>;
 
 #[derive(Debug)]
@@ -244,7 +244,7 @@ impl JobQueue {
 /// A launched round's entry in the cancel table, removed however its task
 /// ends — unless a later round of the job has taken its place, which a
 /// revise accepted after this round's verdict can do while `run` is still
-/// delivering it.
+/// discarding its clone.
 struct Registration {
     cancels: CancelTable,
     address: JobAddress,

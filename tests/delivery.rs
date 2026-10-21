@@ -1,11 +1,14 @@
 use assembly_line::config::{Delivery, DeliveryMode, RepoConfig};
 use assembly_line::delivery::{Delivered, PullRequestText, deliver};
+use assembly_line::event::EventKind;
+use assembly_line::frame::{Frame, FrameBody};
 use assembly_line::git;
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use std::path::{Path, PathBuf};
 use support::commit_all;
+use tokio_util::sync::CancellationToken;
 
 mod support;
 
@@ -41,6 +44,7 @@ async fn delivery_is_skipped_when_it_is_turned_off() {
             title: "job 1: x",
             body: "x",
         },
+        &CancellationToken::new(),
     )
     .await;
     assert!(matches!(outcome, Delivered::Skipped(_)), "{outcome:?}");
@@ -372,6 +376,47 @@ async fn a_revise_whose_pull_request_was_merged_opens_another() {
 
     let args = std::fs::read_to_string(&args_log).unwrap();
     assert_eq!(args.matches("pr create").count(), 2, "{args}");
+
+    discard_outside_state(&tmp);
+}
+
+/// The verdict is the last thing a round reports, so a collector that has
+/// seen it has seen the pull request too.
+#[tokio::test]
+async fn a_passing_round_reports_its_pull_request_before_its_verdict() {
+    let tmp = repo_running("fake-agent.sh", "true").await;
+    let (gh_dir, _) = fake_gh_capturing_args(&tmp);
+
+    let out = assembly(&tmp)
+        .env("PATH", path_with(&gh_dir))
+        .args(["run", "--prompt", "x", "--frames"])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "{out:?}");
+    let events: Vec<EventKind> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(
+            |line| match serde_json::from_str::<Frame>(line).unwrap().body {
+                FrameBody::Event(event) => Some(event.kind),
+                FrameBody::Output(_) => None,
+            },
+        )
+        .collect();
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                ..,
+                EventKind::RoundCommitted { .. },
+                EventKind::BranchPushed { .. },
+                EventKind::PullRequestOpened { .. },
+                EventKind::RoundPassed,
+            ]
+        ),
+        "{events:?}"
+    );
 
     discard_outside_state(&tmp);
 }

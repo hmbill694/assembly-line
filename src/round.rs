@@ -43,6 +43,40 @@ impl Verdict {
     }
 }
 
+/// A round's verdict and the events that record it — always the last a
+/// round reports, so whoever runs the round appends them once nothing else
+/// is left to report.
+#[derive(Debug)]
+pub struct RoundClosing {
+    pub verdict: Verdict,
+    events: Vec<EventKind>,
+}
+
+impl RoundClosing {
+    fn passed() -> Self {
+        Self {
+            verdict: Verdict::Passed,
+            events: vec![EventKind::RoundPassed],
+        }
+    }
+
+    #[must_use]
+    pub fn failed_because(reason: String) -> Self {
+        Self {
+            verdict: Verdict::Failed,
+            events: vec![EventKind::RoundFailed { reason }],
+        }
+    }
+
+    /// # Errors
+    ///
+    /// When the frames cannot be written.
+    pub fn append_to<W: Write>(self, frames: &FrameWriter<W>) -> std::io::Result<Verdict> {
+        append_all(frames, self.events)?;
+        Ok(self.verdict)
+    }
+}
+
 /// What an agent left behind, recorded on the job's branch.
 #[derive(Debug)]
 struct AgentWork {
@@ -93,8 +127,10 @@ pub fn discard_reporting_failure<W: Write>(
 }
 
 /// One round in `ws`, which the caller cloned and will discard: provision,
-/// agent, commit, push, `verify`, and the events that record them. No
-/// `RoundStarted`: whoever collects the round numbers it.
+/// agent, commit, push, `verify`, and the events that record its work. No
+/// `RoundStarted`: whoever collects the round numbers it. The round's
+/// closing events come back unwritten, for the caller to append after
+/// anything it still does with the work.
 ///
 /// `provisioning_deadline` is what is left of the budget the clone and
 /// provisioning share, fixed before the clone began.
@@ -102,14 +138,14 @@ pub fn discard_reporting_failure<W: Write>(
 /// # Errors
 ///
 /// Only when the round's frames cannot be written. An agent that fails and a
-/// push that fails are both [`Verdict::Failed`], reported as events.
+/// push that fails both close the round as [`Verdict::Failed`].
 pub async fn run_round_in<W: Write + Send + 'static>(
     payload: &RoundPayload,
     ws: &RoundWorkspace,
     frames: &FrameWriter<W>,
     provisioning_deadline: Instant,
     cancel: CancellationToken,
-) -> anyhow::Result<Verdict> {
+) -> anyhow::Result<RoundClosing> {
     let timeout = payload.command_limit_secs.map(Duration::from_secs);
     let result = result_in_workspace(payload, ws, frames, provisioning_deadline, timeout, cancel)
         .await
@@ -121,7 +157,9 @@ pub async fn run_round_in<W: Write + Send + 'static>(
             work: None,
         });
 
-    record_completion(frames, result)
+    let (work, closing) = events_for_completion(result);
+    append_all(frames, work)?;
+    Ok(closing)
 }
 
 /// `cloning`, cut off at [`PROVISIONING_LIMIT`] or by `cancel`.
@@ -342,17 +380,10 @@ async fn agent_work_on_branch(
     }))
 }
 
-fn record_completion<W: Write>(
-    frames: &FrameWriter<W>,
-    result: RoundResult,
-) -> anyhow::Result<Verdict> {
-    let (events, verdict) = events_for_completion(result);
-
+fn append_all<W: Write>(frames: &FrameWriter<W>, events: Vec<EventKind>) -> std::io::Result<()> {
     events
         .into_iter()
-        .try_for_each(|kind| frames.append_event(kind).map(|_| ()))?;
-
-    Ok(verdict)
+        .try_for_each(|kind| frames.append_event(kind).map(|_| ()))
 }
 
 /// Empty for an agent that correctly changed nothing.
@@ -374,41 +405,35 @@ fn work_recorded(work: Option<&AgentWork>) -> Vec<EventKind> {
     .unwrap_or_default()
 }
 
-/// The events a completion implies, in the order things settled, paired with
-/// the verdict they add up to.
+/// The events a completion implies, in the order things settled: those
+/// recording the work, then those closing the round with the verdict they
+/// add up to.
 ///
 /// Pure, so the ordering that makes replay correct can be asserted without
 /// running anything. Work is recorded before the verdict that judges it.
-fn events_for_completion(result: RoundResult) -> (Vec<EventKind>, Verdict) {
+fn events_for_completion(result: RoundResult) -> (Vec<EventKind>, RoundClosing) {
     match result {
-        RoundResult::PassedUnchanged => (vec![EventKind::RoundPassed], Verdict::Passed),
-        RoundResult::PassedWithWork { work } => (
-            work_recorded(Some(&work))
-                .into_iter()
-                .chain([EventKind::RoundPassed])
-                .collect(),
-            Verdict::Passed,
-        ),
+        RoundResult::PassedUnchanged => (Vec::new(), RoundClosing::passed()),
+        RoundResult::PassedWithWork { work } => {
+            (work_recorded(Some(&work)), RoundClosing::passed())
+        }
         RoundResult::Rejected { reason, work } => (
-            work_recorded(work.as_ref())
-                .into_iter()
-                .chain([
+            work_recorded(work.as_ref()),
+            RoundClosing {
+                verdict: Verdict::Failed,
+                events: vec![
                     EventKind::VerifyRejected {
                         reason: reason.clone(),
                     },
                     EventKind::RoundFailed {
                         reason: format!("verify rejected the work: {reason}"),
                     },
-                ])
-                .collect(),
-            Verdict::Failed,
+                ],
+            },
         ),
         RoundResult::Failed { reason, work } => (
-            work_recorded(work.as_ref())
-                .into_iter()
-                .chain([EventKind::RoundFailed { reason }])
-                .collect(),
-            Verdict::Failed,
+            work_recorded(work.as_ref()),
+            RoundClosing::failed_because(reason),
         ),
     }
 }

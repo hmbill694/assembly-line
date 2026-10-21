@@ -74,7 +74,7 @@ pub async fn run_allowing_failure(
         .kill_on_drop(true)
         .spawn()
         .map_err(failed)?;
-    let group = GroupKilledOnDrop(child.id().and_then(|id| i32::try_from(id).ok()));
+    let group = GroupKilledOnDrop::led_by(&child);
     let output = child.wait_with_output().await.map_err(failed)?;
     group.disarm();
 
@@ -86,11 +86,17 @@ pub async fn run_allowing_failure(
 }
 
 /// A process group killed when this is dropped, unless disarmed first.
-struct GroupKilledOnDrop(Option<i32>);
+pub(crate) struct GroupKilledOnDrop(Option<i32>);
 
 impl GroupKilledOnDrop {
+    /// The group `leader` leads, which it does once started through
+    /// `exec::detach_from_terminal`.
+    pub(crate) fn led_by(leader: &tokio::process::Child) -> Self {
+        Self(leader.id().and_then(|id| i32::try_from(id).ok()))
+    }
+
     /// The leader finished on its own; nothing is left to kill.
-    fn disarm(mut self) {
+    pub(crate) fn disarm(mut self) {
         self.0 = None;
     }
 }

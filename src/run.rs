@@ -16,8 +16,8 @@ use crate::job::JobId;
 use crate::payload::{RoundPayload, RoundRequest, remote_to_clone};
 use crate::report::JobReport;
 use crate::round::{
-    PROVISIONING_LIMIT, Verdict, credential_helper_for_this_environment, discard_reporting_failure,
-    run_round_in, within_provisioning_limit,
+    PROVISIONING_LIMIT, RoundClosing, Verdict, credential_helper_for_this_environment,
+    discard_reporting_failure, run_round_in, within_provisioning_limit,
 };
 use crate::workspace::{self, DEFAULT_REMOTE, RoundWorkspace, ScratchClone};
 use anyhow::anyhow;
@@ -242,7 +242,9 @@ impl ReadyJob {
         }
     }
 
-    /// Run the round, deliver its branch if it passed, and conclude.
+    /// Run the round, deliver its branch if it passed, and only then report
+    /// its verdict: a collector that sees the verdict has seen everything
+    /// the round will report, and one that does not keeps reading.
     ///
     /// # Errors
     ///
@@ -270,14 +272,16 @@ impl ReadyJob {
                 return Ok(conclusion_of(&payload, frames, Verdict::Failed, None));
             }
         };
-        let verdict = run_round_in(&payload, &ws, frames, provisioning_deadline, cancel).await?;
+        let closing =
+            run_round_in(&payload, &ws, frames, provisioning_deadline, cancel.clone()).await?;
 
-        let base_differs = match verdict {
+        let base_differs = match closing.verdict {
             Verdict::Passed if branch_carries_work(&ws, &payload, &base, frames).await => {
-                deliver(&ws, &config, &base, &payload, &prompt, frames).await?
+                deliver(&ws, &config, &base, &payload, &prompt, frames, &cancel).await?
             }
             Verdict::Passed | Verdict::Failed => None,
         };
+        let verdict = closing_after_delivery(closing, &cancel).append_to(frames)?;
         discard_reporting_failure(ws, frames)?;
         Ok(conclusion_of(&payload, frames, verdict, base_differs))
     }
@@ -316,6 +320,7 @@ async fn deliver<W: Write + Send + 'static>(
     payload: &RoundPayload,
     prompt: &str,
     frames: &FrameWriter<W>,
+    cancel: &CancellationToken,
 ) -> anyhow::Result<Option<BaseDiffers>> {
     let target = config.base.as_deref().unwrap_or(&base.name);
     let base_differs = (target != base.name).then(|| BaseDiffers {
@@ -331,6 +336,7 @@ async fn deliver<W: Write + Send + 'static>(
             title: payload.commit_message.lines().next().unwrap_or_default(),
             body: prompt,
         },
+        cancel,
     )
     .await;
     match delivered {
@@ -340,6 +346,19 @@ async fn deliver<W: Write + Send + 'static>(
         other => frames.append_output(&other.to_string())?,
     }
     Ok(base_differs)
+}
+
+/// How a round closes once delivery is over. The job reads as running until
+/// its verdict, so a cancel can arrive after the round passed; it fails the
+/// round, as it would have failed it any earlier, whether or not a pull
+/// request was opened before it came.
+fn closing_after_delivery(closing: RoundClosing, cancel: &CancellationToken) -> RoundClosing {
+    match (closing.verdict, cancel.is_cancelled()) {
+        (Verdict::Passed, true) => {
+            RoundClosing::failed_because("cancelled while delivering its pull request".to_string())
+        }
+        (Verdict::Passed, false) | (Verdict::Failed, _) => closing,
+    }
 }
 
 fn conclusion_of<W: Write>(

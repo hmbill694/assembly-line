@@ -43,10 +43,25 @@ impl Fixture {
     }
 
     async fn repository(config: &str) -> Self {
+        Self::configured(&format!("{config}\n{DELIVERY_OFF}")).await
+    }
+
+    /// Like [`Fixture::running`], but its passing rounds open pull requests
+    /// through whatever `gh` the daemon's `PATH` finds.
+    async fn delivering(script: &str, daemon_env: &[(&str, &str)]) -> Self {
+        let fx = Self::configured(&format!(
+            "verify = \"true\"\n{}",
+            support::config_running(script)
+        ))
+        .await;
+        fx.with_daemon(&[], daemon_env)
+    }
+
+    async fn configured(config: &str) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let origin = tmp.path().join("origin.git");
-        publish_opted_in_repository(&repo, &origin, config).await;
+        publish_configured_repository(&repo, &origin, config).await;
         Fixture {
             daemon: None,
             tmp,
@@ -137,16 +152,20 @@ impl Drop for Fixture {
     }
 }
 
-/// A checkout at `repo` that opts in with `config`, published to a bare
-/// `origin`.
+const DELIVERY_OFF: &str = "[delivery]\nmode = \"none\"\n";
+
+/// A checkout at `repo` that opts in with `config` and delivers nothing,
+/// published to a bare `origin`.
 async fn publish_opted_in_repository(repo: &Path, origin: &Path, config: &str) {
+    publish_configured_repository(repo, origin, &format!("{config}\n{DELIVERY_OFF}")).await;
+}
+
+/// A checkout at `repo` whose whole config is `config`, published to a bare
+/// `origin`.
+async fn publish_configured_repository(repo: &Path, origin: &Path, config: &str) {
     support::init_git_repo(repo).await;
     std::fs::create_dir_all(repo.join(".assembly")).unwrap();
-    std::fs::write(
-        repo.join(REPO_CONFIG_PATH),
-        format!("{config}\n[delivery]\nmode = \"none\"\n"),
-    )
-    .unwrap();
+    std::fs::write(repo.join(REPO_CONFIG_PATH), config).unwrap();
     support::commit_all(repo, "opt in").await.unwrap().unwrap();
     support::add_origin(repo, origin).await;
     support::publish_main(repo).await;
@@ -593,42 +612,110 @@ async fn a_job_in_line_twice_is_launched_once() {
     assert!(!third.any_round_started, "{:?}", fx.events_of(3));
 }
 
-/// A round's verdict is recorded before `run` has delivered it. From then
-/// on the job is over: a cancel is refused, and a revise is its next round
-/// rather than lost behind the one still delivering.
+/// A round reports its verdict only once its pull request is open, so a
+/// daemon restarted mid-delivery still has a round to reattach to, and
+/// collects the pull request.
 #[tokio::test]
-async fn a_job_whose_round_is_still_delivering_has_its_verdict() {
+async fn a_round_delivering_across_a_daemon_restart_still_reports_its_pull_request() {
     let fakes = tempfile::tempdir().unwrap();
     let stall = fakes.path().join("stall");
-    let path = path_where_git_stalls(fakes.path(), &stall, DELIVERY_CHECK_IN_A_CLONE);
+    let path = path_where_gh_stalls(fakes.path(), &stall, "create");
     std::fs::write(&stall, "").unwrap();
-    let fx = Fixture::running(
-        "fake-agent.sh",
-        &["--max-jobs", "2"],
-        &[("PATH", path.as_str())],
-    )
-    .await;
+    let mut fx = Fixture::delivering("fake-agent.sh", &[("PATH", path.as_str())]).await;
     fx.assembly()
         .args(["submit", "--prompt", "x"])
         .assert()
         .success();
     wait_until_stalled_times(&stall, 1);
-    assert_eq!(wait_for_verdict(&fx.job_dir(1)).state, JobState::Passed);
+
+    assert!(fx.daemon.take().unwrap().stop().success());
+    let fx = fx.with_daemon(&[], &[("PATH", path.as_str())]);
+    std::fs::remove_file(&stall).unwrap();
+    let report = wait_for_verdict(&fx.job_dir(1));
+
+    assert_eq!(report.state, JobState::Passed);
+    let events = fx.events_of(1);
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                ..,
+                EventKind::PullRequestOpened { .. },
+                EventKind::RoundPassed
+            ]
+        ),
+        "{events:?}"
+    );
+    fx.assembly()
+        .args(["status", "1"])
+        .assert()
+        .success()
+        .stdout(contains("pull request: https://example.invalid/pr/1"));
+}
+
+/// A round delivering its pull request has no verdict yet, so it can be
+/// cancelled, and fails saying where it was.
+#[tokio::test]
+async fn a_round_cancelled_while_delivering_fails_as_cancelled() {
+    let fakes = tempfile::tempdir().unwrap();
+    let stall = fakes.path().join("stall");
+    let path = path_where_gh_stalls(fakes.path(), &stall, "create");
+    std::fs::write(&stall, "").unwrap();
+    let fx = Fixture::delivering("fake-agent.sh", &[("PATH", path.as_str())]).await;
+    fx.assembly()
+        .args(["submit", "--prompt", "x"])
+        .assert()
+        .success();
+    wait_until_stalled_times(&stall, 1);
 
     fx.assembly()
         .args(["cancel", "1"])
         .assert()
-        .code(2)
-        .stderr(contains("job 1 is not queued or running"));
-    fx.assembly()
-        .args(["submit", "--job", "1", "--prompt", "more"])
-        .assert()
-        .success();
-    let revised = wait_for_verdict(&fx.job_dir(1));
+        .success()
+        .stdout(contains("job 1: cancelling"));
+    wait_for_verdict(&fx.job_dir(1));
     std::fs::remove_file(&stall).unwrap();
 
-    assert_eq!(revised.state, JobState::Passed);
-    assert_eq!(revised.rounds, 2);
+    fx.assembly()
+        .args(["status", "1"])
+        .assert()
+        .success()
+        .stdout(
+            contains(
+                "job 1: failed (round 1, 1 file +1/-0) — cancelled while delivering its pull \
+                 request",
+            )
+            .and(contains("pull request:").not()),
+        );
+}
+
+/// A cancel while `gh` looks for the branch's pull request ends delivery
+/// there: an interrupted look is not "none open", so none is asked for.
+#[tokio::test]
+async fn a_round_cancelled_while_looking_for_its_pull_request_asks_for_none() {
+    let fakes = tempfile::tempdir().unwrap();
+    let stall = fakes.path().join("stall");
+    let path = path_where_gh_stalls(fakes.path(), &stall, "view");
+    std::fs::write(&stall, "").unwrap();
+    let fx = Fixture::delivering("fake-agent.sh", &[("PATH", path.as_str())]).await;
+    fx.assembly()
+        .args(["submit", "--prompt", "x"])
+        .assert()
+        .success();
+    wait_until_stalled_times(&stall, 1);
+
+    fx.assembly().args(["cancel", "1"]).assert().success();
+    let report = wait_for_verdict(&fx.job_dir(1));
+    std::fs::remove_file(&stall).unwrap();
+
+    assert_eq!(
+        report.detail.as_deref(),
+        Some("cancelled while delivering its pull request")
+    );
+    assert_eq!(
+        std::fs::read_to_string(stall.with_extension("calls")).unwrap(),
+        "pr view\n"
+    );
 }
 
 #[tokio::test]
@@ -1188,13 +1275,6 @@ const CONFIG_READ_IN_THE_CACHE: GitCall = GitCall {
     when: "[ \"$1\" = cat-file ]",
 };
 
-/// `run` asking whether the branch it pushed carries work worth delivering —
-/// after the round's verdict. Committing asks the same of `..HEAD`, before.
-const DELIVERY_CHECK_IN_A_CLONE: GitCall = GitCall {
-    in_dir: "*/scratch/*",
-    when: "[ \"$1\" = rev-list ] && [ \"${3%..HEAD}\" = \"$3\" ]",
-};
-
 /// A `PATH` whose `git`, while `stall` exists, holds up every `call` until
 /// `stall` is removed, adding a line to `<stall>.reached` as each one
 /// begins to wait.
@@ -1227,14 +1307,42 @@ fn path_where_git_stalls(fakes: &Path, stall: &Path, call: GitCall) -> String {
     format!("{}:{}", fakes.display(), support::path_where_gh_refuses())
 }
 
-/// Wait until `times` git calls have stalled on `stall`.
+/// A `PATH` whose `gh` finds no pull request open and opens one when asked,
+/// adding each call to `<stall>.calls`. While `stall` exists, `gh pr
+/// {subcommand}` waits until it is removed, adding a line to
+/// `<stall>.reached` as it begins to.
+fn path_where_gh_stalls(fakes: &Path, stall: &Path, subcommand: &str) -> String {
+    support::fake_cli(
+        fakes,
+        "gh",
+        &format!(
+            "echo \"$1 $2\" >> '{stall}.calls'\n\
+             if [ \"$1 $2\" = 'pr {subcommand}' ] && [ -e '{stall}' ]; then\n  \
+               echo stalled >> '{stall}.reached'\n  \
+               while [ -e '{stall}' ]; do sleep 0.1; done\n\
+             fi\n\
+             case \"$1 $2\" in\n  \
+               'pr view') exit 1 ;;\n  \
+               'pr create') echo https://example.invalid/pr/1 ;;\n\
+             esac\n",
+            stall = stall.display(),
+        ),
+    );
+    format!(
+        "{}:{}",
+        fakes.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+/// Wait until `times` calls have stalled on `stall`.
 fn wait_until_stalled_times(stall: &Path, times: usize) {
     let reached = stall.with_extension("reached");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while std::fs::read_to_string(&reached).map_or(0, |log| log.lines().count()) < times {
         assert!(
             std::time::Instant::now() < deadline,
-            "fewer than {times} git calls ever stalled on {}",
+            "fewer than {times} calls ever stalled on {}",
             stall.display()
         );
         std::thread::sleep(std::time::Duration::from_millis(50));

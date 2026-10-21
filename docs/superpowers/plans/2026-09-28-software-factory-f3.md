@@ -23,8 +23,6 @@ Known open:
   a verdict: exit 2"; its reason is in `assembly logs`.
 - A revise cancelled before it starts shows "failed (round 1)", naming the
   round before it.
-- A round with a verdict still delivering when the daemon stops loses its
-  `PullRequestOpened` event; the pull request is still opened.
 - `tests/kubernetes_runner.rs` cancels after a fixed 300ms and may be
   timing-sensitive.
 - The stack's revisions below `rtuzrxvq` still carry the flaky
