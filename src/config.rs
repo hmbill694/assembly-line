@@ -124,46 +124,86 @@ impl RepoConfig {
         toml::from_str(src).map_err(|e| anyhow::anyhow!("parsing {REPO_CONFIG_PATH}: {e}"))
     }
 
-    /// Every reason this repository cannot run a job with `provider`, so all
-    /// of them are fixed in one pass rather than one per run.
+    /// The settings a job with `provider_named` runs under, or every reason
+    /// it cannot run, so all of them are fixed in one pass rather than one
+    /// per run.
     ///
-    /// `provider` is what the job will actually use — the command line's
-    /// choice when it named one, otherwise [`RepoConfig::provider`].
-    #[must_use]
-    pub fn reasons_it_cannot_run(&self, provider: &str) -> Vec<ConfigError> {
-        let undeclared = match (provider.is_empty(), self.providers.contains_key(provider)) {
-            (true, _) => Some(ConfigError::NoProviderDeclared),
-            (false, false) => Some(ConfigError::UnknownProvider(provider.to_string())),
-            (false, true) => None,
-        };
+    /// The job's provider is `provider_named` when the command line named
+    /// one, otherwise [`RepoConfig::provider`].
+    ///
+    /// # Errors
+    ///
+    /// Every [`ConfigError`] that stops the job.
+    pub fn settings_for(
+        &self,
+        provider_named: Option<&str>,
+    ) -> Result<JobSettings, Vec<ConfigError>> {
+        let provider = self.provider_named_or_default(provider_named);
+        let max_duration = self.max_duration_parsed();
+        let copy_retired = self
+            .retired_copy
+            .is_some()
+            .then_some(ConfigError::CopyRetired);
 
-        undeclared
-            .into_iter()
-            .chain(self.unparseable_max_duration())
-            .chain(
-                self.retired_copy
-                    .is_some()
-                    .then_some(ConfigError::CopyRetired),
-            )
-            .collect()
+        match (provider, max_duration, copy_retired) {
+            (Ok((provider_name, provider)), Ok(max_duration), None) => Ok(JobSettings {
+                provider_name,
+                provider,
+                verify: self.verify.clone(),
+                pull_request_target: self.base.clone(),
+                max_duration,
+                delivery: self.delivery.clone(),
+            }),
+            (provider, max_duration, copy_retired) => Err(provider
+                .err()
+                .into_iter()
+                .chain(max_duration.err())
+                .chain(copy_retired)
+                .collect()),
+        }
     }
 
-    fn unparseable_max_duration(&self) -> Option<ConfigError> {
-        let value = self.max_duration.as_deref()?;
-        parse_duration(value)
-            .is_err()
-            .then(|| ConfigError::UnparseableMaxDuration(value.to_string()))
+    fn provider_named_or_default(
+        &self,
+        provider_named: Option<&str>,
+    ) -> Result<(String, Provider), ConfigError> {
+        let name = provider_named
+            .or(self.provider.as_deref())
+            .ok_or(ConfigError::NoProviderDeclared)?;
+        self.providers
+            .get(name)
+            .map(|provider| (name.to_string(), provider.clone()))
+            .ok_or_else(|| ConfigError::UnknownProvider(name.to_string()))
     }
 
-    /// `max_duration` in whole seconds, when it is set and parses.
-    #[must_use]
-    pub fn command_limit_secs(&self) -> Option<u64> {
+    fn max_duration_parsed(&self) -> Result<Option<Duration>, ConfigError> {
         self.max_duration
             .as_deref()
-            .and_then(|value| parse_duration(value).ok())
-            .map(|limit| limit.as_secs())
+            .map(|value| {
+                parse_duration(value)
+                    .map_err(|_| ConfigError::UnparseableMaxDuration(value.to_string()))
+            })
+            .transpose()
     }
+}
 
+/// What one job runs under: a repository's config with the job's provider
+/// chosen and every setting checked. Only [`RepoConfig::settings_for`] makes
+/// one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct JobSettings {
+    pub provider_name: String,
+    pub provider: Provider,
+    pub verify: Option<String>,
+    /// See [`RepoConfig::base`].
+    pub pull_request_target: Option<String>,
+    /// See [`RepoConfig::max_duration`].
+    pub max_duration: Option<Duration>,
+    pub delivery: Delivery,
+}
+
+impl JobSettings {
     /// Settings worth telling the user about, none of which stop a job.
     #[must_use]
     pub fn settings_worth_flagging(&self) -> Vec<Warning> {

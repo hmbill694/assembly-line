@@ -180,6 +180,7 @@ async fn a_repository_that_has_not_opted_in_is_told_which_file_to_write() {
         .args(["run", "--prompt", "x"])
         .assert()
         .code(2)
+        .stdout("")
         .stderr(contains(".assembly/config.toml"));
 
     assert_eq!(

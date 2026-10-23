@@ -1,4 +1,4 @@
-use assembly_line::config::{ConfigError, RepoConfig, Warning, parse_duration};
+use assembly_line::config::{ConfigError, DeliveryMode, RepoConfig, Warning, parse_duration};
 use std::time::Duration;
 
 const FULL: &str = r#"
@@ -55,64 +55,92 @@ fn parses_durations() {
 // Validation. Job ids are allocated, never configured, so what is left to get
 // wrong is the provider and the duration.
 
+fn reasons_it_cannot_run(body: &str, provider_named: Option<&str>) -> Vec<ConfigError> {
+    RepoConfig::parse(body)
+        .unwrap()
+        .settings_for(provider_named)
+        .expect_err("the settings were valid")
+}
+
 #[test]
 fn a_provider_the_repository_never_declared_is_rejected() {
-    let config = RepoConfig::parse("[providers.real]\ncmd = \"true\"\n").unwrap();
-
     assert_eq!(
-        config.reasons_it_cannot_run("ghost"),
+        reasons_it_cannot_run("[providers.real]\ncmd = \"true\"\n", Some("ghost")),
         vec![ConfigError::UnknownProvider("ghost".into())]
     );
 }
 
 #[test]
 fn a_repository_naming_no_provider_at_all_is_rejected() {
-    let config = RepoConfig::parse("[providers.real]\ncmd = \"true\"\n").unwrap();
-
     assert_eq!(
-        config.reasons_it_cannot_run(""),
+        reasons_it_cannot_run("[providers.real]\ncmd = \"true\"\n", None),
         vec![ConfigError::NoProviderDeclared]
     );
 }
 
 #[test]
-fn a_declared_provider_is_accepted() {
+fn a_job_runs_under_the_provider_the_repository_names_by_default() {
+    let settings = RepoConfig::parse(FULL).unwrap().settings_for(None).unwrap();
+
+    assert_eq!(settings.provider_name, "claude");
+    assert_eq!(settings.provider.cmd, "claude");
+}
+
+#[test]
+fn a_provider_named_for_the_job_wins_over_the_default() {
     let config = RepoConfig::parse(
-        "provider = \"real\"\nverify = \"true\"\n[providers.real]\ncmd = \"true\"\n",
+        "provider = \"real\"\n[providers.real]\ncmd = \"real\"\n[providers.other]\ncmd = \"other\"\n",
     )
     .unwrap();
 
-    assert!(config.reasons_it_cannot_run("real").is_empty());
+    let settings = config.settings_for(Some("other")).unwrap();
+
+    assert_eq!(settings.provider_name, "other");
+    assert_eq!(settings.provider.cmd, "other");
+}
+
+#[test]
+fn settings_carry_everything_else_the_repository_declares() {
+    let settings = RepoConfig::parse(FULL).unwrap().settings_for(None).unwrap();
+
+    assert_eq!(settings.verify.as_deref(), Some("cargo test"));
+    assert_eq!(settings.pull_request_target.as_deref(), Some("develop"));
+    assert_eq!(settings.delivery.mode, DeliveryMode::None);
 }
 
 #[test]
 fn rejects_an_unparseable_max_duration() {
-    let config = RepoConfig::parse(
-        "provider = \"p\"\nmax_duration = \"soon\"\n[providers.p]\ncmd = \"true\"\n",
-    )
-    .unwrap();
-
     assert_eq!(
-        config.reasons_it_cannot_run("p"),
+        reasons_it_cannot_run(
+            "provider = \"p\"\nmax_duration = \"soon\"\n[providers.p]\ncmd = \"true\"\n",
+            None
+        ),
         vec![ConfigError::UnparseableMaxDuration("soon".into())]
     );
 }
 
 #[test]
-fn a_command_limit_is_max_duration_in_whole_seconds_when_it_parses() {
-    let parsed = |body: &str| RepoConfig::parse(body).unwrap().command_limit_secs();
+fn a_max_duration_reaches_the_settings_as_a_duration() {
+    let max_duration = |body: &str| {
+        RepoConfig::parse(body)
+            .unwrap()
+            .settings_for(Some("p"))
+            .unwrap()
+            .max_duration
+    };
+    let runnable = "[providers.p]\ncmd = \"true\"\n";
 
-    assert_eq!(parsed(FULL), Some(20 * 60));
-    assert_eq!(parsed("max_duration = \"soon\"\n"), None);
-    assert_eq!(parsed(""), None);
+    assert_eq!(
+        max_duration(&format!("max_duration = \"20m\"\n{runnable}")),
+        Some(Duration::from_mins(20))
+    );
+    assert_eq!(max_duration(runnable), None);
 }
 
 #[test]
 fn reports_every_problem_at_once() {
-    let config = RepoConfig::parse("max_duration = \"soon\"\n").unwrap();
-
     assert_eq!(
-        config.reasons_it_cannot_run(""),
+        reasons_it_cannot_run("max_duration = \"soon\"\n", None),
         vec![
             ConfigError::NoProviderDeclared,
             ConfigError::UnparseableMaxDuration("soon".into())
@@ -143,11 +171,10 @@ fn every_config_error_says_what_to_do_about_it() {
 
 #[test]
 fn a_config_that_still_declares_copy_is_told_what_to_do_instead() {
-    let config =
-        RepoConfig::parse("provider = \"p\"\ncopy = [\".env\"]\n[providers.p]\ncmd = \"p\"\n")
-            .expect("a retired field still parses, so it can be explained");
-
-    let problems = config.reasons_it_cannot_run("p");
+    let problems = reasons_it_cannot_run(
+        "provider = \"p\"\ncopy = [\".env\"]\n[providers.p]\ncmd = \"p\"\n",
+        None,
+    );
 
     assert_eq!(problems, [ConfigError::CopyRetired]);
     let said = problems[0].to_string();
@@ -159,12 +186,14 @@ fn a_config_that_still_declares_copy_is_told_what_to_do_instead() {
 
 #[test]
 fn a_repository_with_no_verify_is_warned_about_but_still_runnable() {
-    let config = RepoConfig::parse("provider = \"p\"\n[providers.p]\ncmd = \"true\"\n").unwrap();
+    let settings = RepoConfig::parse("provider = \"p\"\n[providers.p]\ncmd = \"true\"\n")
+        .unwrap()
+        .settings_for(None)
+        .expect("no verify is still runnable");
 
-    assert!(config.reasons_it_cannot_run("p").is_empty());
-    assert_eq!(config.settings_worth_flagging(), vec![Warning::NoVerify]);
+    assert_eq!(settings.settings_worth_flagging(), vec![Warning::NoVerify]);
     assert!(
-        config.settings_worth_flagging()[0]
+        settings.settings_worth_flagging()[0]
             .to_string()
             .contains("nothing will check")
     );
@@ -172,10 +201,12 @@ fn a_repository_with_no_verify_is_warned_about_but_still_runnable() {
 
 #[test]
 fn a_repository_that_declares_verify_warns_about_nothing() {
-    let config = RepoConfig::parse(
+    let settings = RepoConfig::parse(
         "provider = \"p\"\nverify = \"cargo test\"\n[providers.p]\ncmd = \"true\"\n",
     )
+    .unwrap()
+    .settings_for(None)
     .unwrap();
 
-    assert!(config.settings_worth_flagging().is_empty());
+    assert!(settings.settings_worth_flagging().is_empty());
 }

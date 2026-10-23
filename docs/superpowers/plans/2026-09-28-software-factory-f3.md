@@ -19,8 +19,6 @@ Known open:
 - Nested `RepoKey` paths can collide: `/x/a.git` and `/x/a/7.git`.
 - A revise's pull request takes its title and body from the feedback
   alone when no pull request is open yet.
-- A refusal inside `run` shows in `status` only as "ended without reporting
-  a verdict: exit 2"; its reason is in `assembly logs`.
 - A revise cancelled before it starts shows "failed (round 1)", naming the
   round before it.
 - `tests/kubernetes_runner.rs` cancels after a fixed 300ms and may be

@@ -2,9 +2,11 @@
 //! runner and collected into the job's log.
 
 use super::Serving;
+use crate::admission::{AdmissionRefused, Admitted, admit};
 use crate::collect::{cancel_and_wait_out, collect, record_launch_failure};
-use crate::config::{REPO_CONFIG_PATH, RepoConfig};
+use crate::config::REPO_CONFIG_PATH;
 use crate::event::{EventKind, EventLog};
+use crate::git::PinnedRef;
 use crate::job::JobId;
 use crate::paths::{self, JobPaths, RepoKey};
 use crate::report::JobReport;
@@ -404,21 +406,28 @@ async fn run_queued_round<R: Runner>(
     ) else {
         anyhow::bail!("the job has no recorded request to run");
     };
-    let config = tokio::select! {
+    let admitted = tokio::select! {
         biased;
         () = cancel.cancelled() => return Ok(address.record_cancelled_before_it_started()?),
         () = serving.queue.stopping.cancelled() => return Ok(()),
-        config = config_in_cache(serving, &address.key, &base.sha) => config,
+        admitted = admitted_in_cache(serving, &address.key, base, &provider) => admitted,
     };
     let paths = address.paths();
     let mut log = EventLog::open_append(paths.events())?;
     log.append(EventKind::RoundStarted { round })?;
 
-    let config = match config {
-        Ok(config) => config,
-        Err(e) => {
+    let (base, settings) = match admitted {
+        Ok(admitted) => admitted.into_base_and_settings(),
+        Err(refused) => {
             log.append(EventKind::RoundFailed {
-                reason: format!("reading {REPO_CONFIG_PATH} at the job's base: {e:#}"),
+                reason: match refused {
+                    AdmissionRefused::Unreadable(e) => {
+                        format!("reading {REPO_CONFIG_PATH} at the job's base: {e:#}")
+                    }
+                    not_runnable @ AdmissionRefused::NotRunnable(_) => {
+                        not_runnable.to_failure_reason()
+                    }
+                },
             })?;
             return Ok(());
         }
@@ -430,7 +439,7 @@ async fn run_queued_round<R: Runner>(
         &base,
         &prompt,
         &provider,
-        config.command_limit_secs(),
+        settings.max_duration.map(|limit| limit.as_secs()),
     );
     let launch_cancel = cancel.child_token();
     let give_up_on_stopping = async {
@@ -511,13 +520,15 @@ async fn reattach_round<R: Runner>(
     }
 }
 
-/// The repository's config at `sha`, from the daemon's cache of it, which
-/// the submit that queued the job fetched `sha` into.
-async fn config_in_cache<R>(
+/// The job admitted again at `base`, from the daemon's cache of the
+/// repository, which the submit that queued the job fetched `base` into.
+/// Its settings are what the round launches under.
+async fn admitted_in_cache<R>(
     serving: &Serving<R>,
     key: &RepoKey,
-    sha: &str,
-) -> anyhow::Result<RepoConfig> {
+    base: PinnedRef,
+    provider: &str,
+) -> Result<Admitted, AdmissionRefused> {
     let _repo = serving.repos.hold(key).await;
-    RepoConfig::from_ref(&key.repo_cache(&serving.daemon.root), sha).await
+    admit(&key.repo_cache(&serving.daemon.root), base, Some(provider)).await
 }

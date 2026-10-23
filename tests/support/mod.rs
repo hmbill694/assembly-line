@@ -7,8 +7,6 @@
 
 pub mod daemon;
 
-use assembly_line::claim;
-use assembly_line::config::RepoConfig;
 use assembly_line::event::EventKind;
 use assembly_line::frame::{FrameWriter, ReadableFrames};
 use assembly_line::git;
@@ -18,6 +16,7 @@ use assembly_line::run::{RunRefused, RunRequest, prepare_run};
 use assembly_line::runner::LaunchSpec;
 use assembly_line::runner::local::LocalRunner;
 use assembly_line::state::JobState;
+use assembly_line::{admission, claim};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -248,8 +247,8 @@ impl Harness {
     /// that hand a round to a runner directly.
     pub async fn launch_spec_for(&self, prompt: &str) -> LaunchSpec {
         let base = git::pinned(&self.repo, "origin", "main").await.unwrap();
-        let config = RepoConfig::from_ref(&self.repo, &base.sha).await.unwrap();
-        let job = claim::claim_job(&self.repo, "origin", &base.sha)
+        let admitted = admission::admit(&self.repo, base, None).await.unwrap();
+        let job = claim::claim_job(&self.repo, "origin", &admitted)
             .await
             .unwrap();
         LaunchSpec::for_round::<LocalRunner>(
@@ -259,9 +258,9 @@ impl Harness {
             },
             1,
             self.origin.to_str().unwrap(),
-            &base,
+            admitted.base(),
             prompt,
-            config.provider.as_deref().unwrap_or_default(),
+            &admitted.settings().provider_name,
             None,
         )
     }

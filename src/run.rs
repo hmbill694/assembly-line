@@ -6,8 +6,9 @@
 //! Preparing claims nothing until every check that can refuse the job has
 //! passed, so a refusal costs no id.
 
+use crate::admission::{self, AdmissionRefused};
 use crate::claim::claim_job;
-use crate::config::{self, ConfigError, RepoConfig};
+use crate::config::JobSettings;
 use crate::delivery::{self, Delivered, PullRequestText};
 use crate::event::EventKind;
 use crate::frame::FrameWriter;
@@ -43,7 +44,7 @@ pub struct RunRequest {
 /// Why a job will not run, decided before anything was claimed for it.
 #[derive(Debug)]
 pub enum RunRefused {
-    ConfigNotRunnable(Vec<ConfigError>),
+    NotAdmitted(AdmissionRefused),
     NoJobBranch(JobId),
     Unpreparable(anyhow::Error),
 }
@@ -53,8 +54,19 @@ impl RunRefused {
     #[must_use]
     pub fn itemized_reasons(&self) -> Vec<String> {
         match self {
-            Self::ConfigNotRunnable(errors) => errors.iter().map(ToString::to_string).collect(),
+            Self::NotAdmitted(refused) => refused.itemized_reasons(),
             Self::NoJobBranch(_) | Self::Unpreparable(_) => Vec::new(),
+        }
+    }
+
+    /// Why the round failed, as its verdict records it: the fault, without
+    /// advice that only makes sense to whoever typed `run`.
+    #[must_use]
+    pub fn to_failure_reason(&self) -> String {
+        match self {
+            Self::NotAdmitted(refused) => refused.to_failure_reason(),
+            Self::NoJobBranch(id) => no_job_branch(*id),
+            Self::Unpreparable(e) => e.to_string(),
         }
     }
 }
@@ -62,15 +74,22 @@ impl RunRefused {
 impl std::fmt::Display for RunRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ConfigNotRunnable(_) => write!(f, "{} is not runnable", config::REPO_CONFIG_PATH),
+            Self::NotAdmitted(refused) => write!(f, "{refused}"),
             Self::NoJobBranch(id) => write!(
                 f,
-                "job {id} has no branch on '{DEFAULT_REMOTE}' — it was deleted, or the job never \
-                 pushed one, so there is nothing to continue; run without --job to start a new job"
+                "{}, so there is nothing to continue; run without --job to start a new job",
+                no_job_branch(*id)
             ),
             Self::Unpreparable(e) => write!(f, "{e}"),
         }
     }
+}
+
+fn no_job_branch(id: JobId) -> String {
+    format!(
+        "job {id} has no branch on '{DEFAULT_REMOTE}' — it was deleted, or the job never pushed \
+         one"
+    )
 }
 
 /// The pull request targets a different branch from the one the job was cut
@@ -99,7 +118,7 @@ impl std::fmt::Display for BaseDiffers {
 pub struct ReadyJob {
     clone: ScratchClone,
     payload: RoundPayload,
-    config: RepoConfig,
+    settings: JobSettings,
     base: PinnedRef,
     prompt: String,
     claimed: bool,
@@ -160,46 +179,37 @@ pub async fn prepare_run(
     let base = workspace::pin_in_clone(&clone, &ref_name, pinned_sha.as_deref())
         .await
         .map_err(RunRefused::Unpreparable)?;
-    let config = RepoConfig::from_ref(clone.path(), &base.sha)
+    let admitted = admission::admit(clone.path(), base, request.provider.as_deref())
         .await
-        .map_err(RunRefused::Unpreparable)?;
-    let provider = request
-        .provider
-        .or_else(|| config.provider.clone())
-        .unwrap_or_default();
-    let problems = config.reasons_it_cannot_run(&provider);
-    if !problems.is_empty() {
-        return Err(RunRefused::ConfigNotRunnable(problems));
-    }
+        .map_err(RunRefused::NotAdmitted)?;
 
-    // Pinning and reading the config change nothing on the remote; claiming
-    // does, so a job cancelled by now is not claimed.
+    // Pinning and admitting change nothing on the remote; claiming does, so
+    // a job cancelled by now is not claimed.
     if cancel.is_cancelled() {
         return Err(RunRefused::Unpreparable(anyhow!("cancelled")));
     }
     let (job_id, start, claimed) = match request.job.map(JobId::from) {
         Some(id) => (id, job_branch_tip(&clone, id).await?, false),
         None => (
-            claim_job(clone.path(), DEFAULT_REMOTE, &base.sha)
+            claim_job(clone.path(), DEFAULT_REMOTE, &admitted)
                 .await
                 .map_err(RunRefused::Unpreparable)?,
-            base.clone(),
+            admitted.base().clone(),
             true,
         ),
     };
 
+    let (base, settings) = admitted.into_base_and_settings();
     let payload = RoundPayload::for_round(
-        &config,
+        &settings,
         RoundRequest {
             job_id,
             prompt: &prompt,
-            provider: &provider,
             start,
             remote_name: DEFAULT_REMOTE,
             remote_url,
         },
-    )
-    .map_err(RunRefused::Unpreparable)?;
+    );
 
     Ok(ReadyJob {
         clone,
@@ -207,7 +217,7 @@ pub async fn prepare_run(
             provision_toolchain: request.provision_toolchain,
             ..payload
         },
-        config,
+        settings,
         base,
         prompt,
         claimed,
@@ -257,7 +267,7 @@ impl ReadyJob {
         let ReadyJob {
             clone,
             payload,
-            config,
+            settings,
             base,
             prompt,
             provisioning_deadline,
@@ -277,7 +287,7 @@ impl ReadyJob {
 
         let base_differs = match closing.verdict {
             Verdict::Passed if branch_carries_work(&ws, &payload, &base, frames).await => {
-                deliver(&ws, &config, &base, &payload, &prompt, frames, &cancel).await?
+                deliver(&ws, &settings, &base, &payload, &prompt, frames, &cancel).await?
             }
             Verdict::Passed | Verdict::Failed => None,
         };
@@ -315,21 +325,24 @@ async fn branch_carries_work<W: Write>(
 /// an event for a pull request that exists, a line of output otherwise.
 async fn deliver<W: Write + Send + 'static>(
     ws: &RoundWorkspace,
-    config: &RepoConfig,
+    settings: &JobSettings,
     base: &PinnedRef,
     payload: &RoundPayload,
     prompt: &str,
     frames: &FrameWriter<W>,
     cancel: &CancellationToken,
 ) -> anyhow::Result<Option<BaseDiffers>> {
-    let target = config.base.as_deref().unwrap_or(&base.name);
+    let target = settings
+        .pull_request_target
+        .as_deref()
+        .unwrap_or(&base.name);
     let base_differs = (target != base.name).then(|| BaseDiffers {
         base: target.to_string(),
         base_ref: base.name.clone(),
     });
     let delivered = delivery::deliver(
         ws.path(),
-        &config.delivery,
+        &settings.delivery,
         &payload.branch,
         target,
         PullRequestText {

@@ -47,7 +47,7 @@ the user, then amend the brief. This happened in #1 and was the right call.
 |---|---|---|---|---|
 | 1 | Report doesn't answer lifecycle questions ("failed (round 1)") | **Done**, reviewed | `vtruquzw` | `2026-10-20-arch-01-job-lifecycle.md` |
 | 2 | A verdict is not the end of a round (lost `PullRequestOpened`) | **Done**, reviewed | `nnzttxxs` | `2026-10-20-arch-02-verdict-after-delivery.md` |
-| 3 | Admission is coded twice | Not started | — | — |
+| 3 | Admission is coded twice | **Done**, reviewed | `smnununx` | `2026-10-22-arch-03-one-admission.md` |
 | 4 | Round lifecycle split across run.rs/round.rs | Not started; #2 does part of it | — | — |
 | 5 | A job's place under the root has no owner; RepoKey collision | Not started | — | — |
 | 6 | "Where a job points" is plain strings; two "origin"s | Not started | — | — |
@@ -137,9 +137,10 @@ before grilling, because earlier findings move lines.
 
 - **Checks:** `just check` (fmt-check, clippy `-D warnings`, test). It takes
   about 80s; `CARGO_TARGET_DIR` defaults to `/tmp/assembly-line-target`.
-- **Test counts:** 361 at `main`, 367 after #1, 370 after #2.
-- **jj stack:** `main` → `vtruquzw` (#1) → `nnzttxxs` (#2) → `prwrkokz`
-  (report HTML). Nothing is pushed. Never push without the user asking.
+- **Test counts:** 361 at `main`, 367 after #1, 370 after #2, 373 after #3.
+- **jj stack:** `main` → `vtruquzw` (#1) → `nnzttxxs` (#2) → `smnununx`
+  (#3) → `prwrkokz` (report HTML). Nothing is pushed. Never push without
+  the user asking.
 - **Edits:** Edit/Write tools only, never shell edits (see the user's
   global CLAUDE.md).
 - **Review lesson from #1.** The reviewer caught a wrong claim in the brief's
@@ -147,7 +148,18 @@ before grilling, because earlier findings move lines.
   presenting a risk for acceptance, verify it with a throwaway run rather
   than by reading.
 
+## What #3 settled that later findings must respect
+
+- `admission::admit` is the one place a job is admitted, and `claim_job`
+  takes its `Admitted`. The dispatcher admits again at launch for the
+  round's settings. Don't read `RepoConfig` for a job's settings anywhere
+  else.
+- Each caller still pins its base its own way (scratch clone in `run`,
+  bare cache in `submit`). Merging the pins is #6's ground.
+- Under `--frames`, a refused `run` writes one `RoundFailed` frame, whose
+  reason comes from `RunRefused::to_failure_reason`.
+
 ## Next action
 
-Grill #3. Its brief and code go in a new change inserted above `nnzttxxs`
+Grill #4. Its brief and code go in a new change inserted above `smnununx`
 and below `prwrkokz`.

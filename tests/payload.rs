@@ -1,13 +1,12 @@
-use assembly_line::config::RepoConfig;
+use assembly_line::config::{JobSettings, RepoConfig};
 use assembly_line::git::PinnedRef;
 use assembly_line::job::JobId;
 use assembly_line::payload::{RoundPayload, RoundRequest, commit_message};
 
-fn request(provider: &str) -> RoundRequest<'_> {
+fn request() -> RoundRequest<'static> {
     RoundRequest {
         job_id: 7.into(),
         prompt: "add a README\n\nwith sections",
-        provider,
         start: PinnedRef {
             name: "main".into(),
             sha: "abc123".into(),
@@ -17,8 +16,8 @@ fn request(provider: &str) -> RoundRequest<'_> {
     }
 }
 
-fn config(body: &str) -> RepoConfig {
-    RepoConfig::parse(body).unwrap()
+fn settings(body: &str) -> JobSettings {
+    RepoConfig::parse(body).unwrap().settings_for(None).unwrap()
 }
 
 const RUNNABLE: &str = "provider = \"fake\"\nverify = \"cargo test\"\nmax_duration = \"20m\"\n\
@@ -26,7 +25,7 @@ const RUNNABLE: &str = "provider = \"fake\"\nverify = \"cargo test\"\nmax_durati
 
 #[test]
 fn a_payload_carries_everything_the_round_needs_already_resolved() {
-    let payload = RoundPayload::for_round(&config(RUNNABLE), request("fake")).unwrap();
+    let payload = RoundPayload::for_round(&settings(RUNNABLE), request());
 
     assert_eq!(payload.branch, "al/job-7");
     assert_eq!(payload.command.program, "agent");
@@ -60,10 +59,4 @@ fn a_commit_message_is_the_first_line_then_the_whole_prompt() {
 #[test]
 fn a_blank_prompt_still_makes_a_commit_message() {
     assert_eq!(commit_message(JobId::from(7), "  \n"), "job 7: agent work");
-}
-
-#[test]
-fn an_undeclared_provider_cannot_become_a_payload() {
-    let err = RoundPayload::for_round(&config(RUNNABLE), request("other")).unwrap_err();
-    assert!(err.to_string().contains("'other'"), "{err}");
 }

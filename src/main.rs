@@ -2,6 +2,7 @@ use assembly_line::cli::{Cli, Command, RunnerArgs, RunnerKind};
 use assembly_line::daemon::api::{CancelRequest, Cancelling, Queued};
 use assembly_line::daemon::client::{DaemonClient, Reply};
 use assembly_line::daemon::{self, Daemon};
+use assembly_line::event::EventKind;
 use assembly_line::frame::{FrameWriter, ReadableFrames};
 use assembly_line::round::Verdict;
 use assembly_line::run::{self, RunRefused, RunRequest};
@@ -116,7 +117,7 @@ async fn run_whole_job(request: RunRequest, as_frames: bool) -> Result<ExitCode,
     cancel_on_termination_signal(cancel.clone()).map_err(|e| format!("handling SIGTERM: {e}"))?;
     let ready = run::prepare_run(request, &std::env::temp_dir(), &cancel)
         .await
-        .map_err(|refused| report_run_refusal(&refused))?;
+        .map_err(|refused| report_run_refusal(&refused, as_frames))?;
 
     let conclusion = if as_frames {
         eprintln!("{}", ready.to_announcement_line());
@@ -142,11 +143,20 @@ async fn run_whole_job(request: RunRequest, as_frames: bool) -> Result<ExitCode,
     Ok(exit_code_for(conclusion.verdict))
 }
 
-fn report_run_refusal(refused: &RunRefused) -> String {
+/// With frames, the refusal is also the round's verdict, so a collector
+/// records why the round failed rather than only that `run` exited.
+fn report_run_refusal(refused: &RunRefused, as_frames: bool) -> String {
     refused
         .itemized_reasons()
         .iter()
         .for_each(|reason| eprintln!("error: {reason}"));
+    if as_frames
+        && let Err(e) = FrameWriter::new(std::io::stdout()).append_event(EventKind::RoundFailed {
+            reason: refused.to_failure_reason(),
+        })
+    {
+        eprintln!("error: writing the refusal as a frame: {e}");
+    }
     refused.to_string()
 }
 

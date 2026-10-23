@@ -4,8 +4,8 @@
 use super::Serving;
 use super::api::{Queued, Refused, Submission};
 use super::dispatch::JobAddress;
+use crate::admission::{Admitted, admit};
 use crate::claim::claim_job;
-use crate::config::{REPO_CONFIG_PATH, RepoConfig};
 use crate::event::{EventKind, EventLog};
 use crate::git;
 use crate::job::JobId;
@@ -84,32 +84,29 @@ pub async fn accept<R: Runner>(
         .map_err(unpreparable)?;
     // The base, never the job's branch: a round is not allowed to have
     // changed the settings that govern the next one.
-    let config = RepoConfig::from_ref(&cache, &base.sha)
+    let admitted = admit(&cache, base, provider_named.as_deref())
         .await
-        .map_err(unpreparable)?;
-    let provider = provider_named
-        .or_else(|| config.provider.clone())
-        .unwrap_or_default();
-    let problems = config.reasons_it_cannot_run(&provider);
-    if !problems.is_empty() {
-        return Err(refused(
-            format!("{REPO_CONFIG_PATH} is not runnable"),
-            problems.iter().map(ToString::to_string).collect(),
-        ));
-    }
+        .map_err(|e| refused(e.to_string(), e.itemized_reasons()))?;
 
     let job = match continued {
         Some(job) => job.paths,
-        None => new_job(&jobs_dir, &cache, &url, &base.sha).await?,
+        None => new_job(&jobs_dir, &cache, &url, &admitted).await?,
     };
     let id = job.id;
+    let warnings = admitted
+        .settings()
+        .settings_worth_flagging()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let (base, settings) = admitted.into_base_and_settings();
     EventLog::open_append(job.events())
         .and_then(|mut log| {
             log.append(EventKind::RoundRequested {
                 remote_url: url,
                 base,
                 prompt: submission.prompt,
-                provider,
+                provider: settings.provider_name,
             })
         })
         .map_err(|e| unpreparable(format!("recording job {id}'s request: {e}")))?;
@@ -118,22 +115,19 @@ pub async fn accept<R: Runner>(
     Ok(Queued {
         job: id.into(),
         branch: id.branch_name(),
-        warnings: config
-            .settings_worth_flagging()
-            .iter()
-            .map(ToString::to_string)
-            .collect(),
+        warnings,
     })
 }
 
-/// A new job's directory, under the id it claimed on `url` at `base_sha`.
+/// A new job's directory, under the id it claimed on `url` at its admitted
+/// base.
 async fn new_job(
     jobs_dir: &Path,
     cache: &Path,
     url: &str,
-    base_sha: &str,
+    admitted: &Admitted,
 ) -> Result<JobPaths, Refused> {
-    let id = claim_job(cache, url, base_sha)
+    let id = claim_job(cache, url, admitted)
         .await
         .map_err(unpreparable)?;
     paths::create_job(jobs_dir, id).map_err(|e| match e.kind() {

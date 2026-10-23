@@ -1,7 +1,7 @@
 //! What one round runs, resolved by `run` in the process that runs it: the
 //! repository's config applied to the job, its branch and its prompt.
 
-use crate::config::{ConfigError, RepoConfig, parse_duration};
+use crate::config::JobSettings;
 use crate::git::{self, PinnedRef};
 use crate::job::JobId;
 use crate::provider::{CommandSpec, render_command};
@@ -65,7 +65,7 @@ pub struct RoundPayload {
     pub commit_message: String,
     pub verify: Option<String>,
     /// Cap on the agent, and again on `verify`, in whole seconds. See
-    /// [`RepoConfig::max_duration`].
+    /// [`crate::config::RepoConfig::max_duration`].
     pub command_limit_secs: Option<u64>,
     /// Whether the round runs `mise install` before the agent. Set by
     /// runners whose rounds arrive in an image with no toolchain of the
@@ -73,51 +73,32 @@ pub struct RoundPayload {
     pub provision_toolchain: bool,
 }
 
-/// What `run` knows about a round before config has been applied to it.
+/// What `run` knows about a round before its settings have been applied.
 #[derive(Debug, Clone)]
 pub struct RoundRequest<'a> {
     pub job_id: JobId,
     pub prompt: &'a str,
-    pub provider: &'a str,
     pub start: PinnedRef,
     pub remote_name: &'a str,
     pub remote_url: String,
 }
 
 impl RoundPayload {
-    /// Apply the repository's config to a round.
-    ///
-    /// # Errors
-    ///
-    /// A [`ConfigError`] when the repository does not declare the provider,
-    /// or declares a `max_duration` that is not a duration.
-    pub fn for_round(
-        config: &RepoConfig,
-        request: RoundRequest<'_>,
-    ) -> anyhow::Result<RoundPayload> {
-        let provider = config
-            .providers
-            .get(request.provider)
-            .ok_or_else(|| ConfigError::UnknownProvider(request.provider.to_string()))?;
-        let command_limit_secs = config
-            .max_duration
-            .as_deref()
-            .map(parse_duration)
-            .transpose()?
-            .map(|limit| limit.as_secs());
-
-        Ok(RoundPayload {
+    /// Apply the job's settings to a round.
+    #[must_use]
+    pub fn for_round(settings: &JobSettings, request: RoundRequest<'_>) -> RoundPayload {
+        RoundPayload {
             job_id: request.job_id,
             remote_url: request.remote_url,
             remote_name: request.remote_name.to_string(),
             start: request.start,
             branch: request.job_id.branch_name(),
-            command: render_command(provider, request.prompt),
+            command: render_command(&settings.provider, request.prompt),
             commit_message: commit_message(request.job_id, request.prompt),
-            verify: config.verify.clone(),
-            command_limit_secs,
+            verify: settings.verify.clone(),
+            command_limit_secs: settings.max_duration.map(|limit| limit.as_secs()),
             provision_toolchain: false,
-        })
+        }
     }
 }
 

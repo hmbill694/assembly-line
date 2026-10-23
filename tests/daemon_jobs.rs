@@ -828,9 +828,8 @@ async fn a_job_whose_branch_was_deleted_keeps_its_directory_to_itself() {
 }
 
 /// `run` can still refuse a job the daemon accepted — its branch deleted
-/// while it waited, say. That refusal is `run`'s exit and its stderr, not a
-/// frame: the round fails for want of a verdict, and the reason is in the
-/// job's log.
+/// while it waited, say. The refusal is the round's verdict, and `status`
+/// gives its reason without the advice meant for a hand-typed `run`.
 #[tokio::test]
 async fn a_round_that_run_refuses_fails_with_the_reason_in_its_log() {
     // One slot, held by a first job until its time runs out, so the second
@@ -861,19 +860,16 @@ async fn a_round_that_run_refuses_fails_with_the_reason_in_its_log() {
     let report = wait_for_verdict(&fx.job_dir(2));
 
     assert_eq!(report.state, JobState::Failed);
-    assert!(
-        report
-            .detail
-            .as_deref()
-            .unwrap_or_default()
-            .contains("without reporting a verdict: exit 2"),
+    assert_eq!(
+        report.detail.as_deref(),
+        Some("job 2 has no branch on 'origin' — it was deleted, or the job never pushed one"),
         "{report:?}"
     );
     fx.assembly()
         .args(["logs", "2"])
         .assert()
         .success()
-        .stdout(contains("job 2 has no branch"));
+        .stdout(contains("run without --job to start a new job"));
 }
 
 #[tokio::test]
@@ -1221,6 +1217,63 @@ async fn a_stalled_fetch_does_not_hold_up_stopping_the_daemon() {
         ),
         "{:?}",
         fx.events_of(2)
+    );
+}
+
+/// A round is admitted again when it is dispatched, so a request the
+/// config at its base does not admit fails with every reason, and never
+/// launches without the settings it should run under. A request written
+/// to the log by hand stands in for one a stricter daemon would refuse.
+#[tokio::test]
+async fn a_round_its_config_does_not_admit_at_dispatch_fails_saying_why() {
+    let mut fx = Fixture::running("fake-agent.sh", &[], &[]).await;
+    fx.assembly()
+        .args(["submit", "--prompt", "first"])
+        .assert()
+        .success();
+    assert_eq!(wait_for_verdict(&fx.job_dir(1)).state, JobState::Passed);
+    assert!(fx.daemon.take().unwrap().stop().success());
+    let Some(EventKind::RoundRequested {
+        remote_url, base, ..
+    }) = fx.events_of(1).into_iter().next()
+    else {
+        panic!("{:?}", fx.events_of(1));
+    };
+    EventLog::open_append(fx.job_dir(1).join("events.jsonl"))
+        .unwrap()
+        .append(EventKind::RoundRequested {
+            remote_url,
+            base,
+            prompt: "second".into(),
+            provider: "ghost".into(),
+        })
+        .unwrap();
+
+    let fx = fx.with_daemon(&[], &[]);
+    let report = wait_for_verdict(&fx.job_dir(1));
+
+    assert_eq!(report.state, JobState::Failed);
+    assert_eq!(
+        report.detail.as_deref(),
+        Some(
+            format!(
+                "{REPO_CONFIG_PATH} is not runnable: provider 'ghost' is not declared in \
+                 [providers] — add a block for it"
+            )
+            .as_str()
+        ),
+        "{:?}",
+        fx.events_of(1)
+    );
+    assert!(
+        !fx.events_of(1)
+            .iter()
+            .skip_while(
+                |e| !matches!(e, EventKind::RoundRequested { provider, .. } if provider == "ghost")
+            )
+            .any(|e| matches!(e, EventKind::RoundLaunched { .. })),
+        "{:?}",
+        fx.events_of(1)
     );
 }
 

@@ -1,5 +1,7 @@
+use assembly_line::admission::AdmissionRefused;
 use assembly_line::config::{ConfigError, REPO_CONFIG_PATH};
 use assembly_line::event::EventKind;
+use assembly_line::frame::{Frame, FrameBody};
 use assembly_line::git::{self, head_sha};
 use assembly_line::payload;
 use assembly_line::run::RunRefused;
@@ -505,10 +507,49 @@ async fn a_provider_the_repository_never_declared_stops_the_job_before_it_starts
     assert!(
         matches!(
             &refusal,
-            RunRefused::ConfigNotRunnable(errors)
+            RunRefused::NotAdmitted(AdmissionRefused::NotRunnable(errors))
                 if errors == &[ConfigError::UnknownProvider("ghost".into())]
         ),
         "{refusal:?}"
+    );
+}
+
+/// A collector reads a round's verdict from its frames, so a refusal under
+/// `--frames` is one: the reason reaches the job's log, not just stderr.
+#[tokio::test]
+async fn a_refusal_under_frames_is_the_rounds_failed_verdict() {
+    let h = Harness::new().await;
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_assembly"))
+        .args(["run", "--frames", "--prompt", "x", "--provider", "ghost"])
+        .args(["--repo", h.repo.to_str().unwrap(), "--ref", "main"])
+        .env("TMPDIR", h.scratch_root())
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let events: Vec<EventKind> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(
+            |line| match serde_json::from_str::<Frame>(line).unwrap().body {
+                FrameBody::Event(event) => event.kind,
+                FrameBody::Output(text) => panic!("a refusal printed output: {text}"),
+            },
+        )
+        .collect();
+    let [EventKind::RoundFailed { reason }] = events.as_slice() else {
+        panic!("{events:?}");
+    };
+    assert_eq!(
+        reason,
+        &format!(
+            "{REPO_CONFIG_PATH} is not runnable: {}",
+            ConfigError::UnknownProvider("ghost".into())
+        )
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("error: provider 'ghost'"),
+        "{out:?}"
     );
 }
 
@@ -525,7 +566,7 @@ async fn an_unparseable_max_duration_stops_the_job_before_it_starts() {
     assert!(
         matches!(
             &refusal,
-            RunRefused::ConfigNotRunnable(errors)
+            RunRefused::NotAdmitted(AdmissionRefused::NotRunnable(errors))
                 if errors == &[ConfigError::UnparseableMaxDuration("soon".into())]
         ),
         "{refusal:?}"

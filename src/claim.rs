@@ -1,6 +1,7 @@
 //! Claiming a job's id: creating its branch on the remote before anything
 //! else happens, so the claim and the work are the same object.
 
+use crate::admission::Admitted;
 use crate::git;
 use crate::job::JobId;
 use crate::paths::job_id_past;
@@ -11,8 +12,8 @@ use std::path::Path;
 /// times in a row means something is claiming far faster than we are.
 const CLAIM_ATTEMPTS: usize = 16;
 
-/// The next free job id on `remote`, claimed by creating its branch at
-/// `base_sha`. `repo` must hold `base_sha`: the push sends it from there.
+/// The next free job id on `remote`, claimed by creating its branch at the
+/// admitted base. `repo` must hold that commit: the push sends it from there.
 ///
 /// A loop, not a fold: each attempt is a listing and a push, and the first
 /// push that creates its branch ends it.
@@ -21,7 +22,8 @@ const CLAIM_ATTEMPTS: usize = 16;
 ///
 /// When the remote cannot be listed or pushed to, when a branch has taken
 /// the last id there is, or when every attempt lost its race.
-pub async fn claim_job(repo: &Path, remote: &str, base_sha: &str) -> anyhow::Result<JobId> {
+pub async fn claim_job(repo: &Path, remote: &str, admitted: &Admitted) -> anyhow::Result<JobId> {
+    let base_sha = &admitted.base().sha;
     for _ in 0..CLAIM_ATTEMPTS {
         let taken = git::remote_branches_matching(repo, remote, JobId::BRANCH_PATTERN).await?;
         let id = job_id_past(&taken).ok_or_else(|| {
