@@ -6,9 +6,11 @@ pub mod kubernetes;
 pub mod local;
 pub mod tail;
 
+use crate::config::JobSettings;
 use crate::git::PinnedRef;
 use crate::paths::JobPaths;
 use crate::payload::{FORGE_TOKEN_VAR, GIT_TOKEN_VAR, https_equivalent, is_path_on_this_machine};
+use crate::report::{JobRequests, RoundRequest};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -35,7 +37,9 @@ pub struct LaunchSpec {
 }
 
 impl LaunchSpec {
-    /// Round `round` of the job at `job`, fitted to where `R` runs it: a
+    /// Round `round` of the job at `job`, from the job's first request's
+    /// remote and its latest request's prompt and provider, at the base and
+    /// under the settings admission gave it. Fitted to where `R` runs it: a
     /// container has neither the host's toolchain nor its SSH keys, so it
     /// provisions the one and reaches the remote over HTTPS, with a token,
     /// in place of the other. Every value is attached with `=`, so none can
@@ -48,13 +52,15 @@ impl LaunchSpec {
     pub fn for_round<R: Runner>(
         job: &JobPaths,
         round: u32,
-        remote_url: &str,
+        requests: &JobRequests,
         base: &PinnedRef,
-        prompt: &str,
-        provider: &str,
-        command_limit_secs: Option<u64>,
+        settings: &JobSettings,
     ) -> LaunchSpec {
         let (frames_file, job) = (job.frames(round), job.id);
+        let remote_url = requests.first.remote_url.as_str();
+        let RoundRequest {
+            prompt, provider, ..
+        } = &requests.latest;
         let remote_url = match (
             R::RUNS_IN_A_CONTAINER,
             std::path::Path::new(remote_url).is_absolute(),
@@ -81,7 +87,7 @@ impl LaunchSpec {
             .into_iter()
             .chain(R::RUNS_IN_A_CONTAINER.then(|| "--provision-toolchain".to_string()))
             .collect(),
-            command_limit_secs,
+            command_limit_secs: settings.max_duration.map(|limit| limit.as_secs()),
             frames_file,
         }
     }

@@ -1,7 +1,7 @@
 use assembly_line::event::{Event, EventKind};
 use assembly_line::git::PinnedRef;
 use assembly_line::job::JobId;
-use assembly_line::report::JobReport;
+use assembly_line::report::{JobReport, JobRequests, RoundRequest};
 use assembly_line::state::JobState;
 use chrono::{DateTime, TimeDelta, Utc};
 
@@ -601,18 +601,66 @@ fn timing_is_reported_only_once_a_round_has_ended() {
     );
 }
 
+/// A revise can spell the remote another way and name another provider; the
+/// first request still says what the job is.
 #[test]
-fn a_jobs_identity_is_its_first_requested_round() {
+fn a_jobs_identity_is_its_first_requested_round_and_a_revise_replaces_the_latest() {
     let events = timeline(vec![
         (0, requested("add auth", "a1")),
-        (1, requested("use sessions", "b2")),
+        (
+            1,
+            EventKind::RoundRequested {
+                remote_url: "ssh://git@github.com/o/r".into(),
+                base: PinnedRef {
+                    name: "develop".into(),
+                    sha: "b2".into(),
+                },
+                prompt: "use sessions".into(),
+                provider: "codex".into(),
+            },
+        ),
     ]);
 
     let report = JobReport::from_events(JobId::from(1), &events);
 
-    assert_eq!(report.remote_url.as_deref(), Some("git@github.com:o/r.git"));
-    assert_eq!(report.first_prompt.as_deref(), Some("add auth"));
-    assert_eq!(report.latest_prompt.as_deref(), Some("use sessions"));
-    assert_eq!(report.base.map(|base| base.sha).as_deref(), Some("b2"));
-    assert_eq!(report.provider.as_deref(), Some("claude"));
+    assert_eq!(
+        report.requests,
+        Some(JobRequests {
+            first: RoundRequest {
+                remote_url: "git@github.com:o/r.git".into(),
+                base: PinnedRef {
+                    name: "main".into(),
+                    sha: "a1".into(),
+                },
+                prompt: "add auth".into(),
+                provider: "claude".into(),
+                requested_at: events[0].at,
+            },
+            latest: RoundRequest {
+                remote_url: "ssh://git@github.com/o/r".into(),
+                base: PinnedRef {
+                    name: "develop".into(),
+                    sha: "b2".into(),
+                },
+                prompt: "use sessions".into(),
+                provider: "codex".into(),
+                requested_at: events[1].at,
+            },
+        })
+    );
+}
+
+/// A log whose request line was torn away has nothing to run or revise
+/// from.
+#[test]
+fn a_log_with_no_request_has_no_requests() {
+    let events = timeline(vec![
+        (0, EventKind::RoundStarted { round: 1 }),
+        (1, EventKind::RoundFailed { reason: "x".into() }),
+    ]);
+
+    assert_eq!(
+        JobReport::from_events(JobId::from(1), &events).requests,
+        None
+    );
 }

@@ -9,6 +9,7 @@ use crate::event::EventKind;
 use crate::git;
 use crate::job::JobId;
 use crate::paths::{JobPaths, JobPlace, RepoKey};
+use crate::report::JobRequests;
 use crate::runner::{Runner, reasons_a_container_cannot_run};
 use crate::state::JobState;
 use std::path::Path;
@@ -164,10 +165,10 @@ async fn continued_job(
             "job {id} is already queued or running — wait for its verdict before revising it"
         )));
     }
-    let (Some(base), Some(provider)) = (report.base, report.provider) else {
+    let Some(JobRequests { latest, .. }) = report.requests else {
         return Err(unpreparable(format!(
-            "job {id} has no recorded request — its first round never started, so there is \
-             nothing to revise"
+            "job {id} has no recorded request in its event log, so there is nothing to revise; \
+             submit without --job to start a new job"
         )));
     };
     match git::remote_lacks_ref(cache, url, &id.branch_name()).await {
@@ -177,8 +178,8 @@ async fn continued_job(
         ))),
         Ok(false) => Ok(Continued {
             paths,
-            base_ref: base.name,
-            provider,
+            base_ref: latest.base.name,
+            provider: latest.provider,
         }),
         Err(e) => Err(unpreparable(e)),
     }

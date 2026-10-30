@@ -1,9 +1,10 @@
-use assembly_line::admission::AdmissionRefused;
+use assembly_line::admission::{self, AdmissionRefused};
 use assembly_line::config::{ConfigError, REPO_CONFIG_PATH};
 use assembly_line::event::EventKind;
 use assembly_line::frame::{Frame, FrameBody};
 use assembly_line::git::{self, head_sha};
 use assembly_line::payload;
+use assembly_line::report::RoundRequest;
 use assembly_line::run::RunRefused;
 use assembly_line::runner::LaunchSpec;
 use assembly_line::runner::local::LocalRunner;
@@ -634,14 +635,20 @@ async fn cancelling_a_round_stops_a_clone_in_progress() {
         "git-remote-hang",
         &format!("touch {}\nsleep 60\n", cloning.display()),
     );
+    let base = git::pinned(&h.repo, "origin", "main").await.unwrap();
+    let admitted = admission::admit(&h.repo, base.clone(), None).await.unwrap();
     let spec = LaunchSpec::for_round::<LocalRunner>(
         &h.job_paths(),
         1,
-        "hang::nowhere",
-        &git::pinned(&h.repo, "origin", "main").await.unwrap(),
-        "x",
-        "fake",
-        None,
+        &support::requested_once(RoundRequest {
+            remote_url: "hang::nowhere".into(),
+            base,
+            prompt: "x".into(),
+            provider: "fake".into(),
+            requested_at: chrono::Utc::now(),
+        }),
+        admitted.base(),
+        admitted.settings(),
     );
 
     let mut run = std::process::Command::new(assert_cmd::cargo::cargo_bin("assembly"))

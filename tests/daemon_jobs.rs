@@ -784,7 +784,10 @@ async fn a_job_with_no_recorded_request_cannot_be_revised() {
         .args(["submit", "--job", "1", "--prompt", "more"])
         .assert()
         .code(2)
-        .stderr(contains("no recorded request"));
+        .stderr(contains(
+            "job 1 has no recorded request in its event log, so there is nothing to revise; \
+             submit without --job to start a new job",
+        ));
 }
 
 #[tokio::test]

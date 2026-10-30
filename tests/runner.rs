@@ -1,14 +1,17 @@
+use assembly_line::config::{JobSettings, RepoConfig};
 use assembly_line::daemon::Daemon;
 use assembly_line::git::PinnedRef;
 use assembly_line::paths::JobPaths;
 use assembly_line::payload::{
     FORGE_TOKEN_VAR, GIT_TOKEN_VAR, https_equivalent, is_path_on_this_machine,
 };
+use assembly_line::report::{JobRequests, RoundRequest};
 use assembly_line::runner::docker::{DockerRunner, docker_create_args};
 use assembly_line::runner::local::{LocalRound, LocalRunner};
 use assembly_line::runner::{
     JobSecrets, LaunchSpec, RoundHandle, Runner, RunnerProblem, reasons_a_container_cannot_run,
 };
+use chrono::Utc;
 use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
@@ -306,6 +309,33 @@ fn base() -> PinnedRef {
     }
 }
 
+/// A job asked for once, so its first request is its latest.
+fn requests(remote_url: &str, prompt: &str, provider: &str) -> JobRequests {
+    let request = RoundRequest {
+        remote_url: remote_url.into(),
+        base: base(),
+        prompt: prompt.into(),
+        provider: provider.into(),
+        requested_at: Utc::now(),
+    };
+    JobRequests {
+        first: request.clone(),
+        latest: request,
+    }
+}
+
+fn settings(max_duration: Option<&str>) -> JobSettings {
+    let limit = max_duration
+        .map(|limit| format!("max_duration = \"{limit}\"\n"))
+        .unwrap_or_default();
+    RepoConfig::parse(&format!(
+        "provider = \"p\"\n{limit}[providers.p]\ncmd = \"true\"\n"
+    ))
+    .unwrap()
+    .settings_for(None)
+    .unwrap()
+}
+
 fn job(id: u64) -> JobPaths {
     JobPaths {
         id: id.into(),
@@ -351,11 +381,9 @@ fn a_container_round_runs_assembly_run_over_https_and_provisions_first() {
     let spec = LaunchSpec::for_round::<ContainerRunner>(
         &job(7),
         2,
-        "git@github.com:o/r.git",
+        &requests("git@github.com:o/r.git", "fix it", "claude"),
         &base(),
-        "fix it",
-        "claude",
-        Some(60),
+        &settings(Some("1m")),
     );
 
     assert_eq!(
@@ -384,11 +412,9 @@ fn a_host_round_runs_assembly_run_with_the_remote_and_toolchain_as_they_are() {
     let spec = LaunchSpec::for_round::<HostRunner>(
         &job(7),
         1,
-        "git@github.com:o/r.git",
+        &requests("git@github.com:o/r.git", "x", "claude"),
         &base(),
-        "x",
-        "claude",
-        None,
+        &settings(None),
     );
 
     assert!(
@@ -398,6 +424,35 @@ fn a_host_round_runs_assembly_run_with_the_remote_and_toolchain_as_they_are() {
     assert!(!spec.args.contains(&"--provision-toolchain".to_string()));
 }
 
+/// A revise records the URL as it was typed, which can be another spelling
+/// of the job's remote; the job still pushes where its first request said.
+#[test]
+fn a_revised_round_runs_against_the_first_remote_with_the_latest_prompt() {
+    let revised = JobRequests {
+        latest: RoundRequest {
+            remote_url: "ssh://git@github.com/o/r".into(),
+            prompt: "now the tests".into(),
+            provider: "codex".into(),
+            ..requests("git@github.com:o/r.git", "x", "claude").latest
+        },
+        ..requests("git@github.com:o/r.git", "fix it", "claude")
+    };
+
+    let spec = LaunchSpec::for_round::<HostRunner>(&job(7), 2, &revised, &base(), &settings(None));
+
+    assert_eq!(
+        spec.args[1..],
+        [
+            "--repo=git@github.com:o/r.git".to_string(),
+            format!("--ref=main@{}", "a".repeat(40)),
+            "--job=7".into(),
+            "--prompt=now the tests".into(),
+            "--provider=codex".into(),
+            "--frames".into(),
+        ]
+    );
+}
+
 /// A remote that is a path could be read by `run` as a checkout whose own
 /// remote is somewhere else; a URL cannot.
 #[test]
@@ -405,11 +460,9 @@ fn a_host_round_names_a_remote_on_this_machine_by_its_file_url() {
     let spec = LaunchSpec::for_round::<HostRunner>(
         &job(7),
         1,
-        "/srv/origin",
+        &requests("/srv/origin", "x", "claude"),
         &base(),
-        "x",
-        "claude",
-        None,
+        &settings(None),
     );
 
     assert!(
@@ -426,11 +479,9 @@ fn every_value_on_the_command_line_is_attached_to_its_flag() {
     let spec = LaunchSpec::for_round::<HostRunner>(
         &job(1),
         1,
-        "/o.git",
+        &requests("/o.git", "--frames\n\"quoted\"", "p"),
         &base(),
-        "--frames\n\"quoted\"",
-        "p",
-        None,
+        &settings(None),
     );
 
     assert!(

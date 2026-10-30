@@ -12,6 +12,7 @@ use assembly_line::frame::{FrameWriter, ReadableFrames};
 use assembly_line::git;
 use assembly_line::job::JobId;
 use assembly_line::paths::JobPaths;
+use assembly_line::report::{JobRequests, RoundRequest};
 use assembly_line::run::{RunRefused, RunRequest, prepare_run};
 use assembly_line::runner::LaunchSpec;
 use assembly_line::runner::local::LocalRunner;
@@ -259,11 +260,15 @@ impl Harness {
                 dir: self.tmp.path().join("jobs").join(job.to_string()),
             },
             1,
-            self.origin.to_str().unwrap(),
+            &requested_once(RoundRequest {
+                remote_url: self.origin.to_str().unwrap().to_string(),
+                base: admitted.base().clone(),
+                prompt: prompt.to_string(),
+                provider: admitted.settings().provider_name.clone(),
+                requested_at: chrono::Utc::now(),
+            }),
             admitted.base(),
-            prompt,
-            &admitted.settings().provider_name,
-            None,
+            admitted.settings(),
         )
     }
 
@@ -329,5 +334,13 @@ pub struct Outcome {
 impl Outcome {
     pub fn has(&self, predicate: impl Fn(&EventKind) -> bool) -> bool {
         self.events.iter().any(predicate)
+    }
+}
+
+/// The requests of a job asked for once, whose first request is its latest.
+pub fn requested_once(request: RoundRequest) -> JobRequests {
+    JobRequests {
+        first: request.clone(),
+        latest: request,
     }
 }

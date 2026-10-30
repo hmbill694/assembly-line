@@ -156,7 +156,12 @@ fn resume_jobs_under_root<R: Runner + Send + Sync + 'static>(
             Resumption::Requeue => Ok(()),
         })?;
 
-    requeued.sort_by_key(|(_, report, _)| report.requested_at);
+    requeued.sort_by_key(|(_, report, _)| {
+        report
+            .requests
+            .as_ref()
+            .map(|requests| requests.latest.requested_at)
+    });
     requeued
         .into_iter()
         .for_each(|(place, _, _)| serving.queue.enqueue(place));

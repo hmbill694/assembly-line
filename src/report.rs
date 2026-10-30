@@ -30,6 +30,24 @@ impl std::fmt::Display for DiffSummary {
     }
 }
 
+/// One `RoundRequested`, and when it was written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoundRequest {
+    pub remote_url: String,
+    pub base: PinnedRef,
+    pub prompt: String,
+    pub provider: String,
+    pub requested_at: DateTime<Utc>,
+}
+
+/// What a job was asked for: its first request, whose remote is where the
+/// job clones from and pushes to, and its latest, which its next round runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobRequests {
+    pub first: RoundRequest,
+    pub latest: RoundRequest,
+}
+
 /// Everything a job's event log says about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobReport {
@@ -54,23 +72,13 @@ pub struct JobReport {
     /// is a job that has not produced anything yet, even though its claimed
     /// branch exists.
     pub branch: Option<String>,
-    /// Where the job clones from and pushes to, from its first request.
-    pub remote_url: Option<String>,
-    /// The job's base as its latest round asked for it. A revise starts from
-    /// the job's branch, not from here.
-    pub base: Option<PinnedRef>,
-    /// What the job was first asked to do.
-    pub first_prompt: Option<String>,
-    /// What the job's latest round was asked to do.
-    pub latest_prompt: Option<String>,
-    /// The provider its latest round was asked to use.
-    pub provider: Option<String>,
+    /// `None` only for a log that holds no request: empty, or torn. A
+    /// revise starts from the job's branch, not from the latest base.
+    pub requests: Option<JobRequests>,
     /// The URL of the branch's pull request, once one is open.
     pub pull_request: Option<String>,
     /// How to find the latest round on its runner, once it has launched.
     pub launched: Option<RoundHandle>,
-    /// When the job's latest round was asked for.
-    pub requested_at: Option<DateTime<Utc>>,
 }
 
 /// A job's facts, accumulated as its event stream is folded.
@@ -84,14 +92,9 @@ struct JobProgress {
     committed_diff: Option<DiffSummary>,
     detail: Option<String>,
     branch: Option<String>,
-    remote_url: Option<String>,
-    base: Option<PinnedRef>,
-    first_prompt: Option<String>,
-    latest_prompt: Option<String>,
-    provider: Option<String>,
+    requests: Option<JobRequests>,
     pull_request: Option<String>,
     launched: Option<RoundHandle>,
-    requested_at: Option<DateTime<Utc>>,
 }
 
 impl JobProgress {
@@ -102,24 +105,34 @@ impl JobProgress {
                 base,
                 prompt,
                 provider,
-            } => JobProgress {
-                // What waits is the round just asked for, so the previous
-                // round's reason, diff and timing no longer describe it.
-                state: JobState::Queued,
-                rounds: self.rounds + 1,
-                round_started_at: None,
-                last_round_duration: None,
-                committed_diff: None,
-                detail: None,
-                launched: None,
-                requested_at: Some(event.at),
-                remote_url: self.remote_url.or_else(|| Some(remote_url.clone())),
-                first_prompt: self.first_prompt.or_else(|| Some(prompt.clone())),
-                latest_prompt: Some(prompt.clone()),
-                base: Some(base.clone()),
-                provider: Some(provider.clone()),
-                ..self
-            },
+            } => {
+                let latest = RoundRequest {
+                    remote_url: remote_url.clone(),
+                    base: base.clone(),
+                    prompt: prompt.clone(),
+                    provider: provider.clone(),
+                    requested_at: event.at,
+                };
+                JobProgress {
+                    // What waits is the round just asked for, so the previous
+                    // round's reason, diff and timing no longer describe it.
+                    state: JobState::Queued,
+                    rounds: self.rounds + 1,
+                    round_started_at: None,
+                    last_round_duration: None,
+                    committed_diff: None,
+                    detail: None,
+                    launched: None,
+                    requests: Some(match self.requests {
+                        Some(JobRequests { first, .. }) => JobRequests { first, latest },
+                        None => JobRequests {
+                            first: latest.clone(),
+                            latest,
+                        },
+                    }),
+                    ..self
+                }
+            }
             // A new round restarts the clock and clears the previous round's
             // reason and diff, so a revised job reports its final round.
             EventKind::RoundStarted { round } => JobProgress {
@@ -199,14 +212,9 @@ impl JobReport {
             diff: progress.committed_diff,
             detail: progress.detail,
             branch: progress.branch,
-            remote_url: progress.remote_url,
-            base: progress.base,
-            first_prompt: progress.first_prompt,
-            latest_prompt: progress.latest_prompt,
-            provider: progress.provider,
+            requests: progress.requests,
             pull_request: progress.pull_request,
             launched: progress.launched,
-            requested_at: progress.requested_at,
         }
     }
 

@@ -361,20 +361,19 @@ async fn run_queued_round<R: Runner>(
     launching: Tally,
 ) -> anyhow::Result<()> {
     let paths = place.paths(&serving.daemon.root);
-    let report = paths.report()?;
-    let (Some(remote_url), Some(base), Some(prompt), Some(provider)) = (
-        report.remote_url,
-        report.base,
-        report.latest_prompt,
-        report.provider,
-    ) else {
+    let Some(requests) = paths.report()?.requests else {
         anyhow::bail!("the job has no recorded request to run");
     };
     let admitted = tokio::select! {
         biased;
         () = cancel.cancelled() => return Ok(record_cancelled_before_it_started(&paths)?),
         () = serving.queue.stopping.cancelled() => return Ok(()),
-        admitted = admitted_in_cache(serving, &place.key, base, &provider) => admitted,
+        admitted = admitted_in_cache(
+            serving,
+            &place.key,
+            requests.latest.base.clone(),
+            &requests.latest.provider,
+        ) => admitted,
     };
     let mut log = EventLog::open_append(paths.events())?;
     log.append(EventKind::RoundStarted { round })?;
@@ -395,15 +394,7 @@ async fn run_queued_round<R: Runner>(
             return Ok(());
         }
     };
-    let spec = LaunchSpec::for_round::<R>(
-        &paths,
-        round,
-        &remote_url,
-        &base,
-        &prompt,
-        &provider,
-        settings.max_duration.map(|limit| limit.as_secs()),
-    );
+    let spec = LaunchSpec::for_round::<R>(&paths, round, &requests, &base, &settings);
     let launch_cancel = cancel.child_token();
     let give_up_on_stopping = async {
         serving.queue.stopping.cancelled().await;
