@@ -1,5 +1,5 @@
-//! Where a job's state lives on disk: under a state root, in a directory
-//! per repository and a directory per job.
+//! Where a job's state lives on disk: under a state root, in one directory
+//! per repository, none inside another's, and a directory per job.
 //!
 //! # Errors
 //!
@@ -10,7 +10,9 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+use crate::event::{EventKind, EventLog};
 use crate::job::JobId;
+use crate::report::JobReport;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -52,11 +54,19 @@ pub fn state_root(
 /// A repository's place under the state root: its host, then the path
 /// segments of its remote URL, from the URL's HTTPS form — so the SSH and
 /// HTTPS spellings of one repository are one key. A repository on this
-/// machine has the host `local`.
+/// machine has the host [`LOCAL_HOST`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RepoKey {
     segments: Vec<String>,
 }
+
+/// The host of a repository on this machine. `@` is in no keyable segment,
+/// so no remote's host can be this.
+pub const LOCAL_HOST: &str = "@local";
+
+/// Joins a key's segments into one directory name. It is in no keyable
+/// segment, so the join can be split again.
+const DIR_NAME_SEPARATOR: char = '~';
 
 /// A remote URL that names no directory a key could be made of.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,55 +98,63 @@ impl RepoKey {
         };
         let https = crate::payload::https_equivalent(url);
         let (host, path) = match https.split_once("://") {
-            Some(("file", path)) => ("local".to_string(), path.to_string()),
+            Some(("file", path)) => (LOCAL_HOST.to_string(), path),
             Some((_, rest)) => {
                 let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
                 let host = authority.rsplit('@').next().unwrap_or(authority);
                 let host = crate::git::split_at_host_colon(host).map_or(host, |(host, _)| host);
-                (host.to_ascii_lowercase(), path.to_string())
+                (host.to_ascii_lowercase(), path)
             }
-            None if https.starts_with('/') => ("local".to_string(), https.clone()),
+            None if https.starts_with('/') => (LOCAL_HOST.to_string(), https.as_str()),
             None => return Err(unkeyable()),
         };
-        let segments: Vec<String> = std::iter::once(host)
-            .chain(
-                path.trim_end_matches('/')
-                    .trim_end_matches(".git")
-                    .split('/')
-                    .filter(|segment| !segment.is_empty())
-                    .map(str::to_string),
-            )
-            .collect();
+        let path = path.trim_end_matches('/');
+        let path = path.strip_suffix(".git").unwrap_or(path);
+        RepoKey::from_host_and_path(host, path.split('/').filter(|segment| !segment.is_empty()))
+            .ok_or_else(unkeyable)
+    }
 
-        match segments.len() > 1 && segments.iter().all(|s| is_keyable_segment(s)) {
-            true => Ok(RepoKey { segments }),
-            false => Err(unkeyable()),
-        }
+    /// The key whose [`Self::dir_name`] is `name`, or `None` for a name no
+    /// key makes.
+    #[must_use]
+    pub fn from_dir_name(name: &str) -> Option<RepoKey> {
+        let mut segments = name.split(DIR_NAME_SEPARATOR);
+        let host = segments.next()?;
+        RepoKey::from_host_and_path(host.to_string(), segments)
+    }
+
+    fn from_host_and_path<'a>(
+        host: String,
+        path: impl IntoIterator<Item = &'a str>,
+    ) -> Option<RepoKey> {
+        let path: Vec<&str> = path.into_iter().collect();
+        let keyable = (host == LOCAL_HOST || is_keyable_segment(&host))
+            && !path.is_empty()
+            && path.iter().all(|segment| is_keyable_segment(segment));
+        keyable.then(|| RepoKey {
+            segments: std::iter::once(host)
+                .chain(path.into_iter().map(str::to_string))
+                .collect(),
+        })
+    }
+
+    /// The one directory this repository's state is kept under, in
+    /// `<root>/jobs` and `<root>/repos` alike.
+    #[must_use]
+    pub fn dir_name(&self) -> String {
+        self.segments.join(&DIR_NAME_SEPARATOR.to_string())
     }
 
     /// Where this repository's jobs live under `root`.
     #[must_use]
     pub fn jobs_dir(&self, root: &Path) -> PathBuf {
-        self.segments
-            .iter()
-            .fold(root.join("jobs"), |dir, segment| dir.join(segment))
+        root.join("jobs").join(self.dir_name())
     }
 
     /// The daemon's bare repository for this remote, under `root`.
-    ///
-    /// # Panics
-    ///
-    /// Never: a key is only made with a host and at least one path segment.
     #[must_use]
     pub fn repo_cache(&self, root: &Path) -> PathBuf {
-        let (name, parents) = self
-            .segments
-            .split_last()
-            .expect("a key has a host and at least one path segment");
-        parents
-            .iter()
-            .fold(root.join("repos"), |dir, segment| dir.join(segment))
-            .join(format!("{name}.git"))
+        root.join("repos").join(format!("{}.git", self.dir_name()))
     }
 }
 
@@ -153,8 +171,9 @@ fn is_keyable_segment(segment: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-/// The ids of the jobs `jobs_dir` holds. Entries that are not a job's are
-/// ignored.
+/// The ids of the jobs one repository's `jobs_dir` holds. Entries that are
+/// not a job's, including names like `007` that no job is created under,
+/// are ignored.
 pub fn existing_job_ids(jobs_dir: &Path) -> io::Result<Vec<JobId>> {
     match std::fs::read_dir(jobs_dir) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -162,10 +181,10 @@ pub fn existing_job_ids(jobs_dir: &Path) -> io::Result<Vec<JobId>> {
         Ok(entries) => entries
             .map(|e| {
                 e.map(|e| {
-                    e.file_name()
-                        .to_str()
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .map(JobId::from)
+                    let name = e.file_name();
+                    let name = name.to_str()?;
+                    let id = JobId::from(name.parse::<u64>().ok()?);
+                    (id.to_string() == name).then_some(id)
                 })
             })
             .collect::<io::Result<Vec<_>>>()
@@ -192,6 +211,49 @@ pub fn latest_job_id(jobs_dir: &Path) -> io::Result<Option<JobId>> {
     existing_job_ids(jobs_dir).map(|ids| ids.into_iter().max())
 }
 
+/// Where one job's state is kept under a root. It is made of nothing but
+/// the job's repository and id, so two places for one job are always equal.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct JobPlace {
+    pub key: RepoKey,
+    pub id: JobId,
+}
+
+impl JobPlace {
+    /// The job's directory under `root`, whether or not it exists.
+    #[must_use]
+    pub fn paths(&self, root: &Path) -> JobPaths {
+        JobPaths {
+            id: self.id,
+            dir: self.key.jobs_dir(root).join(self.id.to_string()),
+        }
+    }
+
+    /// Create the job's directory under `root`. `AlreadyExists` when the job
+    /// has one: its id came from the remote, and a directory left by a job
+    /// whose branch has since gone must not be taken over.
+    pub fn create(&self, root: &Path) -> io::Result<JobPaths> {
+        let paths = self.paths(root);
+        std::fs::create_dir_all(self.key.jobs_dir(root))
+            .and_then(|()| std::fs::create_dir(&paths.dir))?;
+        Ok(paths)
+    }
+
+    /// The job's existing directory under `root`. `NotFound` rather than an
+    /// empty result, so `submit --job` and `status` can report a wrong job
+    /// id.
+    pub fn open(&self, root: &Path) -> io::Result<JobPaths> {
+        let paths = self.paths(root);
+        match paths.dir.is_dir() {
+            true => Ok(paths),
+            false => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no such job: {}", self.id),
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct JobPaths {
     pub id: JobId,
@@ -199,6 +261,20 @@ pub struct JobPaths {
 }
 
 impl JobPaths {
+    /// The job's log, folded. A job with no log yet reports as `Pending`.
+    pub fn report(&self) -> anyhow::Result<JobReport> {
+        let events = EventLog::read(self.events())
+            .map_err(|e| anyhow::anyhow!("reading {}: {e}", self.events().display()))?;
+        Ok(JobReport::from_events(self.id, &events))
+    }
+
+    /// Append `kind` to the job's log, creating the log if it has none.
+    pub fn append(&self, kind: EventKind) -> io::Result<()> {
+        EventLog::open_append(self.events())?
+            .append(kind)
+            .map(|_| ())
+    }
+
     #[must_use]
     pub fn events(&self) -> PathBuf {
         self.dir.join("events.jsonl")
@@ -221,27 +297,5 @@ impl JobPaths {
     #[must_use]
     pub fn position(&self, round: u32) -> PathBuf {
         self.dir.join(format!("round-{round}.position"))
-    }
-}
-
-/// Create the directory layout for a new job. `AlreadyExists` when the job
-/// has one: its id came from the remote, and a directory left by a job whose
-/// branch has since gone must not be taken over.
-pub fn create_job(jobs_dir: &Path, id: JobId) -> io::Result<JobPaths> {
-    let dir = jobs_dir.join(id.to_string());
-    std::fs::create_dir_all(jobs_dir).and_then(|()| std::fs::create_dir(&dir))?;
-    Ok(JobPaths { id, dir })
-}
-
-/// Locate an existing job. `NotFound` rather than an empty result, so
-/// `submit --job` and `status` can report a wrong job id.
-pub fn open_job(jobs_dir: &Path, id: JobId) -> io::Result<JobPaths> {
-    let dir = jobs_dir.join(id.to_string());
-    match dir.is_dir() {
-        true => Ok(JobPaths { id, dir }),
-        false => Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("no such job: {id}"),
-        )),
     }
 }

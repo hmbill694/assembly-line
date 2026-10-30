@@ -332,7 +332,7 @@ fn conclusion_of<W: Write>(
     JobConclusion {
         job: payload.job_id,
         verdict,
-        report: JobReport::from_events(payload.job_id.into(), &frames.events_so_far()),
+        report: JobReport::from_events(payload.job_id, &frames.events_so_far()),
         base_differs,
     }
 }

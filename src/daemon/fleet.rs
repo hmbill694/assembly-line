@@ -1,15 +1,13 @@
 //! What a daemon starting on a root owes the jobs it finds there — decided
 //! from each job's log alone.
 
-use super::dispatch::JobAddress;
-use crate::event::EventLog;
 use crate::job::JobId;
-use crate::paths::{JobPaths, RepoKey};
+use crate::paths::{self, JobPlace, RepoKey};
 use crate::report::JobReport;
 use crate::runner::RoundHandle;
 use crate::state::JobState;
 use anyhow::Context;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resumption {
@@ -49,71 +47,52 @@ pub(super) fn lost_while_launching(job: JobId) -> String {
     )
 }
 
-/// Every job under `root`, with its report and the address the daemon finds
-/// it by. A job directory is any directory under `<root>/jobs` holding an
-/// `events.jsonl`; its key comes from the remote its log names.
+/// Every job under `root` that has a log, with its report. Jobs are found
+/// where [`JobPlace::create`] puts them, `<root>/jobs/<repository>/<id>`,
+/// and the key comes from the repository directory's name. A name that
+/// [`RepoKey::from_dir_name`] or a job id does not make is passed over.
 ///
 /// # Errors
 ///
-/// When the jobs directory cannot be walked or a log cannot be read.
-pub fn jobs_under(root: &Path) -> anyhow::Result<Vec<(JobAddress, JobReport)>> {
+/// When a jobs directory cannot be listed or a log cannot be read.
+pub fn jobs_under(root: &Path) -> anyhow::Result<Vec<(JobPlace, JobReport)>> {
     let jobs = root.join("jobs");
-    job_dirs_below(&jobs)
+    repositories_under(&jobs)
         .with_context(|| format!("reading {}", jobs.display()))?
         .into_iter()
-        .filter_map(|dir| address_and_report(&dir).transpose())
+        .map(|key| {
+            let jobs_dir = key.jobs_dir(root);
+            paths::existing_job_ids(&jobs_dir)
+                .with_context(|| format!("reading {}", jobs_dir.display()))
+                .map(|ids| {
+                    ids.into_iter()
+                        .map(|id| JobPlace {
+                            key: key.clone(),
+                            id,
+                        })
+                        .collect::<Vec<_>>()
+                })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .filter(|place| place.paths(root).events().is_file())
+        .map(|place| place.paths(root).report().map(|report| (place, report)))
         .collect()
 }
 
-fn job_dirs_below(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
-    match std::fs::read_dir(dir) {
+fn repositories_under(jobs: &Path) -> std::io::Result<Vec<RepoKey>> {
+    match std::fs::read_dir(jobs) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(e),
         Ok(entries) => entries
-            .map(|entry| {
-                let path = entry?.path();
-                match (path.is_dir(), path.join("events.jsonl").is_file()) {
-                    (true, true) => Ok(vec![path]),
-                    (true, false) => job_dirs_below(&path),
-                    (false, _) => Ok(Vec::new()),
-                }
-            })
+            .map(|entry| entry.map(|entry| entry.path()))
             .collect::<std::io::Result<Vec<_>>>()
-            .map(|nested| nested.into_iter().flatten().collect()),
+            .map(|dirs| {
+                dirs.iter()
+                    .filter(|dir| dir.is_dir())
+                    .filter_map(|dir| RepoKey::from_dir_name(dir.file_name()?.to_str()?))
+                    .collect()
+            }),
     }
-}
-
-/// `None` for a directory whose name is not a job id or whose log names no
-/// remote — not a job this daemon can do anything for.
-fn address_and_report(dir: &Path) -> anyhow::Result<Option<(JobAddress, JobReport)>> {
-    let Some(id) = dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.parse::<u64>().ok())
-    else {
-        return Ok(None);
-    };
-    let paths = JobPaths {
-        id: id.into(),
-        dir: dir.to_path_buf(),
-    };
-    let events = EventLog::read(paths.events())
-        .with_context(|| format!("reading {}", paths.events().display()))?;
-    let report = JobReport::from_events(id, &events);
-    let Some(key) = report
-        .remote_url
-        .as_deref()
-        .and_then(|url| RepoKey::from_remote_url(url).ok())
-    else {
-        return Ok(None);
-    };
-    let jobs_dir = dir.parent().map(Path::to_path_buf).unwrap_or_default();
-    Ok(Some((
-        JobAddress {
-            key,
-            jobs_dir,
-            id: id.into(),
-        },
-        report,
-    )))
 }

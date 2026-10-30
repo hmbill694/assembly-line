@@ -1,9 +1,8 @@
 //! From what a person typed — a `--repo`, a job id, or nothing — to where
 //! that job's state lives under the root.
 
-use crate::event::EventLog;
 use crate::job::JobId;
-use crate::paths::{self, JobPaths, RepoKey};
+use crate::paths::{self, JobPaths, JobPlace, RepoKey};
 use crate::payload::remote_to_clone;
 use crate::report::JobReport;
 use crate::workspace::DEFAULT_REMOTE;
@@ -48,16 +47,15 @@ pub async fn remote_url_named_or_enclosing(repo: Option<String>) -> anyhow::Resu
     }
 }
 
-/// The jobs directory for `repo` — or for the repository the user is
-/// standing in — under `root`.
+/// The key of `repo`, or of the repository the user is standing in.
 ///
 /// # Errors
 ///
 /// As [`remote_url_named_or_enclosing`]; and when the remote names no
 /// directory a key could be made of.
-pub async fn jobs_dir_of(root: &Path, repo: Option<String>) -> anyhow::Result<PathBuf> {
+pub async fn repo_key_named_or_enclosing(repo: Option<String>) -> anyhow::Result<RepoKey> {
     let remote_url = remote_url_named_or_enclosing(repo).await?;
-    Ok(RepoKey::from_remote_url(&remote_url)?.jobs_dir(root))
+    Ok(RepoKey::from_remote_url(&remote_url)?)
 }
 
 /// Job `job_id` of `repo` under `root`, or its latest when `job_id` is
@@ -65,18 +63,19 @@ pub async fn jobs_dir_of(root: &Path, repo: Option<String>) -> anyhow::Result<Pa
 ///
 /// # Errors
 ///
-/// As [`jobs_dir_of`]; and when there are no jobs yet, or no such job.
+/// As [`repo_key_named_or_enclosing`]; and when there are no jobs yet, or
+/// no such job.
 pub async fn job_at(
     root: &Path,
     repo: Option<String>,
     job_id: Option<u64>,
 ) -> anyhow::Result<JobPaths> {
-    let jobs_dir = jobs_dir_of(root, repo).await?;
+    let key = repo_key_named_or_enclosing(repo).await?;
     let id = match job_id {
         Some(id) => JobId::from(id),
-        None => paths::latest_job_id(&jobs_dir)?.ok_or_else(|| anyhow!("no jobs yet"))?,
+        None => paths::latest_job_id(&key.jobs_dir(root))?.ok_or_else(|| anyhow!("no jobs yet"))?,
     };
-    Ok(paths::open_job(&jobs_dir, id)?)
+    Ok(JobPlace { key, id }.open(root)?)
 }
 
 /// The report on the job `job_id` names in `repo`, or on the latest one there
@@ -90,10 +89,7 @@ pub async fn report_for_job(
     job_id: Option<u64>,
     repo: Option<String>,
 ) -> anyhow::Result<JobReport> {
-    let paths = job_at(root, repo, job_id).await?;
-    let events =
-        EventLog::read(paths.events()).map_err(|e| anyhow!("reading the event log: {e}"))?;
-    Ok(JobReport::from_events(paths.id.into(), &events))
+    job_at(root, repo, job_id).await?.report()
 }
 
 /// Where job `job_id` in `repo` captured its output.

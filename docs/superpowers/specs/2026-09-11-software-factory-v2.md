@@ -122,9 +122,14 @@ everything the daemon writes. A lock file allows one daemon per root.
 
 ```
 <root>/daemon.sock  daemon.lock
-<root>/repos/<host>/<owner>/<name>.git          bare; claim refs and config reads only
-<root>/jobs/<host>/<owner>/<name>/<id>/events.jsonl  job.log  frames
+<root>/repos/<host>~<owner>~<name>.git          bare; claim refs and config reads only
+<root>/jobs/<host>~<owner>~<name>/<id>/events.jsonl  job.log  frames
 ```
+
+One flat directory per repository, its key's segments joined with `~`, so
+no repository's directory is inside another's. A repository on this
+machine has the host `@local`: `/srv/git/origin.git` is
+`<root>/jobs/@local~srv~git~origin/`.
 
 **The API** is two routes over the socket: `POST /jobs` submits a new job or
 a new round of an existing one, and `POST /jobs/…/cancel` stops one; a health

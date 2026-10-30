@@ -11,7 +11,7 @@ use assembly_line::event::EventKind;
 use assembly_line::frame::{FrameWriter, ReadableFrames};
 use assembly_line::git;
 use assembly_line::job::JobId;
-use assembly_line::paths::{self, JobPaths};
+use assembly_line::paths::JobPaths;
 use assembly_line::run::{RunRefused, RunRequest, prepare_run};
 use assembly_line::runner::LaunchSpec;
 use assembly_line::runner::local::LocalRunner;
@@ -202,10 +202,12 @@ impl Harness {
     /// A job directory outside the repository, for tests that drive a runner
     /// directly and collect what it reports.
     pub fn job_paths(&self) -> JobPaths {
-        let jobs_dir = self.tmp.path().join("jobs");
-        paths::open_job(&jobs_dir, THE_JOB.into())
-            .or_else(|_| paths::create_job(&jobs_dir, THE_JOB.into()))
-            .unwrap()
+        let job = JobPaths {
+            id: THE_JOB.into(),
+            dir: self.tmp.path().join("jobs").join(THE_JOB.to_string()),
+        };
+        std::fs::create_dir_all(&job.dir).unwrap();
+        job
     }
 
     /// Run one job against this repository, with `prompt`, from `main` —

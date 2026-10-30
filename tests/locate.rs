@@ -1,7 +1,8 @@
-use assembly_line::event::{EventKind, EventLog};
+use assembly_line::event::EventKind;
 use assembly_line::git;
+use assembly_line::job::JobId;
 use assembly_line::locate::{output_log_of, report_for_job};
-use assembly_line::paths::{self, JobPaths, RepoKey};
+use assembly_line::paths::{JobPaths, JobPlace, RepoKey};
 use support::Harness;
 
 mod support;
@@ -9,22 +10,22 @@ mod support;
 /// Job `id`'s directory under `h`'s root and the request that opens its
 /// log, as the daemon leaves them when it queues the job.
 async fn job_in(h: &Harness, id: u64) -> JobPaths {
-    let jobs_dir = RepoKey::from_remote_url(h.origin.to_str().unwrap())
-        .unwrap()
-        .jobs_dir(&h.root);
-    let job = paths::create_job(&jobs_dir, id.into()).unwrap();
-    EventLog::open_append(job.events())
-        .unwrap()
-        .append(EventKind::RoundRequested {
-            remote_url: h.origin.to_string_lossy().into_owned(),
-            base: git::PinnedRef {
-                name: "main".into(),
-                sha: git::sha_at_ref(&h.origin, "main").await.unwrap(),
-            },
-            prompt: "x".into(),
-            provider: "fake".into(),
-        })
-        .unwrap();
+    let job = JobPlace {
+        key: RepoKey::from_remote_url(h.origin.to_str().unwrap()).unwrap(),
+        id: id.into(),
+    }
+    .create(&h.root)
+    .unwrap();
+    job.append(EventKind::RoundRequested {
+        remote_url: h.origin.to_string_lossy().into_owned(),
+        base: git::PinnedRef {
+            name: "main".into(),
+            sha: git::sha_at_ref(&h.origin, "main").await.unwrap(),
+        },
+        prompt: "x".into(),
+        provider: "fake".into(),
+    })
+    .unwrap();
     job
 }
 
@@ -42,7 +43,7 @@ async fn status_without_a_job_id_reports_the_latest_job() {
         .await
         .unwrap();
 
-    assert_eq!(report.id, 12);
+    assert_eq!(report.id, JobId::from(12));
 }
 
 /// `--repo` takes the remote's URL as readily as a checkout of it, as
@@ -56,7 +57,7 @@ async fn a_job_is_found_by_its_remotes_url_too() {
         .await
         .unwrap();
 
-    assert_eq!(report.id, 4);
+    assert_eq!(report.id, JobId::from(4));
 }
 
 #[tokio::test]

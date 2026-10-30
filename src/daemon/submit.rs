@@ -3,14 +3,12 @@
 
 use super::Serving;
 use super::api::{Queued, Refused, Submission};
-use super::dispatch::JobAddress;
 use crate::admission::{Admitted, admit};
 use crate::claim::claim_job;
-use crate::event::{EventKind, EventLog};
+use crate::event::EventKind;
 use crate::git;
 use crate::job::JobId;
-use crate::paths::{self, JobPaths, RepoKey};
-use crate::report::JobReport;
+use crate::paths::{JobPaths, JobPlace, RepoKey};
 use crate::runner::{Runner, reasons_a_container_cannot_run};
 use crate::state::JobState;
 use std::path::Path;
@@ -63,7 +61,6 @@ pub async fn accept<R: Runner>(
         ));
     }
     let root = &serving.daemon.root;
-    let jobs_dir = key.jobs_dir(root);
     let cache = key.repo_cache(root);
     let _repo = serving.repos.hold(&key).await;
     git::init_bare_if_absent(&cache)
@@ -71,7 +68,13 @@ pub async fn accept<R: Runner>(
         .map_err(|e| unpreparable(format!("preparing {}: {e}", cache.display())))?;
 
     let continued = match submission.job {
-        Some(id) => Some(continued_job(&jobs_dir, JobId::from(id), &cache, &url).await?),
+        Some(id) => {
+            let place = JobPlace {
+                key: key.clone(),
+                id: JobId::from(id),
+            };
+            Some(continued_job(&place, root, &cache, &url).await?)
+        }
         None => None,
     };
     let (base_ref, provider_named) = match (&continued, submission.base_ref) {
@@ -90,7 +93,7 @@ pub async fn accept<R: Runner>(
 
     let job = match continued {
         Some(job) => job.paths,
-        None => new_job(&jobs_dir, &cache, &url, &admitted).await?,
+        None => new_job(&key, root, &cache, &url, &admitted).await?,
     };
     let id = job.id;
     let warnings = admitted
@@ -100,17 +103,14 @@ pub async fn accept<R: Runner>(
         .map(ToString::to_string)
         .collect();
     let (base, settings) = admitted.into_base_and_settings();
-    EventLog::open_append(job.events())
-        .and_then(|mut log| {
-            log.append(EventKind::RoundRequested {
-                remote_url: url,
-                base,
-                prompt: submission.prompt,
-                provider: settings.provider_name,
-            })
-        })
-        .map_err(|e| unpreparable(format!("recording job {id}'s request: {e}")))?;
-    serving.queue.enqueue(JobAddress { key, jobs_dir, id });
+    job.append(EventKind::RoundRequested {
+        remote_url: url,
+        base,
+        prompt: submission.prompt,
+        provider: settings.provider_name,
+    })
+    .map_err(|e| unpreparable(format!("recording job {id}'s request: {e}")))?;
+    serving.queue.enqueue(JobPlace { key, id });
 
     Ok(Queued {
         job: id.into(),
@@ -122,7 +122,8 @@ pub async fn accept<R: Runner>(
 /// A new job's directory, under the id it claimed on `url` at its admitted
 /// base.
 async fn new_job(
-    jobs_dir: &Path,
+    key: &RepoKey,
+    root: &Path,
     cache: &Path,
     url: &str,
     admitted: &Admitted,
@@ -130,11 +131,15 @@ async fn new_job(
     let id = claim_job(cache, url, admitted)
         .await
         .map_err(unpreparable)?;
-    paths::create_job(jobs_dir, id).map_err(|e| match e.kind() {
+    let place = JobPlace {
+        key: key.clone(),
+        id,
+    };
+    place.create(root).map_err(|e| match e.kind() {
         std::io::ErrorKind::AlreadyExists => unpreparable(format!(
             "job {id}'s branch was gone from {url}, so its id was claimed again, but {} still \
              holds that job — submit again, and the next id will be claimed",
-            jobs_dir.join(id.to_string()).display()
+            place.paths(root).dir.display()
         )),
         _ => unpreparable(format!("preparing job {id}'s directory: {e}")),
     })
@@ -146,14 +151,14 @@ async fn new_job(
 /// A job's branch can be absent rather than unpushed — deleted once its pull
 /// request merged — and "push it first" would be the wrong advice.
 async fn continued_job(
-    jobs_dir: &Path,
-    id: JobId,
+    place: &JobPlace,
+    root: &Path,
     cache: &Path,
     url: &str,
 ) -> Result<Continued, Refused> {
-    let paths = paths::open_job(jobs_dir, id).map_err(unpreparable)?;
-    let events = EventLog::read(paths.events()).map_err(unpreparable)?;
-    let report = JobReport::from_events(id.into(), &events);
+    let id = place.id;
+    let paths = place.open(root).map_err(unpreparable)?;
+    let report = paths.report().map_err(|e| unpreparable(format!("{e:#}")))?;
     if matches!(report.state, JobState::Queued | JobState::Running) {
         return Err(unpreparable(format!(
             "job {id} is already queued or running — wait for its verdict before revising it"

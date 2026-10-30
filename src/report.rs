@@ -1,5 +1,6 @@
 use crate::event::{Event, EventKind};
 use crate::git::PinnedRef;
+use crate::job::JobId;
 use crate::runner::RoundHandle;
 use crate::state::JobState;
 use chrono::{DateTime, Utc};
@@ -32,7 +33,7 @@ impl std::fmt::Display for DiffSummary {
 /// Everything a job's event log says about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobReport {
-    pub id: u64,
+    pub id: JobId,
     pub state: JobState,
     /// How many rounds this job has had, which is also its latest round's
     /// number: each `RoundRequested` takes the next one, whether or not that
@@ -184,7 +185,7 @@ impl JobReport {
     ///
     /// A job with no events yet reports as `Pending` with no rounds, which is
     /// what a directory allocated but not yet run looks like.
-    pub fn from_events<'a>(id: u64, events: impl IntoIterator<Item = &'a Event>) -> Self {
+    pub fn from_events<'a>(id: JobId, events: impl IntoIterator<Item = &'a Event>) -> Self {
         let progress = events
             .into_iter()
             .fold(JobProgress::default(), JobProgress::after_event);

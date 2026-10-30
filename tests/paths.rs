@@ -1,9 +1,16 @@
 use assembly_line::job::JobId;
 use assembly_line::paths::{
-    RepoKey, create_job, git_root, job_id_past, latest_job_id, open_job, state_root,
+    JobPlace, RepoKey, existing_job_ids, git_root, job_id_past, latest_job_id, state_root,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
+
+fn place(url: &str, id: u64) -> JobPlace {
+    JobPlace {
+        key: RepoKey::from_remote_url(url).unwrap(),
+        id: JobId::from(id),
+    }
+}
 
 #[test]
 fn finds_the_git_root_by_walking_up() {
@@ -51,54 +58,133 @@ fn branches_that_are_not_a_jobs_are_ignored_when_allocating() {
 
 #[test]
 fn the_latest_job_is_the_highest_job_directory() {
-    let tmp = tempfile::tempdir().unwrap();
-    let jobs = tmp.path().join("jobs");
+    let root = tempfile::tempdir().unwrap();
+    let jobs = RepoKey::from_remote_url("/o.git")
+        .unwrap()
+        .jobs_dir(root.path());
     assert_eq!(latest_job_id(&jobs).unwrap(), None);
 
-    create_job(&jobs, JobId::from(1)).unwrap();
-    create_job(&jobs, JobId::from(2)).unwrap();
+    place("/o.git", 1).create(root.path()).unwrap();
+    place("/o.git", 2).create(root.path()).unwrap();
     assert_eq!(latest_job_id(&jobs).unwrap(), Some(JobId::from(2)));
 }
 
+/// `007` is no name a job is created under, so it is not job 7.
 #[test]
 fn the_latest_job_ignores_directories_that_are_not_a_jobs() {
-    let tmp = tempfile::tempdir().unwrap();
-    let jobs = tmp.path().join("jobs");
-    create_job(&jobs, JobId::from(7)).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let job = place("/o.git", 2).create(root.path()).unwrap();
+    let jobs = job.dir.parent().unwrap();
     fs::create_dir_all(jobs.join("notes")).unwrap();
+    fs::create_dir_all(jobs.join("007")).unwrap();
 
-    assert_eq!(latest_job_id(&jobs).unwrap(), Some(JobId::from(7)));
+    assert_eq!(latest_job_id(jobs).unwrap(), Some(JobId::from(2)));
 }
 
 #[test]
-fn create_job_lays_out_the_directory() {
-    let tmp = tempfile::tempdir().unwrap();
-    let jobs = tmp.path().join("jobs");
-    let p = create_job(&jobs, JobId::from(42)).unwrap();
+fn a_job_is_created_and_opened_at_its_place() {
+    let root = tempfile::tempdir().unwrap();
+    let place = place("/o.git", 42);
+    let p = place.create(root.path()).unwrap();
 
     assert_eq!(p.id, JobId::from(42));
-    assert_eq!(p.dir, jobs.join("42"));
+    assert_eq!(p.dir, place.key.jobs_dir(root.path()).join("42"));
+    assert_eq!(p.dir, place.paths(root.path()).dir);
     assert!(p.dir.is_dir());
     assert_eq!(p.events(), p.dir.join("events.jsonl"));
     assert_eq!(p.log(), p.dir.join("job.log"), "one job, one log");
 
-    assert_eq!(open_job(&jobs, JobId::from(42)).unwrap().dir, p.dir);
+    assert_eq!(place.open(root.path()).unwrap().dir, p.dir);
 }
 
 #[test]
 fn a_job_directory_that_exists_is_not_created_again() {
-    let tmp = tempfile::tempdir().unwrap();
-    let jobs = tmp.path().join("jobs");
-    create_job(&jobs, JobId::from(1)).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    place("/o.git", 1).create(root.path()).unwrap();
 
-    let err = create_job(&jobs, JobId::from(1)).unwrap_err();
+    let err = place("/o.git", 1).create(root.path()).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
 }
 
 #[test]
-fn open_job_fails_for_a_missing_job() {
-    let tmp = tempfile::tempdir().unwrap();
-    assert!(open_job(&tmp.path().join("jobs"), JobId::from(99)).is_err());
+fn opening_a_missing_job_fails_as_not_found() {
+    let root = tempfile::tempdir().unwrap();
+    let err = place("/o.git", 99).open(root.path()).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+/// `/x/a/7.git`'s jobs directory and `/x/a.git`'s job 7 used to be one
+/// directory.
+#[test]
+fn a_nested_repository_does_not_take_another_repositorys_job() {
+    let root = tempfile::tempdir().unwrap();
+    let nested = place("/x/a/7.git", 1);
+    let outer = place("/x/a.git", 7);
+
+    nested.create(root.path()).unwrap();
+    outer.create(root.path()).unwrap();
+
+    assert_eq!(
+        existing_job_ids(&nested.key.jobs_dir(root.path())).unwrap(),
+        [JobId::from(1)]
+    );
+    assert_eq!(
+        existing_job_ids(&outer.key.jobs_dir(root.path())).unwrap(),
+        [JobId::from(7)]
+    );
+}
+
+#[test]
+fn a_host_named_local_is_not_this_machine() {
+    let hosted = RepoKey::from_remote_url("https://local/x/a").unwrap();
+    let here = RepoKey::from_remote_url("/x/a.git").unwrap();
+    let root = Path::new("/state");
+
+    assert_ne!(hosted, here);
+    assert_ne!(hosted.jobs_dir(root), here.jobs_dir(root));
+    assert_ne!(hosted.repo_cache(root), here.repo_cache(root));
+}
+
+#[test]
+fn a_repositorys_cache_is_not_inside_another_repositorys() {
+    let root = Path::new("/state");
+    let outer = RepoKey::from_remote_url("/x/a.git").unwrap();
+    let inner = RepoKey::from_remote_url("/x/a.git/b").unwrap();
+
+    assert!(!inner.repo_cache(root).starts_with(outer.repo_cache(root)));
+    assert!(!inner.jobs_dir(root).starts_with(outer.jobs_dir(root)));
+}
+
+#[test]
+fn dot_git_is_stripped_once() {
+    assert_eq!(key("/x/a.git.git"), "@local/x/a.git");
+    assert_ne!(
+        RepoKey::from_remote_url("/x/a.git.git").unwrap(),
+        RepoKey::from_remote_url("/x/a").unwrap()
+    );
+}
+
+#[test]
+fn a_key_is_found_again_from_its_directory_name() {
+    for url in ["/x/a.git", "https://local/x/a", "git@github.com:o/r.git"] {
+        let key = RepoKey::from_remote_url(url).unwrap();
+        assert_eq!(RepoKey::from_dir_name(&key.dir_name()), Some(key), "{url}");
+    }
+}
+
+#[test]
+fn a_directory_name_no_key_makes_is_no_key() {
+    for name in [
+        "notes",
+        "github.com~",
+        "~o",
+        "github.com~~r",
+        "github.com~..",
+        "@locals~o",
+        "a b~c",
+    ] {
+        assert_eq!(RepoKey::from_dir_name(name), None, "{name}");
+    }
 }
 
 fn key(url: &str) -> String {
@@ -127,8 +213,8 @@ fn ssh_and_https_spellings_of_one_repository_share_a_key() {
 
 #[test]
 fn a_repository_on_this_machine_is_keyed_under_local() {
-    assert_eq!(key("/srv/git/origin.git"), "local/srv/git/origin");
-    assert_eq!(key("file:///srv/git/origin.git"), "local/srv/git/origin");
+    assert_eq!(key("/srv/git/origin.git"), "@local/srv/git/origin");
+    assert_eq!(key("file:///srv/git/origin.git"), "@local/srv/git/origin");
 }
 
 #[test]
@@ -150,11 +236,11 @@ fn a_keys_jobs_and_cache_live_under_the_root() {
 
     assert_eq!(
         key.jobs_dir(Path::new("/state")),
-        PathBuf::from("/state/jobs/github.com/o/r")
+        PathBuf::from("/state/jobs/github.com~o~r")
     );
     assert_eq!(
         key.repo_cache(Path::new("/state")),
-        PathBuf::from("/state/repos/github.com/o/r.git")
+        PathBuf::from("/state/repos/github.com~o~r.git")
     );
 }
 
