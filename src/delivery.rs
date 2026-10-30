@@ -1,4 +1,5 @@
-//! Getting a finished job's branch off the machine, as a pull request.
+//! Getting a job's branch off the machine, as a pull request, once a round
+//! on it has passed.
 
 use crate::config::{Delivery, DeliveryMode};
 use crate::git::{GroupKilledOnDrop, PinnedRef};
@@ -115,7 +116,7 @@ pub struct PullRequestText<'a> {
 }
 
 /// Ask for a pull request from `job_branch` into `base`, unless `cancel`
-/// fires first. The job already pushed the branch, so nothing here can lose
+/// fires first. The round already pushed the branch, so nothing here can lose
 /// work.
 pub async fn deliver(
     repo: impl AsRef<Path>,

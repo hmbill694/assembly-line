@@ -1,9 +1,9 @@
-//! `assembly run`: one whole job, in this process — what every runner
-//! launches, and what a person types to reproduce a job.
+//! `assembly run`: one round, in this process — what every runner launches,
+//! and what a person types to reproduce a round.
 //!
 //! It keeps no state. What it did is its output — frames for a collector, or
 //! readable lines for a person — and the branch and pull request it leaves.
-//! Preparing claims nothing until every check that can refuse the job has
+//! Preparing claims nothing until every check that can refuse the round has
 //! passed, so a refusal costs no id.
 
 use crate::admission::{self, AdmissionRefused};
@@ -14,7 +14,7 @@ use crate::event::EventKind;
 use crate::frame::FrameWriter;
 use crate::git::{self, PinnedRef};
 use crate::job::JobId;
-use crate::payload::{RoundPayload, RoundRequest, remote_to_clone};
+use crate::payload::{RoundBeforeSettings, RoundPayload, remote_to_clone};
 use crate::report::JobReport;
 use crate::round::{FinishedRound, Verdict, run_round};
 use crate::workspace::{self, DEFAULT_REMOTE, ScratchClone};
@@ -38,7 +38,7 @@ pub struct RunRequest {
     pub provision_toolchain: bool,
 }
 
-/// Why a job will not run, decided before anything was claimed for it.
+/// Why a round will not run, decided before anything was claimed for it.
 #[derive(Debug)]
 pub enum RunRefused {
     NotAdmitted(AdmissionRefused),
@@ -89,10 +89,10 @@ fn no_job_branch(id: JobId) -> String {
     )
 }
 
-/// A job that has passed every check: cloned, its config read and valid, its
-/// id claimed or its branch found.
+/// A round that has passed every check: cloned, its config read and valid,
+/// its job's id claimed or its branch found.
 #[derive(Debug)]
-pub struct ReadyJob {
+pub struct AdmittedRound {
     clone: ScratchClone,
     payload: RoundPayload,
     settings: JobSettings,
@@ -102,24 +102,43 @@ pub struct ReadyJob {
     provisioning_deadline: Instant,
 }
 
-/// What a finished job left.
+/// What a finished round left.
 #[derive(Debug)]
-pub struct JobConclusion {
+pub struct RoundConclusion {
     pub job: JobId,
     pub verdict: Verdict,
-    pub report: JobReport,
+    /// Folded from this round's frames alone: `run` never sees the job's
+    /// earlier rounds.
+    pub this_rounds_report: JobReport,
     pub base_differs: Option<BaseDiffers>,
 }
 
-impl JobConclusion {
-    /// What the job left, as printed once it is over.
+impl RoundConclusion {
+    /// What the round left, as printed once it is over. Unlike `status`, no
+    /// `logs:` line: `run` keeps no state for `logs` to read.
     #[must_use]
     pub fn to_lines(&self) -> Vec<String> {
         self.base_differs
             .iter()
             .map(|differs| format!("note: {differs}"))
-            .chain(self.report.to_conclusion_lines())
+            .chain(std::iter::once(self.to_summary_line()))
+            .chain(self.this_rounds_report.work_location_lines())
             .collect()
+    }
+
+    /// `job 1: round failed (1 file +1/-0) — verify rejected the work: exit 1`.
+    /// `run` writes neither `RoundRequested` nor `RoundStarted`, so the
+    /// report names no round.
+    fn to_summary_line(&self) -> String {
+        let verdict = match self.verdict {
+            Verdict::Passed => "passed",
+            Verdict::Failed => "failed",
+        };
+        format!(
+            "job {}: round {verdict}{}",
+            self.job,
+            self.this_rounds_report.to_summary_after_label()
+        )
     }
 }
 
@@ -127,13 +146,13 @@ impl JobConclusion {
 ///
 /// # Errors
 ///
-/// A [`RunRefused`] for every reason the job cannot run; nothing is claimed
-/// on the remote for a refused job.
+/// A [`RunRefused`] for every reason the round cannot run; nothing is
+/// claimed on the remote for a refused round.
 pub async fn prepare_run(
     request: RunRequest,
     scratch_root: &Path,
     cancel: &CancellationToken,
-) -> Result<ReadyJob, RunRefused> {
+) -> Result<AdmittedRound, RunRefused> {
     let prompt =
         prompt_text(request.prompt, request.prompt_file).map_err(RunRefused::Unpreparable)?;
     let (remote_url, base_ref) = remote_and_base_ref(request.repo, request.base_ref)
@@ -154,7 +173,7 @@ pub async fn prepare_run(
         .map_err(RunRefused::NotAdmitted)?;
 
     // Pinning and admitting change nothing on the remote; claiming does, so
-    // a job cancelled by now is not claimed.
+    // a round cancelled by now claims nothing.
     if cancel.is_cancelled() {
         return Err(RunRefused::Unpreparable(anyhow!("cancelled")));
     }
@@ -172,21 +191,19 @@ pub async fn prepare_run(
     let (base, settings) = admitted.into_base_and_settings();
     let payload = RoundPayload::for_round(
         &settings,
-        RoundRequest {
+        RoundBeforeSettings {
             job_id,
             prompt: &prompt,
             start,
             remote_name: DEFAULT_REMOTE,
             remote_url,
+            provision_toolchain: request.provision_toolchain,
         },
     );
 
-    Ok(ReadyJob {
+    Ok(AdmittedRound {
         clone,
-        payload: RoundPayload {
-            provision_toolchain: request.provision_toolchain,
-            ..payload
-        },
+        payload,
         settings,
         base,
         prompt,
@@ -203,8 +220,8 @@ async fn job_branch_tip(clone: &ScratchClone, id: JobId) -> Result<PinnedRef, Ru
         .ok_or(RunRefused::NoJobBranch(id))
 }
 
-impl ReadyJob {
-    /// Which job is about to run, and from where.
+impl AdmittedRound {
+    /// Which job's round is about to run, and from where.
     #[must_use]
     pub fn to_announcement_line(&self) -> String {
         match self.claimed {
@@ -233,8 +250,8 @@ impl ReadyJob {
         self,
         frames: &FrameWriter<W>,
         cancel: CancellationToken,
-    ) -> anyhow::Result<JobConclusion> {
-        let ReadyJob {
+    ) -> anyhow::Result<RoundConclusion> {
+        let AdmittedRound {
             clone,
             payload,
             settings,
@@ -328,11 +345,11 @@ fn conclusion_of<W: Write>(
     frames: &FrameWriter<W>,
     verdict: Verdict,
     base_differs: Option<BaseDiffers>,
-) -> JobConclusion {
-    JobConclusion {
+) -> RoundConclusion {
+    RoundConclusion {
         job: payload.job_id,
         verdict,
-        report: JobReport::from_events(payload.job_id, &frames.events_so_far()),
+        this_rounds_report: JobReport::from_events(payload.job_id, &frames.events_so_far()),
         base_differs,
     }
 }
@@ -353,7 +370,7 @@ pub fn prompt_text(prompt: Option<String>, prompt_file: Option<PathBuf>) -> anyh
     }
 }
 
-/// Where the job clones from, and what it starts from: `base_ref` when one
+/// Where the round clones from, and what it starts from: `base_ref` when one
 /// is named, else a checkout's checked-out branch. A URL has none.
 async fn remote_and_base_ref(
     repo: Option<String>,

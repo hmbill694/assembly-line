@@ -35,7 +35,7 @@ pub fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-/// `PATH` with a `gh` in front that always refuses. A passing job delivers by
+/// `PATH` with a `gh` in front that always refuses. A passing round delivers by
 /// running `gh pr create`, and a test must never reach the developer's real
 /// `gh`, which is signed in and on the network.
 pub fn path_where_gh_refuses() -> String {
@@ -126,10 +126,10 @@ pub async fn repo_with_initial_commit() -> tempfile::TempDir {
 /// A repository that has opted in, with a remote its jobs push to.
 pub struct Harness {
     tmp: tempfile::TempDir,
-    /// The repository a job runs against.
+    /// The repository rounds run against.
     pub repo: PathBuf,
     /// The bare remote the repository's `main` is published to, which every
-    /// job clones from and pushes its branch back to.
+    /// round clones from and pushes its job's branch back to.
     pub origin: PathBuf,
     /// A state root for tests that keep a job's state the way a host does.
     /// [`Harness::run_job`] keeps none.
@@ -143,9 +143,9 @@ impl Harness {
     }
 
     /// A repository whose `.assembly/config.toml` is `body`, committed so it
-    /// can be read from a ref — which is the only way a job ever reads it.
+    /// can be read from a ref — which is the only way a round ever reads it.
     ///
-    /// Delivery is turned off: these jobs are about what a round does, and
+    /// Delivery is turned off: these tests are about what a round does, and
     /// `tests/cli.rs` and `tests/delivery.rs` cover what happens to its branch.
     pub async fn with_config(body: &str) -> Self {
         let tmp = tempfile::tempdir().unwrap();
@@ -177,12 +177,12 @@ impl Harness {
         }
     }
 
-    /// Where this harness's jobs make their scratch clones.
+    /// Where this harness's rounds make their scratch clones.
     pub fn scratch_root(&self) -> PathBuf {
         self.tmp.path().join("scratch")
     }
 
-    /// Whether every scratch clone a job made is gone again.
+    /// Whether every scratch clone a round made is gone again.
     pub fn scratch_is_empty(&self) -> bool {
         std::fs::read_dir(self.scratch_root()).map_or(true, |mut entries| entries.next().is_none())
     }
@@ -211,13 +211,13 @@ impl Harness {
         job
     }
 
-    /// Run one job against this repository, with `prompt`, from `main` —
-    /// in this process, as `assembly run` does.
+    /// Run a new job's first round against this repository, with `prompt`,
+    /// from `main` — in this process, as `assembly run` does.
     pub async fn run_job(&self, prompt: &str) -> Outcome {
         self.run(self.request(prompt, None, None)).await
     }
 
-    /// Run one job cut from a named ref rather than `main`.
+    /// Run a new job's first round, cut from a named ref rather than `main`.
     pub async fn run_job_from(&self, prompt: &str, base_ref: &str) -> Outcome {
         self.run(self.request(prompt, None, Some(base_ref))).await
     }
@@ -231,8 +231,8 @@ impl Harness {
         .await
     }
 
-    /// Why a job with `provider` would not start: a refusal before anything
-    /// was claimed, as distinct from a job that failed.
+    /// Why a round with `provider` would not start: a refusal before anything
+    /// was claimed, as distinct from a round that failed.
     pub async fn refusal_to_start(&self, prompt: &str, provider: Option<&str>) -> RunRefused {
         match prepare_run(
             self.request(prompt, provider, None),
@@ -241,7 +241,7 @@ impl Harness {
         )
         .await
         {
-            Ok(_) => panic!("the job was ready to run, not refused"),
+            Ok(_) => panic!("the round was admitted, not refused"),
             Err(refused) => refused,
         }
     }
@@ -293,33 +293,33 @@ impl Harness {
         }
     }
 
-    /// Run a job that must be ready rather than refused, its frames kept in
-    /// memory.
+    /// Run a round that must be admitted rather than refused, its frames kept
+    /// in memory.
     async fn run(&self, request: RunRequest) -> Outcome {
         let cancel = CancellationToken::new();
-        let ready = match prepare_run(request, &self.scratch_root(), &cancel).await {
-            Ok(ready) => ready,
+        let admitted = match prepare_run(request, &self.scratch_root(), &cancel).await {
+            Ok(admitted) => admitted,
             Err(refused) => panic!(
-                "the job was refused: {refused} {:?}",
+                "the round was refused: {refused} {:?}",
                 refused.itemized_reasons()
             ),
         };
         let frames = FrameWriter::new(Vec::new());
-        let conclusion = ready.run(&frames, cancel).await.unwrap();
+        let conclusion = admitted.run(&frames, cancel).await.unwrap();
         let mut readable = ReadableFrames::new(Vec::new());
         readable.write_all(&frames.copy_of_sink()).unwrap();
 
         Outcome {
             passed: conclusion.verdict.passed(),
             job_id: conclusion.job,
-            state: conclusion.report.state,
+            state: conclusion.this_rounds_report.state,
             events: frames.events_so_far().into_iter().map(|e| e.kind).collect(),
             output: String::from_utf8(readable.into_text()).unwrap(),
         }
     }
 }
 
-/// What a finished job reported.
+/// What a finished round reported.
 #[derive(Debug)]
 pub struct Outcome {
     pub passed: bool,

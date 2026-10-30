@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[command(
     name = "assembly",
     version,
-    about = "Run one coding-agent job and keep the branch it leaves"
+    about = "Run coding-agent jobs as rounds, and keep the branches they leave"
 )]
 pub struct Cli {
     /// Where job state lives. Defaults to $XDG_STATE_HOME/assembly-line,
@@ -19,8 +19,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Do one whole job, here, in this process: clone, agent, verify, push,
-    /// pull request. What every runner launches.
+    /// Do one round, here, in this process: clone, agent, verify, push, pull
+    /// request. What every runner launches.
     Run {
         /// What the agent is asked to do. Give it as --prompt=TEXT when it
         /// begins with '-'.

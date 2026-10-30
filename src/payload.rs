@@ -1,5 +1,6 @@
 //! What one round runs, resolved by `run` in the process that runs it: the
-//! repository's config applied to the job, its branch and its prompt.
+//! repository's config applied to the round, its job's branch and its
+//! prompt.
 
 use crate::config::JobSettings;
 use crate::git::{self, PinnedRef};
@@ -75,29 +76,30 @@ pub struct RoundPayload {
 
 /// What `run` knows about a round before its settings have been applied.
 #[derive(Debug, Clone)]
-pub struct RoundRequest<'a> {
+pub struct RoundBeforeSettings<'a> {
     pub job_id: JobId,
     pub prompt: &'a str,
     pub start: PinnedRef,
     pub remote_name: &'a str,
     pub remote_url: String,
+    pub provision_toolchain: bool,
 }
 
 impl RoundPayload {
     /// Apply the job's settings to a round.
     #[must_use]
-    pub fn for_round(settings: &JobSettings, request: RoundRequest<'_>) -> RoundPayload {
+    pub fn for_round(settings: &JobSettings, round: RoundBeforeSettings<'_>) -> RoundPayload {
         RoundPayload {
-            job_id: request.job_id,
-            remote_url: request.remote_url,
-            remote_name: request.remote_name.to_string(),
-            start: request.start,
-            branch: request.job_id.branch_name(),
-            command: render_command(&settings.provider, request.prompt),
-            commit_message: commit_message(request.job_id, request.prompt),
+            job_id: round.job_id,
+            remote_url: round.remote_url,
+            remote_name: round.remote_name.to_string(),
+            start: round.start,
+            branch: round.job_id.branch_name(),
+            command: render_command(&settings.provider, round.prompt),
+            commit_message: commit_message(round.job_id, round.prompt),
             verify: settings.verify.clone(),
             command_limit_secs: settings.max_duration.map(|limit| limit.as_secs()),
-            provision_toolchain: false,
+            provision_toolchain: round.provision_toolchain,
         }
     }
 }

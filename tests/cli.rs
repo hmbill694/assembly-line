@@ -103,7 +103,7 @@ async fn run_exits_zero_and_leaves_the_jobs_branch() {
         .args(["run", "--prompt", "do the thing"])
         .assert()
         .success()
-        .stdout(contains("job 1: passed"));
+        .stdout(contains("job 1: round passed"));
 
     assert_eq!(
         git_on_origin(&tmp, &["rev-parse", "--verify", "-q", "al/job-1"]).len(),
@@ -121,7 +121,7 @@ async fn run_exits_one_when_the_agent_fails_but_still_leaves_the_branch() {
         .args(["run", "--prompt", "x"])
         .assert()
         .code(1)
-        .stdout(contains("job 1: failed").and(contains("exit 3")));
+        .stdout(contains("job 1: round failed").and(contains("exit 3")));
 
     // The branch is the durable artifact, and it survives a failure.
     assert_eq!(
@@ -156,7 +156,7 @@ async fn a_job_id_already_taken_on_the_remote_is_skipped() {
         .args(["run", "--prompt", "x"])
         .assert()
         .success()
-        .stdout(contains("job 2: passed"));
+        .stdout(contains("job 2: round passed"));
 
     assert_eq!(
         git_on_origin(&tmp, &["rev-parse", "al/job-1"]),
@@ -447,7 +447,7 @@ async fn a_revise_round_continues_the_branch_instead_of_starting_over() {
         .args(["run", "--job", "1", "--prompt", "add error handling"])
         .assert()
         .success()
-        .stdout(contains("continuing al/job-1").and(contains("job 1: passed")));
+        .stdout(contains("continuing al/job-1").and(contains("job 1: round passed")));
 
     // Two commits on the job's branch, not one replaced by another.
     let count: usize = git_on_origin(&tmp, &["rev-list", "--count", "al/job-1"])

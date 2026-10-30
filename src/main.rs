@@ -42,7 +42,7 @@ fn main() -> ExitCode {
                 provision_toolchain,
             },
             _,
-        ) => in_async_runtime(run_whole_job(
+        ) => in_async_runtime(run_one_round(
             RunRequest {
                 repo,
                 base_ref,
@@ -110,23 +110,23 @@ fn install_tracing() {
 
 /// `run`: prepare, announce, run, conclude. With frames, stdout carries them
 /// and everything a person reads goes to stderr; without, a person reads
-/// stdout. The exit code mirrors the job, but a collector decides from the
+/// stdout. The exit code mirrors the round, but a collector decides from the
 /// frames — the code only matters when the frames never said.
-async fn run_whole_job(request: RunRequest, as_frames: bool) -> Result<ExitCode, String> {
+async fn run_one_round(request: RunRequest, as_frames: bool) -> Result<ExitCode, String> {
     let cancel = CancellationToken::new();
     cancel_on_termination_signal(cancel.clone()).map_err(|e| format!("handling SIGTERM: {e}"))?;
-    let ready = run::prepare_run(request, &std::env::temp_dir(), &cancel)
+    let admitted = run::prepare_run(request, &std::env::temp_dir(), &cancel)
         .await
         .map_err(|refused| report_run_refusal(&refused, as_frames))?;
 
     let conclusion = if as_frames {
-        eprintln!("{}", ready.to_announcement_line());
-        ready
+        eprintln!("{}", admitted.to_announcement_line());
+        admitted
             .run(&FrameWriter::new(std::io::stdout()), cancel)
             .await
     } else {
-        println!("{}", ready.to_announcement_line());
-        ready
+        println!("{}", admitted.to_announcement_line());
+        admitted
             .run(
                 &FrameWriter::new(ReadableFrames::new(std::io::stdout())),
                 cancel,

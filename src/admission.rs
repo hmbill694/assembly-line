@@ -1,12 +1,12 @@
-//! Whether a job may run, decided once, before anything is claimed for it:
-//! the repository's config at the job's pinned base, checked into the
-//! settings the job runs under.
+//! Whether a round may run, decided once, before anything is claimed for it:
+//! the repository's config at the round's pinned base, checked into the
+//! settings the round runs under.
 
 use crate::config::{ConfigError, JobSettings, REPO_CONFIG_PATH, RepoConfig};
 use crate::git::PinnedRef;
 use std::path::Path;
 
-/// A job that may run: the base its config was read at, and the settings
+/// A round that may run: the base its config was read at, and the settings
 /// that config gives it. Only [`admit`] makes one and nothing changes it,
 /// and claiming a job's id takes one, so a job is claimed at the commit its
 /// settings came from.
@@ -33,7 +33,7 @@ impl Admitted {
     }
 }
 
-/// Why a job may not run.
+/// Why a round may not run.
 #[derive(Debug)]
 pub enum AdmissionRefused {
     /// The base carries no config, or one that is not valid TOML.
@@ -70,12 +70,12 @@ impl std::fmt::Display for AdmissionRefused {
     }
 }
 
-/// Admit a job cut from `base` that names `provider_named`, reading the
-/// config at `base` from `repo`, which must hold that commit.
+/// Admit a round on `base` that names `provider_named`, reading the config
+/// at `base` from `repo`, which must hold that commit.
 ///
 /// # Errors
 ///
-/// An [`AdmissionRefused`] holding every reason the job may not run.
+/// An [`AdmissionRefused`] holding every reason the round may not run.
 pub async fn admit(
     repo: &Path,
     base: PinnedRef,

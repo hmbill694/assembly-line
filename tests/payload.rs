@@ -1,10 +1,10 @@
 use assembly_line::config::{JobSettings, RepoConfig};
 use assembly_line::git::PinnedRef;
 use assembly_line::job::JobId;
-use assembly_line::payload::{RoundPayload, RoundRequest, commit_message};
+use assembly_line::payload::{RoundBeforeSettings, RoundPayload, commit_message};
 
-fn request() -> RoundRequest<'static> {
-    RoundRequest {
+fn round() -> RoundBeforeSettings<'static> {
+    RoundBeforeSettings {
         job_id: 7.into(),
         prompt: "add a README\n\nwith sections",
         start: PinnedRef {
@@ -13,6 +13,7 @@ fn request() -> RoundRequest<'static> {
         },
         remote_name: "origin",
         remote_url: "https://example.com/o/r.git".into(),
+        provision_toolchain: false,
     }
 }
 
@@ -25,7 +26,7 @@ const RUNNABLE: &str = "provider = \"fake\"\nverify = \"cargo test\"\nmax_durati
 
 #[test]
 fn a_payload_carries_everything_the_round_needs_already_resolved() {
-    let payload = RoundPayload::for_round(&settings(RUNNABLE), request());
+    let payload = RoundPayload::for_round(&settings(RUNNABLE), round());
 
     assert_eq!(payload.branch, "al/job-7");
     assert_eq!(payload.command.program, "agent");
@@ -40,10 +41,20 @@ fn a_payload_carries_everything_the_round_needs_already_resolved() {
     assert_eq!(payload.verify.as_deref(), Some("cargo test"));
     assert_eq!(payload.command_limit_secs, Some(20 * 60));
     assert_eq!(payload.start.sha, "abc123");
-    assert!(
-        !payload.provision_toolchain,
-        "the host opts a runner in, never the default"
-    );
+}
+
+#[test]
+fn the_toolchain_flag_reaches_the_payload_as_given() {
+    [true, false].into_iter().for_each(|provision_toolchain| {
+        let payload = RoundPayload::for_round(
+            &settings(RUNNABLE),
+            RoundBeforeSettings {
+                provision_toolchain,
+                ..round()
+            },
+        );
+        assert_eq!(payload.provision_toolchain, provision_toolchain);
+    });
 }
 
 #[test]

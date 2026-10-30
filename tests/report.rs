@@ -561,26 +561,6 @@ fn status_of_a_job_cancelled_before_its_first_round_names_no_logs_command() {
 }
 
 #[test]
-fn a_conclusion_names_no_logs_command() {
-    let events = timeline(vec![
-        (0, EventKind::RoundStarted { round: 1 }),
-        (
-            1,
-            EventKind::BranchPushed {
-                branch: "al/job-4".into(),
-                pushed_to: "origin".into(),
-            },
-        ),
-        (3, EventKind::RoundPassed),
-    ]);
-
-    assert_eq!(
-        JobReport::from_events(JobId::from(4), &events).to_conclusion_lines(),
-        ["job 4: passed (round 1)", "took 3.0s", "branch: al/job-4"]
-    );
-}
-
-#[test]
 fn timing_is_reported_only_once_a_round_has_ended() {
     let running = timeline(vec![(0, EventKind::RoundStarted { round: 1 })]);
     assert!(

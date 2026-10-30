@@ -218,11 +218,24 @@ impl JobReport {
         }
     }
 
-    /// The single line printed at the end of a round:
-    /// `job 7: failed (round 2, 3 files +40/-2) — verify failed`. A report
-    /// that saw no round requested or started names no round.
+    /// The job's line in `status`:
+    /// `job 7: failed (round 2, 3 files +40/-2) — verify rejected the work: exit 1`.
     #[must_use]
     pub fn to_summary_line(&self) -> String {
+        format!(
+            "job {}: {}{}",
+            self.id,
+            self.state.label(),
+            self.to_summary_after_label()
+        )
+    }
+
+    /// What a summary line says after its state label:
+    /// ` (round 2, 3 files +40/-2) — verify rejected the work: exit 1`, or
+    /// nothing. A report that saw no round requested or started names no
+    /// round.
+    #[must_use]
+    pub fn to_summary_after_label(&self) -> String {
         let facts: Vec<String> = [
             (self.rounds > 0).then(|| format!("round {}", self.rounds)),
             self.diff.map(|d| d.to_string()),
@@ -234,16 +247,12 @@ impl JobReport {
             true => String::new(),
             false => format!(" ({})", facts.join(", ")),
         };
-
-        format!(
-            "job {}: {}{facts}{}",
-            self.id,
-            self.state.label(),
-            self.detail
-                .as_ref()
-                .map(|why| format!(" — {why}"))
-                .unwrap_or_default(),
-        )
+        let detail = self
+            .detail
+            .as_ref()
+            .map(|why| format!(" — {why}"))
+            .unwrap_or_default();
+        format!("{facts}{detail}")
     }
 
     /// How long the last round took, as `status` prints it. `None` for a job
@@ -254,22 +263,11 @@ impl JobReport {
             .map(|d| format!("took {:.1}s", d.as_secs_f64()))
     }
 
-    /// What `run` prints once its job is over: the summary, how long the
-    /// round took, and the branch and its pull request once there are any.
-    #[must_use]
-    pub fn to_conclusion_lines(&self) -> Vec<String> {
-        std::iter::once(self.to_summary_line())
-            .chain(self.to_duration_line())
-            .chain(self.work_location_lines())
-            .collect()
-    }
-
-    /// Everything `status` prints: the conclusion's lines with the job's id
-    /// before its branch, and the command that prints its output once a
-    /// round has started. A round that fails reading its config or launching
-    /// has started without capturing anything, so `logs` can still have
-    /// nothing to show. `run` keeps no state for `logs` to read, which is why
-    /// the two differ.
+    /// Everything `status` prints: the summary, how long the round took, the
+    /// job's id, its branch and pull request once there are any, and the
+    /// command that prints its output once a round has started. A round that
+    /// fails reading its config or launching has started without capturing
+    /// anything, so `logs` can still have nothing to show.
     #[must_use]
     pub fn to_status_lines(&self) -> Vec<String> {
         std::iter::once(self.to_summary_line())
@@ -283,7 +281,8 @@ impl JobReport {
             .collect()
     }
 
-    fn work_location_lines(&self) -> impl Iterator<Item = String> {
+    /// `branch: …` and `pull request: …`, once there are any.
+    pub fn work_location_lines(&self) -> impl Iterator<Item = String> {
         let branch = self
             .branch
             .as_ref()
