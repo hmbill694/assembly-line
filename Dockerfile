@@ -10,7 +10,7 @@ WORKDIR /src
 COPY . .
 RUN cargo build --release --locked --bin assembly
 
-FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
 
 # Every `curl | sh` below fails the build when curl does, rather than piping
 # an empty script into a shell that exits 0.
