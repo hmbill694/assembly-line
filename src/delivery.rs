@@ -1,7 +1,8 @@
 //! Getting a finished job's branch off the machine, as a pull request.
 
 use crate::config::{Delivery, DeliveryMode};
-use crate::git::GroupKilledOnDrop;
+use crate::git::{GroupKilledOnDrop, PinnedRef};
+use crate::round::Verdict;
 use std::path::Path;
 use std::process::{Output, Stdio};
 use tokio::process::Command;
@@ -37,6 +38,67 @@ impl std::fmt::Display for Delivered {
             }
             Self::Opened { url } => write!(f, "opened {url}"),
             Self::AlreadyOpen { url } => write!(f, "updated {url}"),
+        }
+    }
+}
+
+/// The pull request targets a different branch from the one the job was cut
+/// from, so its diff carries more than the job's work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseDiffers {
+    pub base: String,
+    pub base_ref: String,
+}
+
+impl std::fmt::Display for BaseDiffers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "this pull request will target '{}', but the job was cut from '{}' — review the \
+             diff before merging, since it carries everything separating the two, not just this \
+             job's work",
+            self.base, self.base_ref
+        )
+    }
+}
+
+/// Whether a finished round's branch is worth a pull request, and where.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliveryPlan {
+    NothingToDeliver,
+    OpenPullRequest {
+        target: String,
+        base_differs: Option<BaseDiffers>,
+    },
+}
+
+/// What to deliver for a round with `verdict` that left the job's branch at
+/// `branch_tip`. A passing branch carries work when its tip is not `base`'s
+/// commit, which needs no git. Unset, `pull_request_target` is `base`.
+///
+/// A revise pins `base` again, so a branch that never got a commit also
+/// differs from a base that has moved on, and `gh` is asked for that pull
+/// request too. Into `base`, `gh` refuses it. Into another target, one that
+/// lacks commits the old base has, it can open with only base commits and
+/// none of the job's work; the [`BaseDiffers`] note is printed with it.
+#[must_use]
+pub fn delivery_plan(
+    verdict: Verdict,
+    branch_tip: &str,
+    base: &PinnedRef,
+    pull_request_target: Option<&str>,
+) -> DeliveryPlan {
+    match (verdict, branch_tip == base.sha) {
+        (Verdict::Failed, _) | (Verdict::Passed, true) => DeliveryPlan::NothingToDeliver,
+        (Verdict::Passed, false) => {
+            let target = pull_request_target.unwrap_or(&base.name);
+            DeliveryPlan::OpenPullRequest {
+                target: target.to_string(),
+                base_differs: (target != base.name).then(|| BaseDiffers {
+                    base: target.to_string(),
+                    base_ref: base.name.clone(),
+                }),
+            }
         }
     }
 }

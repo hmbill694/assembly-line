@@ -209,6 +209,26 @@ async fn a_failing_agent_preserves_its_work_on_a_branch_and_leaves_no_checkout()
     );
 }
 
+#[tokio::test]
+async fn a_failing_agent_has_its_work_recorded_before_its_verdict() {
+    let h = Harness::with_config(&config_running("failing-agent.sh")).await;
+
+    let outcome = h.run_job("x").await;
+
+    assert!(
+        matches!(
+            outcome.events.as_slice(),
+            [
+                EventKind::RoundCommitted { .. },
+                EventKind::BranchPushed { .. },
+                EventKind::RoundFailed { reason },
+            ] if reason == "exit 3"
+        ),
+        "{:?}",
+        outcome.events
+    );
+}
+
 /// The checkout is the agent's to change, permissions included. One it has
 /// made hard to delete still goes, and the work it holds is still recorded.
 #[tokio::test]

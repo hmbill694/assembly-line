@@ -1,9 +1,16 @@
 //! One round's sandbox: a scratch clone of the remote.
 
 use crate::git::{self, PinnedRef};
+use crate::payload::GIT_TOKEN_VAR;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
+
+/// How long cloning and provisioning may take together. Not `max_duration`:
+/// that is the repository's statement about its own commands, and a cold
+/// toolchain install should not eat the agent's budget.
+pub const PROVISIONING_LIMIT: Duration = Duration::from_mins(15);
 
 /// A scratch clone of the remote, with nothing checked out yet.
 #[derive(Debug)]
@@ -62,6 +69,60 @@ pub async fn clone_scratch(
         .tempdir_in(scratch_root)?;
     git::clone_into(remote_url, dir.path(), credential_helper).await?;
     Ok(ScratchClone { dir })
+}
+
+/// [`clone_scratch`] with this environment's credentials, cut off at
+/// [`PROVISIONING_LIMIT`] or by `cancel`. The deadline that comes back with
+/// the clone is that limit, counted from before the clone began: what is
+/// left of it is provisioning's.
+///
+/// # Errors
+///
+/// The clone's own error, or one saying it timed out or was cancelled.
+pub async fn clone_within_provisioning_limit(
+    remote_url: &str,
+    scratch_root: impl AsRef<Path>,
+    cancel: &CancellationToken,
+) -> anyhow::Result<(ScratchClone, Instant)> {
+    let provisioning_deadline = Instant::now() + PROVISIONING_LIMIT;
+    let clone = within_provisioning_limit(
+        clone_scratch(
+            remote_url,
+            scratch_root,
+            credential_helper_for_this_environment(),
+        ),
+        cancel,
+    )
+    .await?;
+    Ok((clone, provisioning_deadline))
+}
+
+/// `cloning`, cut off at [`PROVISIONING_LIMIT`] or by `cancel`.
+///
+/// Unlike `mise`, a clone may be dropped from outside, because dropping
+/// `git` kills its whole process group (`git::run_allowing_failure`).
+async fn within_provisioning_limit<T>(
+    cloning: impl Future<Output = anyhow::Result<T>>,
+    cancel: &CancellationToken,
+) -> anyhow::Result<T> {
+    tokio::select! {
+        cloned = tokio::time::timeout(PROVISIONING_LIMIT, cloning) => cloned.map_err(|_| {
+            anyhow::anyhow!(
+                "provisioning timed out after {}",
+                humantime::format_duration(PROVISIONING_LIMIT)
+            )
+        })?,
+        () = cancel.cancelled() => Err(anyhow::anyhow!("cancelled")),
+    }
+}
+
+/// The credential helper a job's clone authenticates with. A container
+/// runner always sends the token, having no other credentials to offer;
+/// without one, git uses whatever this environment already has.
+fn credential_helper_for_this_environment() -> Option<&'static str> {
+    std::env::var_os(GIT_TOKEN_VAR)
+        .is_some()
+        .then_some(git::TOKEN_CREDENTIAL_HELPER)
 }
 
 /// `git_ref` as the clone's remote has it, pinned to `pinned_sha` when one

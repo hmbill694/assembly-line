@@ -76,6 +76,31 @@ async fn a_round_whose_verify_fails_is_a_failed_round() {
     );
 }
 
+#[tokio::test]
+async fn a_rejected_round_records_its_work_then_the_rejection_then_its_verdict() {
+    let h = Harness::with_config(&format!(
+        "verify = \"{VERIFY_REJECTS_THE_COMMITTED_WORK}\"\n{}",
+        config_running("fake-agent.sh")
+    ))
+    .await;
+
+    let outcome = h.run_job("write a file").await;
+
+    assert!(
+        matches!(
+            outcome.events.as_slice(),
+            [
+                EventKind::RoundCommitted { .. },
+                EventKind::BranchPushed { .. },
+                EventKind::VerifyRejected { reason: rejected },
+                EventKind::RoundFailed { reason: failed },
+            ] if rejected == "exit 1" && failed == "verify rejected the work: exit 1"
+        ),
+        "{:?}",
+        outcome.events
+    );
+}
+
 /// Also the positive control for `an_agent_failure_wins_over_verify`: the
 /// same sentinel that must be absent there must be present here, or that test
 /// would pass for a verify that never runs under any circumstances.

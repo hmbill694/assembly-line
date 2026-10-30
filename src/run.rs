@@ -9,18 +9,15 @@
 use crate::admission::{self, AdmissionRefused};
 use crate::claim::claim_job;
 use crate::config::JobSettings;
-use crate::delivery::{self, Delivered, PullRequestText};
+use crate::delivery::{self, BaseDiffers, Delivered, DeliveryPlan, PullRequestText};
 use crate::event::EventKind;
 use crate::frame::FrameWriter;
 use crate::git::{self, PinnedRef};
 use crate::job::JobId;
 use crate::payload::{RoundPayload, RoundRequest, remote_to_clone};
 use crate::report::JobReport;
-use crate::round::{
-    PROVISIONING_LIMIT, RoundClosing, Verdict, credential_helper_for_this_environment,
-    discard_reporting_failure, run_round_in, within_provisioning_limit,
-};
-use crate::workspace::{self, DEFAULT_REMOTE, RoundWorkspace, ScratchClone};
+use crate::round::{FinishedRound, Verdict, run_round};
+use crate::workspace::{self, DEFAULT_REMOTE, ScratchClone};
 use anyhow::anyhow;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -92,26 +89,6 @@ fn no_job_branch(id: JobId) -> String {
     )
 }
 
-/// The pull request targets a different branch from the one the job was cut
-/// from, so its diff carries more than the job's work.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BaseDiffers {
-    pub base: String,
-    pub base_ref: String,
-}
-
-impl std::fmt::Display for BaseDiffers {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "this pull request will target '{}', but the job was cut from '{}' — review the \
-             diff before merging, since it carries everything separating the two, not just this \
-             job's work",
-            self.base, self.base_ref
-        )
-    }
-}
-
 /// A job that has passed every check: cloned, its config read and valid, its
 /// id claimed or its branch found.
 #[derive(Debug)]
@@ -164,17 +141,10 @@ pub async fn prepare_run(
         .map_err(RunRefused::Unpreparable)?;
     let (ref_name, pinned_sha) = split_pin(&base_ref);
 
-    let provisioning_deadline = Instant::now() + PROVISIONING_LIMIT;
-    let clone = within_provisioning_limit(
-        workspace::clone_scratch(
-            &remote_url,
-            scratch_root,
-            credential_helper_for_this_environment(),
-        ),
-        cancel,
-    )
-    .await
-    .map_err(RunRefused::Unpreparable)?;
+    let (clone, provisioning_deadline) =
+        workspace::clone_within_provisioning_limit(&remote_url, scratch_root, cancel)
+            .await
+            .map_err(RunRefused::Unpreparable)?;
 
     let base = workspace::pin_in_clone(&clone, &ref_name, pinned_sha.as_deref())
         .await
@@ -273,75 +243,54 @@ impl ReadyJob {
             provisioning_deadline,
             ..
         } = self;
-        let ws = match workspace::start_round(clone, &payload.start, &payload.branch).await {
-            Ok(ws) => ws,
-            Err(e) => {
-                frames.append_event(EventKind::RoundFailed {
-                    reason: e.to_string(),
-                })?;
-                return Ok(conclusion_of(&payload, frames, Verdict::Failed, None));
+        let round = run_round(
+            clone,
+            &payload,
+            frames,
+            provisioning_deadline,
+            cancel.clone(),
+        )
+        .await?;
+        let plan = delivery::delivery_plan(
+            round.verdict(),
+            round.branch_tip(),
+            &base,
+            settings.pull_request_target.as_deref(),
+        );
+        let base_differs = match (plan, round.workspace_path()) {
+            (
+                DeliveryPlan::OpenPullRequest {
+                    target,
+                    base_differs,
+                },
+                Some(checkout),
+            ) => {
+                deliver(
+                    checkout, &settings, &target, &payload, &prompt, frames, &cancel,
+                )
+                .await?;
+                base_differs
             }
+            (DeliveryPlan::NothingToDeliver | DeliveryPlan::OpenPullRequest { .. }, _) => None,
         };
-        let closing =
-            run_round_in(&payload, &ws, frames, provisioning_deadline, cancel.clone()).await?;
-
-        let base_differs = match closing.verdict {
-            Verdict::Passed if branch_carries_work(&ws, &payload, &base, frames).await => {
-                deliver(&ws, &settings, &base, &payload, &prompt, frames, &cancel).await?
-            }
-            Verdict::Passed | Verdict::Failed => None,
-        };
-        let verdict = closing_after_delivery(closing, &cancel).append_to(frames)?;
-        discard_reporting_failure(ws, frames)?;
+        let verdict = closing_after_delivery(round, &cancel).close(frames)?;
         Ok(conclusion_of(&payload, frames, verdict, base_differs))
     }
 }
 
-/// Whether the job's branch, as the round left it on the remote, holds
-/// commits its base does not — this round's, or an earlier round's when this
-/// one changed nothing. A branch that could not be compared holds nothing
-/// worth delivering.
-async fn branch_carries_work<W: Write>(
-    ws: &RoundWorkspace,
-    payload: &RoundPayload,
-    base: &PinnedRef,
-    frames: &FrameWriter<W>,
-) -> bool {
-    let tip = frames
-        .events_so_far()
-        .into_iter()
-        .rev()
-        .find_map(|e| match e.kind {
-            EventKind::RoundCommitted { sha, .. } => Some(sha),
-            _ => None,
-        })
-        .unwrap_or_else(|| payload.start.sha.clone());
-    git::commit_is_ahead_of(ws.path(), &tip, &base.sha)
-        .await
-        .unwrap_or(false)
-}
-
-/// Open the pull request from inside the clone, and record what came of it:
-/// an event for a pull request that exists, a line of output otherwise.
+/// Open the pull request from inside `checkout`, and record what came of
+/// it: an event for a pull request that exists, a line of output otherwise.
 async fn deliver<W: Write + Send + 'static>(
-    ws: &RoundWorkspace,
+    checkout: &Path,
     settings: &JobSettings,
-    base: &PinnedRef,
+    target: &str,
     payload: &RoundPayload,
     prompt: &str,
     frames: &FrameWriter<W>,
     cancel: &CancellationToken,
-) -> anyhow::Result<Option<BaseDiffers>> {
-    let target = settings
-        .pull_request_target
-        .as_deref()
-        .unwrap_or(&base.name);
-    let base_differs = (target != base.name).then(|| BaseDiffers {
-        base: target.to_string(),
-        base_ref: base.name.clone(),
-    });
+) -> anyhow::Result<()> {
     let delivered = delivery::deliver(
-        ws.path(),
+        checkout,
         &settings.delivery,
         &payload.branch,
         target,
@@ -358,19 +307,19 @@ async fn deliver<W: Write + Send + 'static>(
         }
         other => frames.append_output(&other.to_string())?,
     }
-    Ok(base_differs)
+    Ok(())
 }
 
 /// How a round closes once delivery is over. The job reads as running until
 /// its verdict, so a cancel can arrive after the round passed; it fails the
 /// round, as it would have failed it any earlier, whether or not a pull
 /// request was opened before it came.
-fn closing_after_delivery(closing: RoundClosing, cancel: &CancellationToken) -> RoundClosing {
-    match (closing.verdict, cancel.is_cancelled()) {
+fn closing_after_delivery(round: FinishedRound, cancel: &CancellationToken) -> FinishedRound {
+    match (round.verdict(), cancel.is_cancelled()) {
         (Verdict::Passed, true) => {
-            RoundClosing::failed_because("cancelled while delivering its pull request".to_string())
+            round.failed_because("cancelled while delivering its pull request".to_string())
         }
-        (Verdict::Passed, false) | (Verdict::Failed, _) => closing,
+        (Verdict::Passed, false) | (Verdict::Failed, _) => round,
     }
 }
 
