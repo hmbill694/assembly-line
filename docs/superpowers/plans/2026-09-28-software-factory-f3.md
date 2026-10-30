@@ -23,8 +23,9 @@ Known open:
   alone when no pull request is open yet.
 - A revise cancelled before it starts shows "failed (round 1)", naming the
   round before it.
-- `tests/kubernetes_runner.rs` cancels after a fixed 300ms and may be
-  timing-sensitive.
+- Fixed by #11 of the architecture handoff: `tests/kubernetes_runner.rs`
+  cancelled after a fixed 300ms; it now cancels once the fake has been
+  asked for `get pods`.
 - The stack's revisions below `rtuzrxvq` still carry the flaky
   `cancelling_a_round_stops_a_clone_in_progress`; `rtuzrxvq` fixes it.
 

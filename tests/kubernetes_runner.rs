@@ -2,12 +2,13 @@ use assembly_line::collect::collect;
 use assembly_line::event::{Event, EventKind, EventLog};
 use assembly_line::frame::FrameWriter;
 use assembly_line::runner::kubernetes::{
-    KubernetesRunner, LogReadPosition, PodProgress, active_deadline_secs, job_manifest,
-    pod_progress, secret_manifest, split_timestamp,
+    KubernetesRunner, LogReadPosition, PodProgress, ReconnectPolicy, StreamAction,
+    active_deadline_secs, job_manifest, pod_progress, secret_manifest, split_timestamp,
 };
 use assembly_line::runner::{JobSecrets, RoundHandle, Runner, RunningRound};
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::time::Duration;
 use support::{Harness, fake_cli};
 use tokio_util::sync::CancellationToken;
 
@@ -189,6 +190,120 @@ fn a_second_line_with_the_same_timestamp_is_new_but_replaying_it_is_not() {
         ),
         (true, true, false, false, true)
     );
+}
+
+const LIVE_CONNECTION: Duration = Duration::from_secs(30);
+
+fn running_pod() -> PodProgress {
+    PodProgress::Running { pod: "p".into() }
+}
+
+/// The policy after `follows` follows of a running pod that each ended at
+/// once, and what it decided after each.
+fn after_fruitless_follows(
+    policy: ReconnectPolicy,
+    follows: usize,
+) -> (ReconnectPolicy, Vec<StreamAction>) {
+    (0..follows).fold((policy, Vec::new()), |(policy, actions), _| {
+        let (policy, action) = policy.after_follow_ended(&running_pod(), Duration::ZERO);
+        (policy, [actions, vec![action]].concat())
+    })
+}
+
+#[test]
+fn a_follow_of_a_running_pod_that_ends_is_reconnected() {
+    let (_, action) = ReconnectPolicy::with_live_connection(LIVE_CONNECTION)
+        .after_follow_ended(&running_pod(), Duration::ZERO);
+
+    assert_eq!(action, StreamAction::Reconnect);
+}
+
+#[test]
+fn a_running_pods_stream_is_abandoned_after_five_fruitless_reconnects() {
+    let (policy, actions) =
+        after_fruitless_follows(ReconnectPolicy::with_live_connection(LIVE_CONNECTION), 5);
+    let (_, sixth) = policy.after_follow_ended(&running_pod(), Duration::ZERO);
+
+    assert_eq!(actions, vec![StreamAction::Reconnect; 5]);
+    assert_eq!(sixth, StreamAction::Abandon);
+}
+
+#[test]
+fn a_follow_that_held_for_the_live_connection_starts_the_count_over() {
+    let (policy, _) =
+        after_fruitless_follows(ReconnectPolicy::with_live_connection(LIVE_CONNECTION), 5);
+    let (policy, held) = policy.after_follow_ended(&running_pod(), LIVE_CONNECTION);
+    let (_, actions) = after_fruitless_follows(policy, 5);
+
+    assert_eq!(held, StreamAction::Reconnect);
+    assert_eq!(
+        actions,
+        [
+            vec![StreamAction::Reconnect; 4],
+            vec![StreamAction::Abandon]
+        ]
+        .concat(),
+        "the held follow is itself the first reconnect of the new count"
+    );
+}
+
+#[test]
+fn a_follow_that_held_for_less_than_the_live_connection_does_not_start_the_count_over() {
+    let (policy, _) =
+        after_fruitless_follows(ReconnectPolicy::with_live_connection(LIVE_CONNECTION), 5);
+    let (_, action) = policy.after_follow_ended(
+        &running_pod(),
+        LIVE_CONNECTION.saturating_sub(Duration::from_nanos(1)),
+    );
+
+    assert_eq!(action, StreamAction::Abandon);
+}
+
+#[test]
+fn a_finished_pod_is_drained_however_many_reconnects_were_fruitless() {
+    let finished = PodProgress::Finished {
+        pod: "p".into(),
+        exit_code: 0,
+        reason: None,
+    };
+    let (worn_out, _) =
+        after_fruitless_follows(ReconnectPolicy::with_live_connection(LIVE_CONNECTION), 5);
+
+    let actions = [
+        ReconnectPolicy::with_live_connection(LIVE_CONNECTION),
+        worn_out,
+    ]
+    .map(|policy| policy.after_follow_ended(&finished, Duration::ZERO).1);
+
+    assert_eq!(actions, [StreamAction::Drain; 2]);
+}
+
+#[test]
+fn a_waiting_or_gone_pods_stream_ends() {
+    let actions = [
+        PodProgress::Waiting {
+            reason: "Pending".into(),
+        },
+        PodProgress::Gone,
+    ]
+    .map(|progress| {
+        ReconnectPolicy::with_live_connection(LIVE_CONNECTION)
+            .after_follow_ended(&progress, Duration::ZERO)
+            .1
+    });
+
+    assert_eq!(actions, [StreamAction::End; 2]);
+}
+
+#[test]
+fn a_new_line_starts_the_count_of_fruitless_reconnects_over() {
+    let (policy, _) =
+        after_fruitless_follows(ReconnectPolicy::with_live_connection(LIVE_CONNECTION), 5);
+    let (policy, actions) = after_fruitless_follows(policy.after_new_line(), 5);
+    let (_, sixth) = policy.after_follow_ended(&running_pod(), Duration::ZERO);
+
+    assert_eq!(actions, vec![StreamAction::Reconnect; 5]);
+    assert_eq!(sixth, StreamAction::Abandon);
 }
 
 /// A whole passing round's frames, as `kubectl logs --timestamps` prints
@@ -638,16 +753,16 @@ async fn a_log_stream_that_only_replays_ends_the_round_and_logs_the_line_once() 
     assert_eq!(log.matches("something unframed").count(), 1, "{log}");
 }
 
-/// An agent can be quiet for longer than a log connection survives. Each
-/// follow here holds for a while, replays the one line and drops — a live
-/// pod on a flaky connection, not a stream that cannot be read — so however
-/// many times it reconnects, the round is collected once the pod finishes.
+/// An agent can be quiet for longer than a log connection survives. With
+/// no `live_connection` to wait out, every follow counts as one that held,
+/// so however many times a quiet pod's follow drops, the round is collected
+/// once the pod finishes.
 #[tokio::test]
 async fn a_quiet_pod_whose_connection_keeps_dropping_is_not_abandoned() {
     let h = Harness::new().await;
     let fakes = h.scratch_root().with_file_name("fakes");
     let k8s = KubernetesRunner {
-        live_connection: std::time::Duration::from_millis(100),
+        live_connection: Duration::ZERO,
         ..runner(kubectl_answering(
             &fakes,
             &format!("cat >/dev/null; echo '{CREATED_JOB}'"),
@@ -656,7 +771,45 @@ async fn a_quiet_pod_whose_connection_keeps_dropping_is_not_abandoned() {
                  if [ $n -gt 12 ]; then echo '{SUCCEEDED_POD}'; else echo '{RUNNING_POD}'; fi"
             ),
             "case \"$*\" in\n\
-               *-f*) echo '2026-09-21T09:59:59Z thinking'; sleep 0.2 ;;\n\
+               *-f*) ;;\n\
+               *) cat frames ;;\n\
+             esac",
+        ))
+    };
+
+    let (passed, events) = collected_round(&h, &k8s).await;
+
+    assert!(passed, "{events:?}");
+    let follows = std::fs::read_to_string(fakes.join("argv"))
+        .unwrap()
+        .lines()
+        .filter(|l| l.contains(" logs ") && l.split(' ').any(|arg| arg == "-f"))
+        .count();
+    assert!(
+        follows > 6,
+        "the pod should have outlasted the fruitless-reconnect allowance: {follows} follows"
+    );
+}
+
+/// The policy is told how long each follow really held: every follow here
+/// holds for 0.2s, far past a 1ms `live_connection`, so the quiet pod is
+/// never abandoned. The margin is one-sided: only a stall of the test
+/// process can make a follow look shorter than it was.
+#[tokio::test]
+async fn a_follow_is_judged_by_how_long_it_really_held() {
+    let h = Harness::new().await;
+    let fakes = h.scratch_root().with_file_name("fakes");
+    let k8s = KubernetesRunner {
+        live_connection: Duration::from_millis(1),
+        ..runner(kubectl_answering(
+            &fakes,
+            &format!("cat >/dev/null; echo '{CREATED_JOB}'"),
+            &format!(
+                "n=$(( $(cat polls 2>/dev/null || echo 0) + 1 )); echo $n > polls\n\
+                 if [ $n -gt 8 ]; then echo '{SUCCEEDED_POD}'; else echo '{RUNNING_POD}'; fi"
+            ),
+            "case \"$*\" in\n\
+               *-f*) sleep 0.2 ;;\n\
                *) cat frames ;;\n\
              esac",
         ))
@@ -697,8 +850,11 @@ async fn cancelling_a_launch_whose_pod_is_pending_deletes_the_job_and_its_secret
     let cancel = CancellationToken::new();
     let spec = h.launch_spec_for("x").await;
     let interrupt = cancel.clone();
+    let argv = fakes.join("argv");
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        while !std::fs::read_to_string(&argv).is_ok_and(|calls| calls.contains("get pods")) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         interrupt.cancel();
     });
 
