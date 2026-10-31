@@ -5,6 +5,9 @@
 //! operation names the repository or clone it acts on, so nothing depends on
 //! the process's current directory.
 //!
+//! A `name_or_url` is a remote as git takes it on the command line: the name
+//! of one the repository configures, or a URL.
+//!
 //! # Errors
 //!
 //! Every function here shares one failure mode: `git` could not be spawned, or
@@ -185,8 +188,8 @@ pub async fn init_bare_if_absent(path: &Path) -> anyhow::Result<()> {
         .map(|_| ())
 }
 
-/// The commit `git_ref` names on `remote`, asked without fetching anything
-/// into `repo` — or `None` when the remote has no such ref.
+/// The commit `git_ref` names on `name_or_url`, asked without fetching
+/// anything into `repo` — or `None` when the remote has no such ref.
 ///
 /// `ls-remote` matches a pattern against the tail of every ref, so
 /// `x/main` would answer for `main`. The ref is resolved the way a fetch of
@@ -194,13 +197,13 @@ pub async fn init_bare_if_absent(path: &Path) -> anyhow::Result<()> {
 /// a branch — and an annotated tag is peeled to its commit.
 pub async fn sha_on_remote(
     repo: impl AsRef<Path>,
-    remote: &str,
+    name_or_url: &str,
     git_ref: &str,
 ) -> anyhow::Result<Option<String>> {
     let peeled_pattern = format!("{git_ref}^{{}}");
     let listed = run_expecting_success(
         repo,
-        &["ls-remote", remote, git_ref, &peeled_pattern],
+        &["ls-remote", name_or_url, git_ref, &peeled_pattern],
         "ls-remote",
     )
     .await?;
@@ -237,30 +240,27 @@ pub struct PinnedRef {
     pub sha: String,
 }
 
-/// The URL a job clones `remote` from and pushes its branch back to, or
-/// `None` when the repository has no such remote.
-///
-/// A relative path is resolved against `repo`: git reads it relative to the
-/// repository, and from a scratch clone anywhere else it names nothing.
+/// The URL the remote called `name` fetches from, as `git remote get-url`
+/// gives it, or `None` when the repository has no such remote.
 ///
 /// # Errors
 ///
-/// When `remote` pushes somewhere the job's clone cannot know about: a
+/// When the remote pushes somewhere a job's clone cannot know about: a
 /// `remote.<name>.pushurl`, or a `url.<base>.pushInsteadOf` in the
 /// repository's own config. The clone has the fetch URL and none of the
 /// repository's config, so its push would go to the wrong place. A rewrite
 /// in global or system config is no reason to refuse: the clone reads that
 /// config too, and pushes where the user's own push would.
-pub async fn remote_url(repo: impl AsRef<Path>, remote: &str) -> anyhow::Result<Option<String>> {
+pub async fn remote_url(repo: impl AsRef<Path>, name: &str) -> anyhow::Result<Option<String>> {
     let repo = repo.as_ref();
-    let fetched = run_allowing_failure(repo, &["remote", "get-url", remote]).await?;
+    let fetched = run_allowing_failure(repo, &["remote", "get-url", name]).await?;
     let Some(fetch_url) = fetched
         .succeeded()
         .then(|| fetched.stdout.trim().to_string())
     else {
         return Ok(None);
     };
-    let pushurl_key = format!("remote.{remote}.pushurl");
+    let pushurl_key = format!("remote.{name}.pushurl");
     let has_pushurl = run_allowing_failure(repo, &["config", "--get-all", &pushurl_key])
         .await?
         .succeeded();
@@ -284,67 +284,33 @@ pub async fn remote_url(repo: impl AsRef<Path>, remote: &str) -> anyhow::Result<
 
     match (has_pushurl, local_rewrite_of_this_url) {
         (true, _) => Err(anyhow::anyhow!(
-            "'{remote}' fetches from {fetch_url} but pushes elsewhere — a job clones from and \
+            "'{name}' fetches from {fetch_url} but pushes elsewhere — a job clones from and \
              pushes back to one URL, so unset {pushurl_key} or point it at the same place"
         )),
         (false, Some(key)) => Err(anyhow::anyhow!(
-            "'{remote}' fetches from {fetch_url} but {key} in this repository's config rewrites \
+            "'{name}' fetches from {fetch_url} but {key} in this repository's config rewrites \
              where it pushes — a job's clone does not see this repository's config, so its push \
              would go to {fetch_url}; move the setting to your global config, or remove it"
         )),
-        (false, None) => Ok(Some(reachable_from_anywhere(repo, &fetch_url))),
+        (false, None) => Ok(Some(fetch_url)),
     }
 }
 
-/// `url` as git reaches it from `repo`, made to mean the same from any
-/// directory: a relative path joined onto the repository, anything else as
-/// it is.
-fn reachable_from_anywhere(repo: &Path, url: &str) -> String {
-    let names_a_host = url.contains("://") || scp_like_parts(url).is_some();
-    match names_a_host || Path::new(url).is_absolute() {
-        true => url.to_string(),
-        false => repo.join(url).to_string_lossy().into_owned(),
-    }
-}
-
-/// git's scp-like `[user@]host:path`, split at the colon that ends the host,
-/// or `None` for anything else. git recognises it by a colon before any
-/// slash; a URL with a scheme is never one, and a local path has no such
-/// colon.
-pub(crate) fn scp_like_parts(url: &str) -> Option<(&str, &str)> {
-    (!url.contains("://"))
-        .then(|| split_at_host_colon(url))
-        .flatten()
-        .filter(|(authority, _)| !authority.contains('/'))
-}
-
-/// `s` split at the colon that ends a host: the first one outside a
-/// bracketed IPv6 literal, whose own colons end nothing.
-pub(crate) fn split_at_host_colon(s: &str) -> Option<(&str, &str)> {
-    let searched_from = match (s.find('['), s.find(':')) {
-        (Some(open), Some(colon)) if open < colon => {
-            s[open..].find(']').map_or(open, |close| open + close)
-        }
-        _ => 0,
-    };
-    let colon = searched_from + s[searched_from..].find(':')?;
-    Some((&s[..colon], &s[colon + 1..]))
-}
-
-/// Fetch `git_ref` from `remote` and return the commit it names *there*.
+/// Fetch `git_ref` from `name_or_url` and return the commit it names
+/// *there*.
 ///
 /// Writes the fetched objects and `FETCH_HEAD` into the repository's `.git`,
 /// never its working tree.
 async fn fetched_sha(
     repo: impl AsRef<Path>,
-    remote: &str,
+    name_or_url: &str,
     git_ref: &str,
 ) -> anyhow::Result<String> {
     let repo = repo.as_ref();
     run_expecting_success(
         repo,
-        &["fetch", "--quiet", remote, git_ref],
-        &format!("fetch {remote} {git_ref}"),
+        &["fetch", "--quiet", name_or_url, git_ref],
+        &format!("fetch {name_or_url} {git_ref}"),
     )
     .await?;
     run_expecting_success(
@@ -355,24 +321,26 @@ async fn fetched_sha(
     .await
 }
 
-/// Whether `remote` answered and does not carry `git_ref` — as opposed to not
-/// answering at all, which is `false`: nothing is known to be missing.
+/// Whether `name_or_url` answered and does not carry `git_ref` — as opposed
+/// to not answering at all, which is `false`: nothing is known to be
+/// missing.
 pub async fn remote_lacks_ref(
     repo: impl AsRef<Path>,
-    remote: &str,
+    name_or_url: &str,
     git_ref: &str,
 ) -> anyhow::Result<bool> {
     // `--exit-code` makes "no matching ref" exit 2, distinct from the 128 of
     // a remote that could not be read.
-    let listed = run_allowing_failure(repo, &["ls-remote", "--exit-code", remote, git_ref]).await?;
+    let listed =
+        run_allowing_failure(repo, &["ls-remote", "--exit-code", name_or_url, git_ref]).await?;
     Ok(listed.exit_code == 2)
 }
 
-/// The branches `remote` carries whose names match `pattern` — a glob such
-/// as `al/job-*` — without their `refs/heads/` prefix.
+/// The branches `name_or_url` carries whose names match `pattern` — a glob
+/// such as `al/job-*` — without their `refs/heads/` prefix.
 pub async fn remote_branches_matching(
     repo: impl AsRef<Path>,
-    remote: &str,
+    name_or_url: &str,
     pattern: &str,
 ) -> anyhow::Result<Vec<String>> {
     let listed = run_expecting_success(
@@ -380,10 +348,10 @@ pub async fn remote_branches_matching(
         &[
             "ls-remote",
             "--heads",
-            remote,
+            name_or_url,
             &format!("refs/heads/{pattern}"),
         ],
-        &format!("ls-remote {remote}"),
+        &format!("ls-remote {name_or_url}"),
     )
     .await?;
     // "<sha>\trefs/heads/<branch>" per line.
@@ -394,7 +362,7 @@ pub async fn remote_branches_matching(
         .collect())
 }
 
-/// `git_ref` as `remote` has it, pinned to one commit.
+/// `git_ref` as `name_or_url` has it, pinned to one commit.
 ///
 /// # Errors
 ///
@@ -404,18 +372,18 @@ pub async fn remote_branches_matching(
 /// fix it.
 pub async fn pinned(
     repo: impl AsRef<Path>,
-    remote: &str,
+    name_or_url: &str,
     git_ref: &str,
 ) -> anyhow::Result<PinnedRef> {
     let repo = repo.as_ref();
-    match fetched_sha(repo, remote, git_ref).await {
+    match fetched_sha(repo, name_or_url, git_ref).await {
         Ok(sha) => Ok(PinnedRef {
             name: git_ref.to_string(),
             sha,
         }),
-        Err(fetch_failure) if remote_lacks_ref(repo, remote, git_ref).await? => {
+        Err(fetch_failure) if remote_lacks_ref(repo, name_or_url, git_ref).await? => {
             Err(anyhow::anyhow!(
-                "'{git_ref}' is not on '{remote}' — a job starts from a clone of the remote, \
+                "'{git_ref}' is not on {name_or_url} — a job starts from a clone of the remote, \
                  so push it first: {fetch_failure}"
             ))
         }
@@ -495,7 +463,7 @@ pub async fn current_branch(repo: impl AsRef<Path>) -> anyhow::Result<Option<Str
     Ok((!name.is_empty()).then_some(name))
 }
 
-/// Publish whatever the clone has checked out as `branch` on `remote`.
+/// Publish whatever the clone has checked out as `branch` on `name_or_url`.
 ///
 /// `HEAD`, not the local `branch`: the agent is free to check out another
 /// branch, and what gets pushed must be the commit everything before the push
@@ -515,21 +483,27 @@ pub async fn current_branch(repo: impl AsRef<Path>) -> anyhow::Result<Option<Str
 /// hidden from the agent, and the spec's accepted risks say it is not.
 pub async fn push_head_as(
     repo: impl AsRef<Path>,
-    remote: &str,
+    name_or_url: &str,
     branch: &str,
 ) -> anyhow::Result<()> {
     let refspec = format!("HEAD:refs/heads/{branch}");
     run_expecting_success(
         repo,
-        &["-c", "core.hooksPath=/dev/null", "push", remote, &refspec],
-        &format!("push {remote} {branch}"),
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "push",
+            name_or_url,
+            &refspec,
+        ],
+        &format!("push {name_or_url} {branch}"),
     )
     .await
     .map(|_| ())
 }
 
-/// Create `branch` on `remote` at `sha`, only if `remote` has no such branch.
-/// `false` means somebody already has it.
+/// Create `branch` on `name_or_url` at `sha`, only if the remote has no such
+/// branch. `false` means somebody already has it.
 ///
 /// Neither the exit code nor the lease decides this alone. A push of the
 /// commit a branch already points at exits 0 as "up to date", lease or not,
@@ -541,7 +515,7 @@ pub async fn push_head_as(
 /// No hooks run, as for [`push_head_as`].
 pub async fn create_branch_if_absent(
     repo: impl AsRef<Path>,
-    remote: &str,
+    name_or_url: &str,
     sha: &str,
     branch: &str,
 ) -> anyhow::Result<bool> {
@@ -556,7 +530,7 @@ pub async fn create_branch_if_absent(
             "push",
             "--porcelain",
             &lease,
-            remote,
+            name_or_url,
             &refspec,
         ],
     )
@@ -579,7 +553,7 @@ pub async fn create_branch_if_absent(
             Ok(false)
         }
         refused => Err(anyhow::anyhow!(
-            "creating {branch} on '{remote}' failed (exit {}): {}",
+            "creating {branch} on {name_or_url} failed (exit {}): {}",
             pushed.exit_code,
             [
                 refused.map_or("", |(_, summary)| summary),

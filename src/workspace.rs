@@ -1,7 +1,11 @@
 //! One round's sandbox: a scratch clone of the remote.
 
+use crate::admission::Admitted;
+use crate::claim::claim_job;
 use crate::git::{self, PinnedRef};
+use crate::job::JobId;
 use crate::payload::GIT_TOKEN_VAR;
+use crate::remote::Remote;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -18,12 +22,21 @@ pub struct ScratchClone {
     /// Deleted when the clone is dropped, which is what makes the checkout
     /// scratch whatever becomes of the round.
     dir: tempfile::TempDir,
+    remote: Remote,
 }
 
 impl ScratchClone {
     #[must_use]
     pub fn path(&self) -> &Path {
         self.dir.path()
+    }
+
+    /// Where the clone came from, which every fetch and push from it reaches
+    /// by this URL rather than by the name `git clone` gave it, so what is
+    /// said about the remote names its URL.
+    #[must_use]
+    pub fn remote(&self) -> &Remote {
+        &self.remote
     }
 }
 
@@ -41,16 +54,15 @@ impl RoundWorkspace {
     pub fn path(&self) -> &Path {
         self.scratch.path()
     }
+
+    /// Where [`publish`] pushes the branch.
+    #[must_use]
+    pub fn remote(&self) -> &Remote {
+        self.scratch.remote()
+    }
 }
 
-/// The repository's remote a job clones from and publishes its branch to.
-pub const DEFAULT_REMOTE: &str = "origin";
-
-/// What `git clone` names the remote a scratch clone came from — whatever
-/// the repository itself calls that remote.
-const CLONE_REMOTE: &str = "origin";
-
-/// Clone `remote_url` into a fresh directory under `scratch_root`, checking
+/// Clone `remote` into a fresh directory under `scratch_root`, checking
 /// nothing out. A `credential_helper` authenticates both the clone and every
 /// later fetch and push from it.
 ///
@@ -59,7 +71,7 @@ const CLONE_REMOTE: &str = "origin";
 /// A clone that fails midway leaves nothing: the directory is removed as
 /// the error propagates.
 pub async fn clone_scratch(
-    remote_url: &str,
+    remote: &Remote,
     scratch_root: impl AsRef<Path>,
     credential_helper: Option<&str>,
 ) -> anyhow::Result<ScratchClone> {
@@ -67,8 +79,11 @@ pub async fn clone_scratch(
     let dir = tempfile::Builder::new()
         .prefix("assembly-round-")
         .tempdir_in(scratch_root)?;
-    git::clone_into(remote_url, dir.path(), credential_helper).await?;
-    Ok(ScratchClone { dir })
+    git::clone_into(remote.url(), dir.path(), credential_helper).await?;
+    Ok(ScratchClone {
+        dir,
+        remote: remote.clone(),
+    })
 }
 
 /// [`clone_scratch`] with this environment's credentials, cut off at
@@ -80,14 +95,14 @@ pub async fn clone_scratch(
 ///
 /// The clone's own error, or one saying it timed out or was cancelled.
 pub async fn clone_within_provisioning_limit(
-    remote_url: &str,
+    remote: &Remote,
     scratch_root: impl AsRef<Path>,
     cancel: &CancellationToken,
 ) -> anyhow::Result<(ScratchClone, Instant)> {
     let provisioning_deadline = Instant::now() + PROVISIONING_LIMIT;
     let clone = within_provisioning_limit(
         clone_scratch(
-            remote_url,
+            remote,
             scratch_root,
             credential_helper_for_this_environment(),
         ),
@@ -138,14 +153,15 @@ pub async fn pin_in_clone(
     git_ref: &str,
     pinned_sha: Option<&str>,
 ) -> anyhow::Result<PinnedRef> {
-    let tip = git::pinned(clone.path(), CLONE_REMOTE, git_ref).await?;
+    let url = clone.remote().url();
+    let tip = git::pinned(clone.path(), url, git_ref).await?;
     let Some(sha) = pinned_sha else {
         return Ok(tip);
     };
     // A ref that moved on past the pin still has it in its history; one that
     // was rewritten may not, so ask the remote for the commit itself.
     if !git::has_commit(clone.path(), sha).await? {
-        git::run_allowing_failure(clone.path(), &["fetch", "--quiet", CLONE_REMOTE, sha]).await?;
+        git::run_allowing_failure(clone.path(), &["fetch", "--quiet", url, sha]).await?;
     }
     match git::has_commit(clone.path(), sha).await? {
         true => Ok(PinnedRef {
@@ -153,7 +169,7 @@ pub async fn pin_in_clone(
             sha: sha.to_string(),
         }),
         false => Err(anyhow::anyhow!(
-            "'{sha}' is not a commit '{CLONE_REMOTE}' can supply for '{git_ref}'"
+            "'{sha}' is not a commit {url} can supply for '{git_ref}'"
         )),
     }
 }
@@ -168,12 +184,23 @@ pub async fn job_branch_in_clone(
     clone: &ScratchClone,
     branch: &str,
 ) -> anyhow::Result<Option<PinnedRef>> {
-    match git::remote_lacks_ref(clone.path(), CLONE_REMOTE, branch).await? {
+    let url = clone.remote().url();
+    match git::remote_lacks_ref(clone.path(), url, branch).await? {
         true => Ok(None),
-        false => git::pinned(clone.path(), CLONE_REMOTE, branch)
-            .await
-            .map(Some),
+        false => git::pinned(clone.path(), url, branch).await.map(Some),
     }
+}
+
+/// The next free job id on the clone's remote, claimed at the admitted base.
+///
+/// # Errors
+///
+/// See [`claim_job`].
+pub async fn claim_job_in_clone(
+    clone: &ScratchClone,
+    admitted: &Admitted,
+) -> anyhow::Result<JobId> {
+    claim_job(clone.path(), clone.remote().url(), admitted).await
 }
 
 /// Check `branch` out at `start` in `clone`, committing as assembly-line,
@@ -220,7 +247,7 @@ const PUSH_BACKOFF: [Duration; 3] = [
     Duration::from_secs(2),
 ];
 
-/// Push the commit the clone ends on to the clone's `origin`, as the job's
+/// Push the commit the clone ends on to the clone's remote, as the job's
 /// branch.
 ///
 /// A loop rather than a combinator: each attempt is sequential I/O, and the
@@ -235,7 +262,7 @@ pub async fn publish(ws: &RoundWorkspace) -> anyhow::Result<()> {
     let mut last_failure = None;
     for wait in PUSH_BACKOFF {
         tokio::time::sleep(wait).await;
-        match git::push_head_as(ws.path(), CLONE_REMOTE, &ws.branch).await {
+        match git::push_head_as(ws.path(), ws.remote().url(), &ws.branch).await {
             Ok(()) => return Ok(()),
             Err(e) => last_failure = Some(e),
         }

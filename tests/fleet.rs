@@ -4,7 +4,8 @@ use assembly_line::daemon::fleet::{Resumption, jobs_under};
 use assembly_line::event::{Event, EventKind, EventLog};
 use assembly_line::git::PinnedRef;
 use assembly_line::job::JobId;
-use assembly_line::paths::{JobPlace, RepoKey};
+use assembly_line::paths::JobPlace;
+use assembly_line::remote::Remote;
 use assembly_line::report::JobReport;
 use assembly_line::runner::RoundHandle;
 use std::path::Path;
@@ -129,7 +130,7 @@ fn a_handle_round_trips_through_the_event_log() {
 
 fn requested_job(root: &Path, url: &str, id: u64) -> JobPlace {
     let place = JobPlace {
-        key: RepoKey::from_remote_url(url).unwrap(),
+        key: Remote::from_url(url).repo_key().unwrap(),
         id: JobId::from(id),
     };
     place.create(root).unwrap().append(requested()).unwrap();

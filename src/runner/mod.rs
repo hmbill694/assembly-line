@@ -9,7 +9,8 @@ pub mod tail;
 use crate::config::JobSettings;
 use crate::git::PinnedRef;
 use crate::paths::JobPaths;
-use crate::payload::{FORGE_TOKEN_VAR, GIT_TOKEN_VAR, https_equivalent, is_path_on_this_machine};
+use crate::payload::{FORGE_TOKEN_VAR, GIT_TOKEN_VAR};
+use crate::remote::Remote;
 use crate::report::{JobRequests, RoundRequest};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -44,10 +45,6 @@ impl LaunchSpec {
     /// provisions the one and reaches the remote over HTTPS, with a token,
     /// in place of the other. Every value is attached with `=`, so none can
     /// be read as a flag.
-    ///
-    /// An absolute path is passed as a `file://` URL: `run --repo` reads a
-    /// path holding `.git` as a checkout and clones that checkout's own
-    /// remote, and a remote that is a non-bare repository holds one.
     #[must_use]
     pub fn for_round<R: Runner>(
         job: &JobPaths,
@@ -57,18 +54,11 @@ impl LaunchSpec {
         settings: &JobSettings,
     ) -> LaunchSpec {
         let (frames_file, job) = (job.frames(round), job.id);
-        let remote_url = requests.first.remote_url.as_str();
+        let remote_url = Remote::from_url(requests.first.remote_url.as_str())
+            .url_for_launch(R::RUNS_IN_A_CONTAINER);
         let RoundRequest {
             prompt, provider, ..
         } = &requests.latest;
-        let remote_url = match (
-            R::RUNS_IN_A_CONTAINER,
-            std::path::Path::new(remote_url).is_absolute(),
-        ) {
-            (true, _) => https_equivalent(remote_url),
-            (false, true) => format!("file://{remote_url}"),
-            (false, false) => remote_url.to_string(),
-        };
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -343,10 +333,11 @@ impl JobSecrets {
 /// What a repository asks for that no container can give it: a remote that
 /// is only a path on the host.
 #[must_use]
-pub fn reasons_a_container_cannot_run(remote_url: &str) -> Vec<RunnerProblem> {
-    is_path_on_this_machine(remote_url)
+pub fn reasons_a_container_cannot_run(remote: &Remote) -> Vec<RunnerProblem> {
+    remote
+        .is_path_on_this_machine()
         .then(|| RunnerProblem::RemoteIsLocalPath {
-            url: remote_url.to_string(),
+            url: remote.url().to_string(),
         })
         .into_iter()
         .collect()

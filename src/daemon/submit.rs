@@ -4,11 +4,12 @@
 use super::Serving;
 use super::api::{Queued, Refused, Submission};
 use crate::admission::{Admitted, admit};
-use crate::claim::claim_job;
+use crate::claim::{claim_job, no_branch_for_job_on};
 use crate::event::EventKind;
 use crate::git;
 use crate::job::JobId;
 use crate::paths::{JobPaths, JobPlace, RepoKey};
+use crate::remote::Remote;
 use crate::report::JobRequests;
 use crate::runner::{Runner, reasons_a_container_cannot_run};
 use crate::state::JobState;
@@ -46,10 +47,10 @@ pub async fn accept<R: Runner>(
     serving: &Serving<R>,
     submission: Submission,
 ) -> Result<Queued, Refused> {
-    let url = submission.remote_url;
-    let key = RepoKey::from_remote_url(&url).map_err(unpreparable)?;
+    let remote = Remote::from_url(submission.remote_url);
+    let key = remote.repo_key().map_err(unpreparable)?;
     let container_problems: Vec<String> = match R::RUNS_IN_A_CONTAINER {
-        true => reasons_a_container_cannot_run(&url)
+        true => reasons_a_container_cannot_run(&remote)
             .iter()
             .map(ToString::to_string)
             .collect(),
@@ -74,7 +75,7 @@ pub async fn accept<R: Runner>(
                 key: key.clone(),
                 id: JobId::from(id),
             };
-            Some(continued_job(&place, root, &cache, &url).await?)
+            Some(continued_job(&place, root, &cache, &remote).await?)
         }
         None => None,
     };
@@ -83,7 +84,7 @@ pub async fn accept<R: Runner>(
         (None, Some(base_ref)) => (base_ref, submission.provider),
         (None, None) => return Err(unpreparable("a new job needs a ref to start from")),
     };
-    let base = git::pinned(&cache, &url, &base_ref)
+    let base = git::pinned(&cache, remote.url(), &base_ref)
         .await
         .map_err(unpreparable)?;
     // The base, never the job's branch: a round is not allowed to have
@@ -94,7 +95,7 @@ pub async fn accept<R: Runner>(
 
     let job = match continued {
         Some(job) => job.paths,
-        None => new_job(&key, root, &cache, &url, &admitted).await?,
+        None => new_job(&key, root, &cache, &remote, &admitted).await?,
     };
     let id = job.id;
     let warnings = admitted
@@ -105,7 +106,7 @@ pub async fn accept<R: Runner>(
         .collect();
     let (base, settings) = admitted.into_base_and_settings();
     job.append(EventKind::RoundRequested {
-        remote_url: url,
+        remote_url: remote.url().to_string(),
         base,
         prompt: submission.prompt,
         provider: settings.provider_name,
@@ -120,16 +121,16 @@ pub async fn accept<R: Runner>(
     })
 }
 
-/// A new job's directory, under the id it claimed on `url` at its admitted
-/// base.
+/// A new job's directory, under the id it claimed on `remote` at its
+/// admitted base.
 async fn new_job(
     key: &RepoKey,
     root: &Path,
     cache: &Path,
-    url: &str,
+    remote: &Remote,
     admitted: &Admitted,
 ) -> Result<JobPaths, Refused> {
-    let id = claim_job(cache, url, admitted)
+    let id = claim_job(cache, remote.url(), admitted)
         .await
         .map_err(unpreparable)?;
     let place = JobPlace {
@@ -138,7 +139,7 @@ async fn new_job(
     };
     place.create(root).map_err(|e| match e.kind() {
         std::io::ErrorKind::AlreadyExists => unpreparable(format!(
-            "job {id}'s branch was gone from {url}, so its id was claimed again, but {} still \
+            "job {id}'s branch was gone from {remote}, so its id was claimed again, but {} still \
              holds that job — submit again, and the next id will be claimed",
             place.paths(root).dir.display()
         )),
@@ -155,7 +156,7 @@ async fn continued_job(
     place: &JobPlace,
     root: &Path,
     cache: &Path,
-    url: &str,
+    remote: &Remote,
 ) -> Result<Continued, Refused> {
     let id = place.id;
     let paths = place.open(root).map_err(unpreparable)?;
@@ -171,10 +172,10 @@ async fn continued_job(
              submit without --job to start a new job"
         )));
     };
-    match git::remote_lacks_ref(cache, url, &id.branch_name()).await {
+    match git::remote_lacks_ref(cache, remote.url(), &id.branch_name()).await {
         Ok(true) => Err(unpreparable(format!(
-            "job {id} has no branch on {url} — it was deleted, or the job never pushed one, so \
-             there is nothing to revise; submit without --job to start a new job"
+            "{}, so there is nothing to revise; submit without --job to start a new job",
+            no_branch_for_job_on(remote, id)
         ))),
         Ok(false) => Ok(Continued {
             paths,

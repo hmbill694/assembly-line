@@ -2,12 +2,17 @@ use assembly_line::job::JobId;
 use assembly_line::paths::{
     JobPlace, RepoKey, existing_job_ids, git_root, job_id_past, latest_job_id, state_root,
 };
+use assembly_line::remote::Remote;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+fn key_of(url: &str) -> RepoKey {
+    Remote::from_url(url).repo_key().unwrap()
+}
+
 fn place(url: &str, id: u64) -> JobPlace {
     JobPlace {
-        key: RepoKey::from_remote_url(url).unwrap(),
+        key: key_of(url),
         id: JobId::from(id),
     }
 }
@@ -59,9 +64,7 @@ fn branches_that_are_not_a_jobs_are_ignored_when_allocating() {
 #[test]
 fn the_latest_job_is_the_highest_job_directory() {
     let root = tempfile::tempdir().unwrap();
-    let jobs = RepoKey::from_remote_url("/o.git")
-        .unwrap()
-        .jobs_dir(root.path());
+    let jobs = key_of("/o.git").jobs_dir(root.path());
     assert_eq!(latest_job_id(&jobs).unwrap(), None);
 
     place("/o.git", 1).create(root.path()).unwrap();
@@ -136,8 +139,8 @@ fn a_nested_repository_does_not_take_another_repositorys_job() {
 
 #[test]
 fn a_host_named_local_is_not_this_machine() {
-    let hosted = RepoKey::from_remote_url("https://local/x/a").unwrap();
-    let here = RepoKey::from_remote_url("/x/a.git").unwrap();
+    let hosted = key_of("https://local/x/a");
+    let here = key_of("/x/a.git");
     let root = Path::new("/state");
 
     assert_ne!(hosted, here);
@@ -148,26 +151,17 @@ fn a_host_named_local_is_not_this_machine() {
 #[test]
 fn a_repositorys_cache_is_not_inside_another_repositorys() {
     let root = Path::new("/state");
-    let outer = RepoKey::from_remote_url("/x/a.git").unwrap();
-    let inner = RepoKey::from_remote_url("/x/a.git/b").unwrap();
+    let outer = key_of("/x/a.git");
+    let inner = key_of("/x/a.git/b");
 
     assert!(!inner.repo_cache(root).starts_with(outer.repo_cache(root)));
     assert!(!inner.jobs_dir(root).starts_with(outer.jobs_dir(root)));
 }
 
 #[test]
-fn dot_git_is_stripped_once() {
-    assert_eq!(key("/x/a.git.git"), "@local/x/a.git");
-    assert_ne!(
-        RepoKey::from_remote_url("/x/a.git.git").unwrap(),
-        RepoKey::from_remote_url("/x/a").unwrap()
-    );
-}
-
-#[test]
 fn a_key_is_found_again_from_its_directory_name() {
     for url in ["/x/a.git", "https://local/x/a", "git@github.com:o/r.git"] {
-        let key = RepoKey::from_remote_url(url).unwrap();
+        let key = key_of(url);
         assert_eq!(RepoKey::from_dir_name(&key.dir_name()), Some(key), "{url}");
     }
 }
@@ -187,52 +181,9 @@ fn a_directory_name_no_key_makes_is_no_key() {
     }
 }
 
-fn key(url: &str) -> String {
-    RepoKey::from_remote_url(url).unwrap().to_string()
-}
-
-#[test]
-fn a_hosted_repository_is_keyed_by_host_owner_and_name() {
-    assert_eq!(key("https://github.com/o/r.git"), "github.com/o/r");
-    assert_eq!(key("https://github.com/o/r"), "github.com/o/r");
-    assert_eq!(key("https://github.com/o/r/"), "github.com/o/r");
-}
-
-/// Review focus 2: one repository, spelled two ways, is one set of jobs.
-#[test]
-fn ssh_and_https_spellings_of_one_repository_share_a_key() {
-    for url in [
-        "git@github.com:o/r.git",
-        "ssh://git@github.com/o/r.git",
-        "ssh://git@github.com:22/o/r.git",
-        "https://GitHub.com/o/r.git",
-    ] {
-        assert_eq!(key(url), "github.com/o/r", "{url}");
-    }
-}
-
-#[test]
-fn a_repository_on_this_machine_is_keyed_under_local() {
-    assert_eq!(key("/srv/git/origin.git"), "@local/srv/git/origin");
-    assert_eq!(key("file:///srv/git/origin.git"), "@local/srv/git/origin");
-}
-
-#[test]
-fn a_url_that_cannot_name_a_directory_is_refused_by_name() {
-    for url in [
-        "../origin",
-        "https://github.com/o/../r",
-        "https://github.com/o/r r",
-        "",
-    ] {
-        let err = RepoKey::from_remote_url(url).unwrap_err();
-        assert!(err.to_string().contains(url), "{url}: {err}");
-    }
-}
-
 #[test]
 fn a_keys_jobs_and_cache_live_under_the_root() {
-    let key = RepoKey::from_remote_url("git@github.com:o/r.git").unwrap();
+    let key = key_of("git@github.com:o/r.git");
 
     assert_eq!(
         key.jobs_dir(Path::new("/state")),

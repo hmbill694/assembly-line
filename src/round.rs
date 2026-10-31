@@ -121,8 +121,8 @@ struct AgentWork {
     branch: String,
     sha: String,
     stat: git::DiffStat,
-    /// The remote the branch reached. A round that could not push has no
-    /// `AgentWork` at all.
+    /// The URL of the remote the branch reached. A round that could not push
+    /// has no `AgentWork` at all.
     pushed_to: String,
 }
 
@@ -417,7 +417,7 @@ async fn agent_work_on_branch(
         branch: ws.branch.clone(),
         sha,
         stat,
-        pushed_to: payload.remote_name.clone(),
+        pushed_to: ws.remote().url().to_string(),
     }))
 }
 
@@ -496,8 +496,6 @@ mod provisioning_tests {
     fn payload_asking_for_provisioning() -> RoundPayload {
         RoundPayload {
             job_id: 1.into(),
-            remote_url: "does-not-matter".to_string(),
-            remote_name: "origin".to_string(),
             start: PinnedRef {
                 name: "main".to_string(),
                 sha: "0".repeat(40),

@@ -16,6 +16,7 @@ pub mod locate;
 pub mod paths;
 pub mod payload;
 pub mod provider;
+pub mod remote;
 pub mod report;
 pub mod round;
 pub mod run;

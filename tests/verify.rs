@@ -2,6 +2,7 @@ mod support;
 
 use assembly_line::event::EventKind;
 use assembly_line::git;
+use std::path::Path;
 use support::{Harness, config_running};
 
 /// A `verify` line that can only pass in the job's own checkout, *after* the
@@ -55,7 +56,7 @@ async fn a_round_whose_verify_fails_is_a_failed_round() {
         outcome.has(|e| matches!(
             e,
             EventKind::BranchPushed { branch: b, pushed_to }
-                if *b == branch && pushed_to == "origin"
+                if *b == branch && Path::new(pushed_to) == h.origin
         )),
         "the branch survives a failed verify — that is what makes it inspectable"
     );

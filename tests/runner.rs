@@ -2,9 +2,8 @@ use assembly_line::config::{JobSettings, RepoConfig};
 use assembly_line::daemon::Daemon;
 use assembly_line::git::PinnedRef;
 use assembly_line::paths::JobPaths;
-use assembly_line::payload::{
-    FORGE_TOKEN_VAR, GIT_TOKEN_VAR, https_equivalent, is_path_on_this_machine,
-};
+use assembly_line::payload::{FORGE_TOKEN_VAR, GIT_TOKEN_VAR};
+use assembly_line::remote::Remote;
 use assembly_line::report::{JobRequests, RoundRequest};
 use assembly_line::runner::docker::{DockerRunner, docker_create_args};
 use assembly_line::runner::local::{LocalRound, LocalRunner};
@@ -61,55 +60,6 @@ fn host_with_both_tokens(name: &str) -> Option<String> {
     [GIT_TOKEN_VAR, FORGE_TOKEN_VAR]
         .contains(&name)
         .then(|| "t0ken".to_string())
-}
-
-#[test]
-fn ssh_remotes_become_the_https_url_a_token_can_authenticate() {
-    assert_eq!(
-        https_equivalent("git@github.com:o/r.git"),
-        "https://github.com/o/r.git"
-    );
-    assert_eq!(
-        https_equivalent("ssh://git@github.com/o/r.git"),
-        "https://github.com/o/r.git"
-    );
-    assert_eq!(
-        https_equivalent("ssh://git@github.com:22/o/r.git"),
-        "https://github.com/o/r.git"
-    );
-    assert_eq!(
-        https_equivalent("git@git.example.com:/srv/r.git"),
-        "https://git.example.com/srv/r.git"
-    );
-}
-
-/// An IPv6 literal's own colons are not the port's, nor scp-like's.
-#[test]
-fn an_ipv6_host_keeps_its_brackets() {
-    assert_eq!(
-        https_equivalent("ssh://git@[::1]/o/r.git"),
-        "https://[::1]/o/r.git"
-    );
-    assert_eq!(
-        https_equivalent("ssh://git@[::1]:22/o/r.git"),
-        "https://[::1]/o/r.git"
-    );
-    assert_eq!(
-        https_equivalent("git@[::1]:o/r.git"),
-        "https://[::1]/o/r.git"
-    );
-}
-
-#[test]
-fn urls_a_token_already_works_with_are_left_alone() {
-    for url in [
-        "https://github.com/o/r.git",
-        "/tmp/origin.git",
-        "file:///tmp/origin.git",
-        "../origin",
-    ] {
-        assert_eq!(https_equivalent(url), url);
-    }
 }
 
 #[test]
@@ -204,7 +154,7 @@ const NETWORK_REMOTE: &str = "https://github.com/o/r.git";
 fn a_remote_that_is_a_path_on_this_machine_cannot_run_in_a_container() {
     for url in ["/tmp/origin.git", "../origin", "file:///tmp/origin.git"] {
         assert_eq!(
-            reasons_a_container_cannot_run(url),
+            reasons_a_container_cannot_run(&Remote::from_url(url)),
             [RunnerProblem::RemoteIsLocalPath { url: url.into() }],
             "{url}"
         );
@@ -214,7 +164,11 @@ fn a_remote_that_is_a_path_on_this_machine_cannot_run_in_a_container() {
         "git@github.com:o/r.git",
         "ssh://git@github.com/o/r.git",
     ] {
-        assert!(!is_path_on_this_machine(url), "{url}");
+        assert_eq!(
+            reasons_a_container_cannot_run(&Remote::from_url(url)),
+            [],
+            "{url}"
+        );
     }
 }
 
@@ -450,25 +404,6 @@ fn a_revised_round_runs_against_the_first_remote_with_the_latest_prompt() {
             "--provider=codex".into(),
             "--frames".into(),
         ]
-    );
-}
-
-/// A remote that is a path could be read by `run` as a checkout whose own
-/// remote is somewhere else; a URL cannot.
-#[test]
-fn a_host_round_names_a_remote_on_this_machine_by_its_file_url() {
-    let spec = LaunchSpec::for_round::<HostRunner>(
-        &job(7),
-        1,
-        &requests("/srv/origin", "x", "claude"),
-        &base(),
-        &settings(None),
-    );
-
-    assert!(
-        spec.args.contains(&"--repo=file:///srv/origin".to_string()),
-        "{:?}",
-        spec.args
     );
 }
 

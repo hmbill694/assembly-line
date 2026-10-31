@@ -51,10 +51,8 @@ pub fn state_root(
     }
 }
 
-/// A repository's place under the state root: its host, then the path
-/// segments of its remote URL, from the URL's HTTPS form — so the SSH and
-/// HTTPS spellings of one repository are one key. A repository on this
-/// machine has the host [`LOCAL_HOST`].
+/// A repository's place under the state root, made from its remote by
+/// [`crate::remote::Remote::repo_key`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RepoKey {
     segments: Vec<String>,
@@ -88,32 +86,6 @@ impl std::fmt::Display for UnkeyableRemote {
 impl std::error::Error for UnkeyableRemote {}
 
 impl RepoKey {
-    /// # Errors
-    ///
-    /// When a segment is empty, `.` or `..`, or holds anything but ASCII
-    /// letters, digits, `.`, `_` and `-` — validated, never sanitized.
-    pub fn from_remote_url(url: &str) -> Result<RepoKey, UnkeyableRemote> {
-        let unkeyable = || UnkeyableRemote {
-            url: url.to_string(),
-        };
-        let https = crate::payload::https_equivalent(url);
-        let (host, path) = match https.split_once("://") {
-            Some(("file", path)) => (LOCAL_HOST.to_string(), path),
-            Some((_, rest)) => {
-                let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-                let host = authority.rsplit('@').next().unwrap_or(authority);
-                let host = crate::git::split_at_host_colon(host).map_or(host, |(host, _)| host);
-                (host.to_ascii_lowercase(), path)
-            }
-            None if https.starts_with('/') => (LOCAL_HOST.to_string(), https.as_str()),
-            None => return Err(unkeyable()),
-        };
-        let path = path.trim_end_matches('/');
-        let path = path.strip_suffix(".git").unwrap_or(path);
-        RepoKey::from_host_and_path(host, path.split('/').filter(|segment| !segment.is_empty()))
-            .ok_or_else(unkeyable)
-    }
-
     /// The key whose [`Self::dir_name`] is `name`, or `None` for a name no
     /// key makes.
     #[must_use]
@@ -123,12 +95,14 @@ impl RepoKey {
         RepoKey::from_host_and_path(host.to_string(), segments)
     }
 
-    fn from_host_and_path<'a>(
+    /// `None` unless the host is [`LOCAL_HOST`], or a keyable segment with
+    /// an optional `+` and port after it, and every path segment is keyable.
+    pub(crate) fn from_host_and_path<'a>(
         host: String,
         path: impl IntoIterator<Item = &'a str>,
     ) -> Option<RepoKey> {
         let path: Vec<&str> = path.into_iter().collect();
-        let keyable = (host == LOCAL_HOST || is_keyable_segment(&host))
+        let keyable = (host == LOCAL_HOST || is_keyable_host(&host))
             && !path.is_empty()
             && path.iter().all(|segment| is_keyable_segment(segment));
         keyable.then(|| RepoKey {
@@ -161,6 +135,15 @@ impl RepoKey {
 impl std::fmt::Display for RepoKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.segments.join("/"))
+    }
+}
+
+fn is_keyable_host(host: &str) -> bool {
+    match host.split_once('+') {
+        Some((name, port)) => {
+            is_keyable_segment(name) && !port.is_empty() && port.chars().all(|c| c.is_ascii_digit())
+        }
+        None => is_keyable_segment(host),
     }
 }
 

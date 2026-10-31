@@ -4,7 +4,8 @@
 use assembly_line::config::REPO_CONFIG_PATH;
 use assembly_line::daemon::{self, Daemon, fleet};
 use assembly_line::event::{EventKind, EventLog};
-use assembly_line::paths::{JobPaths, JobPlace, RepoKey};
+use assembly_line::paths::{JobPaths, JobPlace};
+use assembly_line::remote::Remote;
 use assembly_line::runner::local::LocalRound;
 use assembly_line::runner::{JobSecrets, LaunchSpec, RoundHandle, Runner, RunnerProblem};
 use assembly_line::state::JobState;
@@ -94,7 +95,9 @@ impl Fixture {
 
     fn job(&self, id: u64) -> JobPaths {
         JobPlace {
-            key: RepoKey::from_remote_url(self.origin.to_str().unwrap()).unwrap(),
+            key: Remote::from_url(self.origin.to_str().unwrap())
+                .repo_key()
+                .unwrap(),
             id: id.into(),
         }
         .paths(&self.root())
@@ -805,7 +808,11 @@ async fn revising_a_job_whose_branch_was_deleted_says_there_is_nothing_to_revise
         .args(["submit", "--job", "1", "--prompt", "try again"])
         .assert()
         .code(2)
-        .stderr(contains("job 1 has no branch").and(contains("nothing to revise")));
+        .stderr(contains(format!(
+            "job 1 has no branch on {} — it was deleted, or the job never pushed one, so there \
+             is nothing to revise; submit without --job to start a new job",
+            fx.origin.display()
+        )));
     assert_eq!(fx.events_of(1), events_before);
 }
 
@@ -871,8 +878,11 @@ async fn a_round_that_run_refuses_fails_with_the_reason_in_its_log() {
 
     assert_eq!(report.state, JobState::Failed);
     assert_eq!(
-        report.detail.as_deref(),
-        Some("job 2 has no branch on 'origin' — it was deleted, or the job never pushed one"),
+        report.detail,
+        Some(format!(
+            "job 2 has no branch on file://{} — it was deleted, or the job never pushed one",
+            fx.origin.display()
+        )),
         "{report:?}"
     );
     fx.assembly()

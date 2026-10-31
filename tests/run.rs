@@ -200,6 +200,60 @@ async fn run_on_a_job_continues_its_branch_with_only_the_new_prompt() {
     assert_eq!(rounds, "hi\nadd error handling", "{rounds}");
 }
 
+/// The round pushes by URL, not by the clone's remote name, and still
+/// authenticates with the token helper the clone was made with. A global
+/// `pushInsteadOf` sends the push to a fake transport, which asks git for
+/// the credential as `git-remote-https` would, records it and refuses the
+/// push — so no network is touched.
+#[tokio::test]
+async fn a_push_by_url_authenticates_with_the_token_helper_the_clone_holds() {
+    let fx = Fixture::running("fake-agent.sh").await;
+    fx.on_origin(&["branch", "al/job-1", "main"]);
+    let asked = fx.tmp.path().join("credential-asked");
+    let transport = fx.tmp.path().join("transport");
+    support::fake_cli(
+        &transport,
+        "git-remote-credential-probe",
+        &format!(
+            "printf 'protocol=https\\nhost=example.invalid\\n\\n' \
+             | GIT_TERMINAL_PROMPT=0 git credential fill > '{}' || true\nexit 1\n",
+            asked.display()
+        ),
+    );
+    let global_config = fx.tmp.path().join("gitconfig");
+    std::fs::write(
+        &global_config,
+        format!(
+            "[url \"credential-probe::{origin}\"]\n\tpushInsteadOf = {origin}\n",
+            origin = fx.origin.display()
+        ),
+    )
+    .unwrap();
+
+    fx.assembly()
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                transport.display(),
+                support::path_where_gh_refuses()
+            ),
+        )
+        .env("GIT_CONFIG_GLOBAL", &global_config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("ASSEMBLY_GIT_TOKEN", "t0ken")
+        .args(["run", "--job", "1", "--prompt", "x"])
+        .assert()
+        .failure()
+        .stdout(contains("could not publish al/job-1"));
+
+    let answered = std::fs::read_to_string(&asked).expect("the push never asked for a credential");
+    assert!(
+        answered.lines().any(|line| line == "password=t0ken"),
+        "{answered:?}"
+    );
+}
+
 #[tokio::test]
 async fn run_on_a_job_with_no_branch_is_refused() {
     let fx = Fixture::running("fake-agent.sh").await;
@@ -208,7 +262,11 @@ async fn run_on_a_job_with_no_branch_is_refused() {
         .args(["run", "--job", "9", "--prompt", "x"])
         .assert()
         .code(2)
-        .stderr(contains("job 9 has no branch"));
+        .stderr(contains(format!(
+            "job 9 has no branch on {} — it was deleted, or the job never pushed one, so there \
+             is nothing to continue; run without --job to start a new job",
+            fx.origin.display()
+        )));
 }
 
 /// Refused before the claim: a broken config costs no id and leaves no

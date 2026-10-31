@@ -340,46 +340,6 @@ async fn a_remotes_url_is_read_back_and_a_missing_remote_is_none() {
     );
 }
 
-/// Git reads a relative remote path from the repository; a job's clone runs
-/// from a scratch directory, where the same path names nothing.
-#[tokio::test]
-async fn a_relative_remote_path_is_resolved_against_the_repository() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("repo");
-    support::init_git_repo(&repo).await;
-    git::run_allowing_failure(&repo, &["remote", "add", "origin", "../origin.git"])
-        .await
-        .unwrap();
-
-    assert_eq!(
-        git::remote_url(&repo, "origin").await.unwrap(),
-        Some(repo.join("../origin.git").to_string_lossy().into_owned())
-    );
-}
-
-#[tokio::test]
-async fn remote_urls_that_name_a_host_are_left_alone() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("repo");
-    support::init_git_repo(&repo).await;
-
-    for url in [
-        "git@example.com:team/repo.git",
-        "https://example.com/team/repo.git",
-    ] {
-        git::run_allowing_failure(&repo, &["remote", "add", "origin", url])
-            .await
-            .unwrap();
-        assert_eq!(
-            git::remote_url(&repo, "origin").await.unwrap().as_deref(),
-            Some(url)
-        );
-        git::run_allowing_failure(&repo, &["remote", "remove", "origin"])
-            .await
-            .unwrap();
-    }
-}
-
 /// A job's clone pushes back to where it cloned from, so a remote that
 /// pushes elsewhere would send the job's branch to the wrong place.
 #[tokio::test]
@@ -462,8 +422,13 @@ async fn a_ref_the_remote_does_not_have_cannot_be_pinned() {
     let err = git::pinned(&repo, "origin", "never-pushed")
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("never-pushed"), "{err}");
-    assert!(err.to_string().contains("push it first"), "{err}");
+    assert!(
+        err.to_string().starts_with(
+            "'never-pushed' is not on origin — a job starts from a clone of the remote, so push \
+             it first: "
+        ),
+        "{err}"
+    );
 }
 
 /// The daemon's cache: pinning into a bare repository fetches the ref's

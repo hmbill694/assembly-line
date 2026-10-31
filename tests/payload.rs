@@ -11,8 +11,6 @@ fn round() -> RoundBeforeSettings<'static> {
             name: "main".into(),
             sha: "abc123".into(),
         },
-        remote_name: "origin",
-        remote_url: "https://example.com/o/r.git".into(),
         provision_toolchain: false,
     }
 }

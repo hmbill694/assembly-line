@@ -3,12 +3,12 @@ use assembly_line::config::{ConfigError, REPO_CONFIG_PATH};
 use assembly_line::event::EventKind;
 use assembly_line::frame::{Frame, FrameBody};
 use assembly_line::git::{self, head_sha};
-use assembly_line::payload;
 use assembly_line::report::RoundRequest;
 use assembly_line::run::RunRefused;
 use assembly_line::runner::LaunchSpec;
 use assembly_line::runner::local::LocalRunner;
 use assembly_line::state::JobState;
+use std::path::Path;
 use support::{Harness, commit_all, config_running, provider_block};
 
 mod support;
@@ -194,7 +194,7 @@ async fn a_failing_agent_preserves_its_work_on_a_branch_and_leaves_no_checkout()
     let branch = outcome.job_id.branch_name();
     assert!(
         outcome
-            .has(|k| matches!(k, EventKind::BranchPushed { branch: b, pushed_to } if *b == branch && pushed_to == "origin"))
+            .has(|k| matches!(k, EventKind::BranchPushed { branch: b, pushed_to } if *b == branch && Path::new(pushed_to) == h.origin))
     );
     assert!(
         h.scratch_is_empty(),
@@ -432,20 +432,6 @@ async fn a_refused_push_fails_the_round_and_says_the_work_is_lost() {
         base,
         "the push was not refused, so this test proves nothing"
     );
-}
-
-#[tokio::test]
-async fn a_repository_with_no_remote_has_nothing_to_clone() {
-    let h = Harness::new().await;
-    git::run_allowing_failure(&h.repo, &["remote", "remove", "origin"])
-        .await
-        .unwrap();
-
-    let err = payload::remote_to_clone(&h.repo, "origin")
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("no 'origin' remote"), "{err}");
 }
 
 #[tokio::test]

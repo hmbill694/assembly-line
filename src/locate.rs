@@ -1,11 +1,11 @@
 //! From what a person typed — a `--repo`, a job id, or nothing — to where
 //! that job's state lives under the root.
 
+use crate::git;
 use crate::job::JobId;
 use crate::paths::{self, JobPaths, JobPlace, RepoKey};
-use crate::payload::remote_to_clone;
+use crate::remote::Remote;
 use crate::report::JobReport;
-use crate::workspace::DEFAULT_REMOTE;
 use anyhow::anyhow;
 use std::path::{Path, PathBuf};
 
@@ -28,34 +28,85 @@ fn enclosing_checkout() -> anyhow::Result<PathBuf> {
         .ok_or_else(|| anyhow!("not inside a git repository — name one with --repo"))
 }
 
-/// The remote a command acts on: `--repo` itself when it names no checkout,
-/// else the checkout's — the one named, or the one the user is standing in.
-///
-/// Every command resolves it the same way, so a job submitted with `--repo`
-/// is findable by `status`, `logs` and `submit --job` with the same `--repo`.
+/// What a command's `--repo` names: the remote it acts on, and the checkout
+/// that remote was read from, if there is one.
+#[derive(Debug, Clone)]
+pub struct NamedRepo {
+    pub remote: Remote,
+    pub checkout: Option<PathBuf>,
+}
+
+impl NamedRepo {
+    /// `--repo` itself when it names no checkout, else the checkout's
+    /// remote — the checkout named, or the one the user is standing in.
+    ///
+    /// Every command resolves it the same way, so a job submitted with
+    /// `--repo` is findable by `status`, `logs` and `submit --job` with the
+    /// same `--repo`.
+    ///
+    /// # Errors
+    ///
+    /// When there is no checkout here, or it has no remote.
+    pub async fn named_or_enclosing(repo: Option<String>) -> anyhow::Result<NamedRepo> {
+        match repo {
+            Some(url) if !Path::new(&url).join(".git").exists() => Ok(NamedRepo {
+                remote: Remote::from_url(url),
+                checkout: None,
+            }),
+            named => {
+                let checkout = checkout_named_or_enclosing(named.map(PathBuf::from))?;
+                Ok(NamedRepo {
+                    remote: Remote::of_checkout(&checkout).await?,
+                    checkout: Some(checkout),
+                })
+            }
+        }
+    }
+
+    /// The ref a new job starts from: `named`, else the checkout's
+    /// checked-out branch. A remote URL has none.
+    ///
+    /// # Errors
+    ///
+    /// When nothing is named and there is no branch to fall back on.
+    pub async fn ref_to_start_from(&self, named: Option<String>) -> anyhow::Result<String> {
+        match (named, &self.checkout) {
+            (Some(named), _) => Ok(named),
+            (None, Some(checkout)) => git::current_branch(checkout)
+                .await?
+                .ok_or_else(|| anyhow!("HEAD is detached — name the ref to start from with --ref")),
+            (None, None) => Err(anyhow!(
+                "a remote URL has no checked-out branch — name the ref to start from with --ref"
+            )),
+        }
+    }
+}
+
+/// The URL of the remote `repo` names, as [`NamedRepo::named_or_enclosing`]
+/// resolves it.
 ///
 /// # Errors
 ///
-/// When there is no checkout here, or it has no remote.
+/// As [`NamedRepo::named_or_enclosing`].
 pub async fn remote_url_named_or_enclosing(repo: Option<String>) -> anyhow::Result<String> {
-    match repo {
-        Some(url) if !Path::new(&url).join(".git").exists() => Ok(url),
-        named => {
-            let checkout = checkout_named_or_enclosing(named.map(PathBuf::from))?;
-            remote_to_clone(&checkout, DEFAULT_REMOTE).await
-        }
-    }
+    Ok(NamedRepo::named_or_enclosing(repo)
+        .await?
+        .remote
+        .url()
+        .to_string())
 }
 
 /// The key of `repo`, or of the repository the user is standing in.
 ///
 /// # Errors
 ///
-/// As [`remote_url_named_or_enclosing`]; and when the remote names no
+/// As [`NamedRepo::named_or_enclosing`]; and when the remote names no
 /// directory a key could be made of.
 pub async fn repo_key_named_or_enclosing(repo: Option<String>) -> anyhow::Result<RepoKey> {
-    let remote_url = remote_url_named_or_enclosing(repo).await?;
-    Ok(RepoKey::from_remote_url(&remote_url)?)
+    Ok(NamedRepo::named_or_enclosing(repo)
+        .await?
+        .remote
+        .repo_key()?)
 }
 
 /// Job `job_id` of `repo` under `root`, or its latest when `job_id` is

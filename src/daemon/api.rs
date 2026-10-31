@@ -3,7 +3,8 @@
 use super::dispatch::CANCELLED_BEFORE_IT_STARTED;
 use super::{Serving, submit};
 use crate::job::JobId;
-use crate::paths::{JobPlace, RepoKey};
+use crate::paths::JobPlace;
+use crate::remote::Remote;
 use crate::runner::Runner;
 use crate::state::JobState;
 use axum::extract::State;
@@ -115,7 +116,9 @@ async fn cancel_job<R: Runner + Send + Sync + 'static>(
             }),
         )
     };
-    let key = RepoKey::from_remote_url(&request.remote_url).map_err(|e| refuse(e.to_string()))?;
+    let key = Remote::from_url(request.remote_url)
+        .repo_key()
+        .map_err(|e| refuse(e.to_string()))?;
     let place = JobPlace {
         key,
         id: JobId::from(request.job),

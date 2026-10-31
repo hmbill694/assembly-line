@@ -7,17 +7,19 @@
 //! passed, so a refusal costs no id.
 
 use crate::admission::{self, AdmissionRefused};
-use crate::claim::claim_job;
+use crate::claim::no_branch_for_job_on;
 use crate::config::JobSettings;
 use crate::delivery::{self, BaseDiffers, Delivered, DeliveryPlan, PullRequestText};
 use crate::event::EventKind;
 use crate::frame::FrameWriter;
-use crate::git::{self, PinnedRef};
+use crate::git::PinnedRef;
 use crate::job::JobId;
-use crate::payload::{RoundBeforeSettings, RoundPayload, remote_to_clone};
+use crate::locate::NamedRepo;
+use crate::payload::{RoundBeforeSettings, RoundPayload};
+use crate::remote::Remote;
 use crate::report::JobReport;
 use crate::round::{FinishedRound, Verdict, run_round};
-use crate::workspace::{self, DEFAULT_REMOTE, ScratchClone};
+use crate::workspace::{self, ScratchClone};
 use anyhow::anyhow;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -42,7 +44,7 @@ pub struct RunRequest {
 #[derive(Debug)]
 pub enum RunRefused {
     NotAdmitted(AdmissionRefused),
-    NoJobBranch(JobId),
+    NoJobBranch(JobId, Box<Remote>),
     Unpreparable(anyhow::Error),
 }
 
@@ -52,7 +54,7 @@ impl RunRefused {
     pub fn itemized_reasons(&self) -> Vec<String> {
         match self {
             Self::NotAdmitted(refused) => refused.itemized_reasons(),
-            Self::NoJobBranch(_) | Self::Unpreparable(_) => Vec::new(),
+            Self::NoJobBranch(..) | Self::Unpreparable(_) => Vec::new(),
         }
     }
 
@@ -62,7 +64,7 @@ impl RunRefused {
     pub fn to_failure_reason(&self) -> String {
         match self {
             Self::NotAdmitted(refused) => refused.to_failure_reason(),
-            Self::NoJobBranch(id) => no_job_branch(*id),
+            Self::NoJobBranch(id, remote) => no_branch_for_job_on(remote, *id),
             Self::Unpreparable(e) => e.to_string(),
         }
     }
@@ -72,21 +74,14 @@ impl std::fmt::Display for RunRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotAdmitted(refused) => write!(f, "{refused}"),
-            Self::NoJobBranch(id) => write!(
+            Self::NoJobBranch(id, remote) => write!(
                 f,
                 "{}, so there is nothing to continue; run without --job to start a new job",
-                no_job_branch(*id)
+                no_branch_for_job_on(remote, *id)
             ),
             Self::Unpreparable(e) => write!(f, "{e}"),
         }
     }
-}
-
-fn no_job_branch(id: JobId) -> String {
-    format!(
-        "job {id} has no branch on '{DEFAULT_REMOTE}' — it was deleted, or the job never pushed \
-         one"
-    )
 }
 
 /// A round that has passed every check: cloned, its config read and valid,
@@ -155,13 +150,17 @@ pub async fn prepare_run(
 ) -> Result<AdmittedRound, RunRefused> {
     let prompt =
         prompt_text(request.prompt, request.prompt_file).map_err(RunRefused::Unpreparable)?;
-    let (remote_url, base_ref) = remote_and_base_ref(request.repo, request.base_ref)
+    let repo = NamedRepo::named_or_enclosing(request.repo)
+        .await
+        .map_err(RunRefused::Unpreparable)?;
+    let base_ref = repo
+        .ref_to_start_from(request.base_ref)
         .await
         .map_err(RunRefused::Unpreparable)?;
     let (ref_name, pinned_sha) = split_pin(&base_ref);
 
     let (clone, provisioning_deadline) =
-        workspace::clone_within_provisioning_limit(&remote_url, scratch_root, cancel)
+        workspace::clone_within_provisioning_limit(&repo.remote, scratch_root, cancel)
             .await
             .map_err(RunRefused::Unpreparable)?;
 
@@ -180,7 +179,7 @@ pub async fn prepare_run(
     let (job_id, start, claimed) = match request.job.map(JobId::from) {
         Some(id) => (id, job_branch_tip(&clone, id).await?, false),
         None => (
-            claim_job(clone.path(), DEFAULT_REMOTE, &admitted)
+            workspace::claim_job_in_clone(&clone, &admitted)
                 .await
                 .map_err(RunRefused::Unpreparable)?,
             admitted.base().clone(),
@@ -195,8 +194,6 @@ pub async fn prepare_run(
             job_id,
             prompt: &prompt,
             start,
-            remote_name: DEFAULT_REMOTE,
-            remote_url,
             provision_toolchain: request.provision_toolchain,
         },
     );
@@ -217,7 +214,7 @@ async fn job_branch_tip(clone: &ScratchClone, id: JobId) -> Result<PinnedRef, Ru
     workspace::job_branch_in_clone(clone, &id.branch_name())
         .await
         .map_err(RunRefused::Unpreparable)?
-        .ok_or(RunRefused::NoJobBranch(id))
+        .ok_or_else(|| RunRefused::NoJobBranch(id, Box::new(clone.remote().clone())))
 }
 
 impl AdmittedRound {
@@ -368,36 +365,6 @@ pub fn prompt_text(prompt: Option<String>, prompt_file: Option<PathBuf>) -> anyh
         // clap refuses this combination before we are reached.
         (None, None) => Err(anyhow!("a job needs --prompt or --prompt-file")),
     }
-}
-
-/// Where the round clones from, and what it starts from: `base_ref` when one
-/// is named, else a checkout's checked-out branch. A URL has none.
-async fn remote_and_base_ref(
-    repo: Option<String>,
-    base_ref: Option<String>,
-) -> anyhow::Result<(String, String)> {
-    let (remote_url, checkout) = match repo {
-        Some(url) if !Path::new(&url).join(".git").exists() => (url, None),
-        named => {
-            let checkout = crate::locate::checkout_named_or_enclosing(named.map(PathBuf::from))?;
-            (
-                remote_to_clone(&checkout, DEFAULT_REMOTE).await?,
-                Some(checkout),
-            )
-        }
-    };
-    let base_ref = match (base_ref, checkout) {
-        (Some(named), _) => named,
-        (None, Some(checkout)) => git::current_branch(&checkout)
-            .await?
-            .ok_or_else(|| anyhow!("HEAD is detached — name the ref to start from with --ref"))?,
-        (None, None) => {
-            return Err(anyhow!(
-                "a remote URL has no checked-out branch — name the ref to start from with --ref"
-            ));
-        }
-    };
-    Ok((remote_url, base_ref))
 }
 
 /// `main@<sha>` as the ref and the commit it is pinned to; anything whose
