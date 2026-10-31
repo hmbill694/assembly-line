@@ -432,7 +432,11 @@ async fn output_of(mut command: Command, stdin: Option<String>) -> anyhow::Resul
 
 impl Runner for KubernetesRunner {
     type Running = KubernetesRound;
-    const RUNS_IN_A_CONTAINER: bool = true;
+    const ENVIRONMENT: super::RoundEnvironment = super::RoundEnvironment {
+        reaches_remotes: super::Reach::FromAnywhere,
+        credentials: super::Credentials::PassedIn,
+        toolchain: super::Toolchain::Provisioned,
+    };
 
     /// Every permission a round uses, asked up front: one found missing
     /// mid-round would leave a Job running that nothing can follow or delete.

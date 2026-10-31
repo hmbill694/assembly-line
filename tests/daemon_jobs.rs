@@ -6,8 +6,10 @@ use assembly_line::daemon::{self, Daemon, fleet};
 use assembly_line::event::{EventKind, EventLog};
 use assembly_line::paths::{JobPaths, JobPlace};
 use assembly_line::remote::Remote;
-use assembly_line::runner::local::LocalRound;
-use assembly_line::runner::{JobSecrets, LaunchSpec, RoundHandle, Runner, RunnerProblem};
+use assembly_line::runner::local::{LocalRound, LocalRunner};
+use assembly_line::runner::{
+    JobSecrets, LaunchSpec, RoundEnvironment, RoundHandle, Runner, RunnerProblem,
+};
 use assembly_line::state::JobState;
 use assert_cmd::Command;
 use chrono::{DateTime, Utc};
@@ -1039,7 +1041,7 @@ struct LaunchingUntilGivenUp {
 
 impl Runner for LaunchingUntilGivenUp {
     type Running = LocalRound;
-    const RUNS_IN_A_CONTAINER: bool = false;
+    const ENVIRONMENT: RoundEnvironment = LocalRunner::ENVIRONMENT;
 
     fn reasons_it_cannot_run(&self) -> impl Future<Output = Vec<RunnerProblem>> + Send {
         std::future::ready(Vec::new())

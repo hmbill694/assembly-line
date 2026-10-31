@@ -3,7 +3,8 @@
 
 use super::tail::FileTail;
 use super::{
-    JobSecrets, LaunchSpec, RoundHandle, Runner, RunnerProblem, RunningRound, Termination,
+    Credentials, JobSecrets, LaunchSpec, Reach, RoundEnvironment, RoundHandle, Runner,
+    RunnerProblem, RunningRound, Termination, Toolchain,
 };
 use crate::payload::GIT_TOKEN_VAR;
 use nix::sys::signal::{Signal, killpg};
@@ -38,7 +39,11 @@ impl LocalRunner {
 
 impl Runner for LocalRunner {
     type Running = LocalRound;
-    const RUNS_IN_A_CONTAINER: bool = false;
+    const ENVIRONMENT: RoundEnvironment = RoundEnvironment {
+        reaches_remotes: Reach::ThisMachine,
+        credentials: Credentials::OfTheHost,
+        toolchain: Toolchain::OfTheHost,
+    };
 
     /// The host is already here: nothing to reach, nothing to create.
     fn reasons_it_cannot_run(&self) -> impl Future<Output = Vec<RunnerProblem>> + Send {
@@ -91,8 +96,9 @@ impl LocalRunner {
         let mut command = Command::new(&self.program);
         crate::exec::detach_from_terminal(&mut command)
             .args(&spec.args)
-            // Exported for a container runner, the token would make `run`
-            // authenticate with it instead of the host's own credentials.
+            // Exported for a runner whose credentials are passed in, the
+            // token would make `run` authenticate with it instead of the
+            // host's own credentials.
             .env_remove(GIT_TOKEN_VAR)
             .stdin(Stdio::null())
             .stdout(frames.try_clone()?)

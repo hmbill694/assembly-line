@@ -207,7 +207,7 @@ bare nouns (`data`, `info`, `result`, `entry`) fail that test.
 - **Filters name what they select:** `JobSettings::settings_worth_flagging`,
   not `warnings` — it names which settings it picks out (`src/config.rs`).
 - **Error producers name the fault:** `Runner::reasons_it_cannot_run`,
-  `runner::reasons_a_container_cannot_run` — not `problems`, `runner_errors`
+  `Reach::reasons_it_cannot_reach` — not `problems`, `runner_errors`
   (`src/runner/mod.rs`).
 - **Mutators name the transition, including its scope:** `EventLog::append`,
   not `write` — the log is append-only, so the half of the name that rules out

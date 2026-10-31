@@ -3,11 +3,12 @@ use assembly_line::git::{self, PinnedRef};
 use assembly_line::paths::{JobPaths, RepoKey};
 use assembly_line::remote::Remote;
 use assembly_line::report::{JobRequests, RoundRequest};
-use assembly_line::runner::local::LocalRound;
-use assembly_line::runner::{JobSecrets, LaunchSpec, RoundHandle, Runner, RunnerProblem};
+use assembly_line::runner::docker::DockerRunner;
+use assembly_line::runner::kubernetes::KubernetesRunner;
+use assembly_line::runner::local::LocalRunner;
+use assembly_line::runner::{LaunchSpec, Runner};
 use chrono::Utc;
 use std::path::PathBuf;
-use tokio_util::sync::CancellationToken;
 
 mod support;
 
@@ -344,34 +345,6 @@ fn key(url: &str) -> Option<String> {
         .map(|key| key.to_string())
 }
 
-#[derive(Debug)]
-struct LaunchingNothing<const IN_A_CONTAINER: bool>;
-
-impl<const IN_A_CONTAINER: bool> Runner for LaunchingNothing<IN_A_CONTAINER> {
-    type Running = LocalRound;
-    const RUNS_IN_A_CONTAINER: bool = IN_A_CONTAINER;
-
-    fn reasons_it_cannot_run(&self) -> impl Future<Output = Vec<RunnerProblem>> + Send {
-        std::future::ready(Vec::new())
-    }
-
-    fn launch(
-        &self,
-        _spec: &LaunchSpec,
-        _secrets: &JobSecrets,
-        _cancel: &CancellationToken,
-    ) -> impl Future<Output = anyhow::Result<LocalRound>> + Send {
-        std::future::ready(Err(anyhow::anyhow!("a spelling test launches nothing")))
-    }
-
-    fn reattach(
-        &self,
-        _handle: &RoundHandle,
-    ) -> impl Future<Output = anyhow::Result<LocalRound>> + Send {
-        std::future::ready(Err(anyhow::anyhow!("a spelling test reattaches nothing")))
-    }
-}
-
 /// The `--repo` a round of a job first requested with `url` is launched with.
 fn launched<R: Runner>(url: &str) -> String {
     let request = RoundRequest {
@@ -434,7 +407,7 @@ fn every_spelling_has_the_key_the_table_says() {
 fn every_spelling_is_launched_on_the_host_as_the_table_says() {
     for s in SPELLINGS {
         assert_eq!(
-            launched::<LaunchingNothing<false>>(s.url),
+            launched::<LocalRunner>(s.url),
             s.launched_on_the_host,
             "{:?}",
             s.url
@@ -446,7 +419,13 @@ fn every_spelling_is_launched_on_the_host_as_the_table_says() {
 fn every_spelling_is_launched_in_a_container_as_the_table_says() {
     for s in SPELLINGS {
         assert_eq!(
-            launched::<LaunchingNothing<true>>(s.url),
+            launched::<DockerRunner>(s.url),
+            s.launched_in_a_container,
+            "{:?}",
+            s.url
+        );
+        assert_eq!(
+            launched::<KubernetesRunner>(s.url),
             s.launched_in_a_container,
             "{:?}",
             s.url

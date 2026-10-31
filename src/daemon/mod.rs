@@ -12,7 +12,7 @@ pub mod submit;
 use crate::event::EventKind;
 use crate::paths::JobPlace;
 use crate::report::JobReport;
-use crate::runner::{JobSecrets, Runner, RunnerProblem};
+use crate::runner::{Credentials, JobSecrets, Runner, RunnerProblem};
 use anyhow::Context;
 use fleet::Resumption;
 use root::{RootLock, socket_path};
@@ -45,9 +45,9 @@ impl<R: Runner> Daemon<R> {
         pass_env: &[String],
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<Daemon<R>, Vec<RunnerProblem>> {
-        let (secrets, unsendable) = match R::RUNS_IN_A_CONTAINER {
-            true => JobSecrets::from_lookup(pass_env, env),
-            false => (JobSecrets::default(), Vec::new()),
+        let (secrets, unsendable) = match R::ENVIRONMENT.credentials {
+            Credentials::PassedIn => JobSecrets::from_lookup(pass_env, env),
+            Credentials::OfTheHost => (JobSecrets::default(), Vec::new()),
         };
         let problems: Vec<RunnerProblem> = runner
             .reasons_it_cannot_run()

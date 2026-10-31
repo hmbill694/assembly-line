@@ -131,8 +131,9 @@ async fn within_provisioning_limit<T>(
     }
 }
 
-/// The credential helper a job's clone authenticates with. A container
-/// runner always sends the token, having no other credentials to offer;
+/// The credential helper a job's clone authenticates with. A runner whose
+/// credentials are passed in ([`crate::runner::Credentials::PassedIn`])
+/// sends the token in [`GIT_TOKEN_VAR`], which is how they reach the round;
 /// without one, git uses whatever this environment already has.
 fn credential_helper_for_this_environment() -> Option<&'static str> {
     std::env::var_os(GIT_TOKEN_VAR)

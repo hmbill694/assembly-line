@@ -3,6 +3,7 @@
 
 use crate::git;
 use crate::paths::{LOCAL_HOST, RepoKey, UnkeyableRemote};
+use crate::runner::Reach;
 use std::path::Path;
 
 /// The remote of a person's checkout that a job clones from and pushes its
@@ -173,17 +174,18 @@ impl Remote {
         }
     }
 
-    /// The `--repo` a round is launched with. A container has no SSH keys,
-    /// so it reaches the remote over HTTPS. On the host an absolute path is
-    /// passed as a `file://` URL: `run --repo` reads a path holding `.git`
-    /// as a checkout and clones that checkout's own remote, and a remote
-    /// that is a non-bare repository holds one.
+    /// The `--repo` a round with `reach` is launched with. A round that
+    /// reaches only network remotes has no SSH keys, so it reaches the
+    /// remote over HTTPS. On this machine an absolute path is passed as a
+    /// `file://` URL: `run --repo` reads a path holding `.git` as a checkout
+    /// and clones that checkout's own remote, and a remote that is a
+    /// non-bare repository holds one.
     #[must_use]
-    pub fn url_for_launch(&self, in_a_container: bool) -> String {
-        match (in_a_container, Path::new(&self.url).is_absolute()) {
-            (true, _) => self.https_equivalent(),
-            (false, true) => format!("file://{}", self.url),
-            (false, false) => self.url.clone(),
+    pub fn url_for_launch(&self, reach: Reach) -> String {
+        match (reach, Path::new(&self.url).is_absolute()) {
+            (Reach::FromAnywhere, _) => self.https_equivalent(),
+            (Reach::ThisMachine, true) => format!("file://{}", self.url),
+            (Reach::ThisMachine, false) => self.url.clone(),
         }
     }
 

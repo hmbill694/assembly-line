@@ -11,7 +11,7 @@ use crate::job::JobId;
 use crate::paths::{JobPaths, JobPlace, RepoKey};
 use crate::remote::Remote;
 use crate::report::JobRequests;
-use crate::runner::{Runner, reasons_a_container_cannot_run};
+use crate::runner::Runner;
 use crate::state::JobState;
 use std::path::Path;
 
@@ -49,17 +49,16 @@ pub async fn accept<R: Runner>(
 ) -> Result<Queued, Refused> {
     let remote = Remote::from_url(submission.remote_url);
     let key = remote.repo_key().map_err(unpreparable)?;
-    let container_problems: Vec<String> = match R::RUNS_IN_A_CONTAINER {
-        true => reasons_a_container_cannot_run(&remote)
-            .iter()
-            .map(ToString::to_string)
-            .collect(),
-        false => Vec::new(),
-    };
-    if !container_problems.is_empty() {
+    let unreachable: Vec<String> = R::ENVIRONMENT
+        .reaches_remotes
+        .reasons_it_cannot_reach(&remote)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    if !unreachable.is_empty() {
         return Err(refused(
             "the job cannot run on this daemon's runner",
-            container_problems,
+            unreachable,
         ));
     }
     let root = &serving.daemon.root;
