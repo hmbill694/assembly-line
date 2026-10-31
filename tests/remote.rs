@@ -378,7 +378,7 @@ fn launched<R: Runner>(url: &str) -> String {
         remote_url: url.into(),
         base: PinnedRef {
             name: "main".into(),
-            sha: "a".repeat(40),
+            sha: "a".repeat(40).parse().unwrap(),
         },
         prompt: "x".into(),
         provider: "p".into(),

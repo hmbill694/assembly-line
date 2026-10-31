@@ -157,14 +157,17 @@ pub async fn prepare_run(
         .ref_to_start_from(request.base_ref)
         .await
         .map_err(RunRefused::Unpreparable)?;
-    let (ref_name, pinned_sha) = split_pin(&base_ref);
+    let (ref_name, pinned_sha) = match base_ref.parse::<PinnedRef>() {
+        Ok(PinnedRef { name, sha }) => (name, Some(sha)),
+        Err(_) => (base_ref, None),
+    };
 
     let (clone, provisioning_deadline) =
         workspace::clone_within_provisioning_limit(&repo.remote, scratch_root, cancel)
             .await
             .map_err(RunRefused::Unpreparable)?;
 
-    let base = workspace::pin_in_clone(&clone, &ref_name, pinned_sha.as_deref())
+    let base = workspace::pin_in_clone(&clone, &ref_name, pinned_sha.as_ref())
         .await
         .map_err(RunRefused::Unpreparable)?;
     let admitted = admission::admit(clone.path(), base, request.provider.as_deref())
@@ -211,7 +214,7 @@ pub async fn prepare_run(
 
 /// Where continuing job `id` starts: its branch's tip on the remote.
 async fn job_branch_tip(clone: &ScratchClone, id: JobId) -> Result<PinnedRef, RunRefused> {
-    workspace::job_branch_in_clone(clone, &id.branch_name())
+    workspace::job_branch_in_clone(clone, id)
         .await
         .map_err(RunRefused::Unpreparable)?
         .ok_or_else(|| RunRefused::NoJobBranch(id, Box::new(clone.remote().clone())))
@@ -225,13 +228,14 @@ impl AdmittedRound {
             true => format!(
                 "job {}: claimed {} at {} ({})",
                 self.payload.job_id,
-                self.payload.branch,
+                self.payload.job_id.branch_name(),
                 self.base.name,
-                &self.base.sha[..12.min(self.base.sha.len())]
+                self.base.sha.short()
             ),
             false => format!(
                 "job {}: continuing {}",
-                self.payload.job_id, self.payload.branch
+                self.payload.job_id,
+                self.payload.job_id.branch_name()
             ),
         }
     }
@@ -306,7 +310,7 @@ async fn deliver<W: Write + Send + 'static>(
     let delivered = delivery::deliver(
         checkout,
         &settings.delivery,
-        &payload.branch,
+        payload.job_id,
         target,
         PullRequestText {
             title: payload.commit_message.lines().next().unwrap_or_default(),
@@ -364,20 +368,5 @@ pub fn prompt_text(prompt: Option<String>, prompt_file: Option<PathBuf>) -> anyh
         }
         // clap refuses this combination before we are reached.
         (None, None) => Err(anyhow!("a job needs --prompt or --prompt-file")),
-    }
-}
-
-/// `main@<sha>` as the ref and the commit it is pinned to; anything whose
-/// part after the last `@` is not a full hex object name is a ref alone.
-fn split_pin(named: &str) -> (String, Option<String>) {
-    match named.rsplit_once('@') {
-        Some((name, sha))
-            if !name.is_empty()
-                && matches!(sha.len(), 40 | 64)
-                && sha.chars().all(|c| c.is_ascii_hexdigit()) =>
-        {
-            (name.to_string(), Some(sha.to_string()))
-        }
-        _ => (named.to_string(), None),
     }
 }

@@ -26,7 +26,7 @@ fn requested() -> EventKind {
         remote_url: "/o.git".into(),
         base: PinnedRef {
             name: "main".into(),
-            sha: "a".repeat(40),
+            sha: "a".repeat(40).parse().unwrap(),
         },
         prompt: "x".into(),
         provider: "p".into(),

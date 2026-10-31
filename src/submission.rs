@@ -2,7 +2,7 @@
 //! prompt — resolved from the checkout without writing anything to it.
 
 use crate::daemon::api::Submission;
-use crate::git;
+use crate::git::{self, CommitId};
 use crate::locate::NamedRepo;
 use crate::remote::CHECKOUT_REMOTE;
 use crate::run::prompt_text;
@@ -27,7 +27,7 @@ pub struct SubmitRequest {
 pub struct LocalRefDiffers {
     pub base_ref: String,
     pub remote: String,
-    pub remote_sha: String,
+    pub remote_sha: CommitId,
 }
 
 impl std::fmt::Display for LocalRefDiffers {
@@ -39,7 +39,7 @@ impl std::fmt::Display for LocalRefDiffers {
             self.base_ref,
             self.remote,
             self.remote,
-            &self.remote_sha[..12.min(self.remote_sha.len())]
+            self.remote_sha.short()
         )
     }
 }

@@ -9,7 +9,8 @@
 use crate::event::EventKind;
 use crate::exec::{ShellOutcome, run_command, run_shell};
 use crate::frame::FrameWriter;
-use crate::git;
+use crate::git::{self, CommitId};
+use crate::job::JobId;
 use crate::payload::RoundPayload;
 use crate::provider::CommandSpec;
 use crate::workspace::{self, PROVISIONING_LIMIT, RoundWorkspace, ScratchClone};
@@ -68,7 +69,7 @@ impl RoundClosing {
 #[must_use = "a round reports its verdict and discards its checkout only when closed"]
 pub struct FinishedRound {
     closing: RoundClosing,
-    branch_tip: String,
+    branch_tip: CommitId,
     workspace: Option<RoundWorkspace>,
 }
 
@@ -81,7 +82,7 @@ impl FinishedRound {
     /// The commit the round left the job's branch at on the remote: its own,
     /// or the one it started from when it pushed nothing.
     #[must_use]
-    pub fn branch_tip(&self) -> &str {
+    pub fn branch_tip(&self) -> &CommitId {
         &self.branch_tip
     }
 
@@ -118,8 +119,8 @@ impl FinishedRound {
 /// What an agent left behind, recorded on the job's branch.
 #[derive(Debug)]
 struct AgentWork {
-    branch: String,
-    sha: String,
+    job: JobId,
+    sha: CommitId,
     stat: git::DiffStat,
     /// The URL of the remote the branch reached. A round that could not push
     /// has no `AgentWork` at all.
@@ -190,7 +191,7 @@ pub async fn run_round<W: Write + Send + 'static>(
     provisioning_deadline: Instant,
     cancel: CancellationToken,
 ) -> anyhow::Result<FinishedRound> {
-    match workspace::start_round(clone, &payload.start, &payload.branch).await {
+    match workspace::start_round(clone, &payload.start, payload.job_id).await {
         Ok(ws) => {
             let (branch_tip, closing) =
                 run_round_in(payload, &ws, frames, provisioning_deadline, cancel).await?;
@@ -216,7 +217,7 @@ async fn run_round_in<W: Write + Send + 'static>(
     frames: &FrameWriter<W>,
     provisioning_deadline: Instant,
     cancel: CancellationToken,
-) -> anyhow::Result<(String, RoundClosing)> {
+) -> anyhow::Result<(CommitId, RoundClosing)> {
     let timeout = payload.command_limit_secs.map(Duration::from_secs);
     let result = result_in_workspace(payload, ws, frames, provisioning_deadline, timeout, cancel)
         .await
@@ -414,7 +415,7 @@ async fn agent_work_on_branch(
     workspace::publish(ws).await?;
 
     Ok(Some(AgentWork {
-        branch: ws.branch.clone(),
+        job: payload.job_id,
         sha,
         stat,
         pushed_to: ws.remote().url().to_string(),
@@ -432,13 +433,13 @@ fn work_recorded(work: Option<&AgentWork>) -> Vec<EventKind> {
     work.map(|w| {
         vec![
             EventKind::RoundCommitted {
-                sha: w.sha.clone(),
+                sha: w.sha.to_string(),
                 files: w.stat.files,
                 insertions: w.stat.insertions,
                 deletions: w.stat.deletions,
             },
             EventKind::BranchPushed {
-                branch: w.branch.clone(),
+                branch: w.job.branch_name(),
                 pushed_to: w.pushed_to.clone(),
             },
         ]
@@ -498,9 +499,8 @@ mod provisioning_tests {
             job_id: 1.into(),
             start: PinnedRef {
                 name: "main".to_string(),
-                sha: "0".repeat(40),
+                sha: "0".repeat(40).parse().unwrap(),
             },
-            branch: "al/job-1".to_string(),
             command: CommandSpec {
                 program: "true".to_string(),
                 args: Vec::new(),

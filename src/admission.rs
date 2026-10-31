@@ -81,7 +81,7 @@ pub async fn admit(
     base: PinnedRef,
     provider_named: Option<&str>,
 ) -> Result<Admitted, AdmissionRefused> {
-    let config = RepoConfig::from_ref(repo, &base.sha)
+    let config = RepoConfig::from_ref(repo, base.sha.as_str())
         .await
         .map_err(AdmissionRefused::Unreadable)?;
     let settings = config

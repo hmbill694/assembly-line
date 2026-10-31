@@ -38,7 +38,7 @@ pub async fn claim_job(
                 JobId::from(u64::MAX).branch_name()
             )
         })?;
-        if git::create_branch_if_absent(repo, name_or_url, base_sha, &id.branch_name()).await? {
+        if git::create_branch_if_absent(repo, name_or_url, &id.branch_name(), base_sha).await? {
             return Ok(id);
         }
     }

@@ -75,7 +75,7 @@ pub fn config_running(script: &str) -> String {
 }
 
 /// Stage everything in `repo` and commit it. `None` means the tree was clean.
-pub async fn commit_all(repo: &Path, message: &str) -> anyhow::Result<Option<String>> {
+pub async fn commit_all(repo: &Path, message: &str) -> anyhow::Result<Option<git::CommitId>> {
     git::commit_all(repo, message).await
 }
 

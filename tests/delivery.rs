@@ -4,7 +4,8 @@ use assembly_line::delivery::{
 };
 use assembly_line::event::EventKind;
 use assembly_line::frame::{Frame, FrameBody};
-use assembly_line::git::{self, PinnedRef};
+use assembly_line::git::{self, CommitId, PinnedRef};
+use assembly_line::job::JobId;
 use assembly_line::round::Verdict;
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
@@ -41,7 +42,7 @@ async fn delivery_is_skipped_when_it_is_turned_off() {
     let outcome = deliver(
         &fx.repo,
         &mode(DeliveryMode::None),
-        "al/job-1",
+        JobId::from(1),
         "main",
         PullRequestText {
             title: "job 1: x",
@@ -71,10 +72,14 @@ fn delivery_is_configurable_from_the_repositorys_own_config() {
     assert_eq!(config.delivery.mode, DeliveryMode::None);
 }
 
+fn commit(sha: &str) -> CommitId {
+    sha.parse().unwrap()
+}
+
 fn main_at(sha: &str) -> PinnedRef {
     PinnedRef {
         name: "main".to_string(),
-        sha: sha.to_string(),
+        sha: commit(sha),
     }
 }
 
@@ -84,7 +89,12 @@ const ROUND_SHA: &str = "2222222222222222222222222222222222222222";
 #[test]
 fn a_failed_round_has_nothing_to_deliver() {
     assert_eq!(
-        delivery_plan(Verdict::Failed, ROUND_SHA, &main_at(BASE_SHA), None),
+        delivery_plan(
+            Verdict::Failed,
+            &commit(ROUND_SHA),
+            &main_at(BASE_SHA),
+            None
+        ),
         DeliveryPlan::NothingToDeliver
     );
 }
@@ -92,7 +102,7 @@ fn a_failed_round_has_nothing_to_deliver() {
 #[test]
 fn a_branch_left_at_its_base_has_nothing_to_deliver() {
     assert_eq!(
-        delivery_plan(Verdict::Passed, BASE_SHA, &main_at(BASE_SHA), None),
+        delivery_plan(Verdict::Passed, &commit(BASE_SHA), &main_at(BASE_SHA), None),
         DeliveryPlan::NothingToDeliver
     );
 }
@@ -102,7 +112,7 @@ fn a_configured_target_other_than_the_base_is_targeted_and_noted() {
     assert_eq!(
         delivery_plan(
             Verdict::Passed,
-            ROUND_SHA,
+            &commit(ROUND_SHA),
             &main_at(BASE_SHA),
             Some("release")
         ),
@@ -119,7 +129,12 @@ fn a_configured_target_other_than_the_base_is_targeted_and_noted() {
 #[test]
 fn with_no_configured_target_the_pull_request_targets_the_base() {
     assert_eq!(
-        delivery_plan(Verdict::Passed, ROUND_SHA, &main_at(BASE_SHA), None),
+        delivery_plan(
+            Verdict::Passed,
+            &commit(ROUND_SHA),
+            &main_at(BASE_SHA),
+            None
+        ),
         DeliveryPlan::OpenPullRequest {
             target: "main".to_string(),
             base_differs: None,

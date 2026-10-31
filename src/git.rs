@@ -125,24 +125,27 @@ async fn run_expecting_success(
         .stdout_or_error(operation)
 }
 
-pub async fn head_sha(repo: impl AsRef<Path>) -> anyhow::Result<String> {
-    run_expecting_success(repo, &["rev-parse", "HEAD"], "rev-parse HEAD").await
+pub async fn head_sha(repo: impl AsRef<Path>) -> anyhow::Result<CommitId> {
+    let printed = run_expecting_success(repo, &["rev-parse", "HEAD"], "rev-parse HEAD").await?;
+    commit_id_printed_by("rev-parse HEAD", &printed)
 }
 
 /// The commit `git_ref` names in this repository — a branch, a tag, `HEAD`,
 /// or a raw sha. A job starts from the remote's copy of the ref instead
 /// ([`pinned`]); this local answer is only compared against it.
-pub async fn sha_at_ref(repo: impl AsRef<Path>, git_ref: &str) -> anyhow::Result<String> {
-    run_expecting_success(
+pub async fn sha_at_ref(repo: impl AsRef<Path>, git_ref: &str) -> anyhow::Result<CommitId> {
+    let operation = format!("rev-parse {git_ref}");
+    let printed = run_expecting_success(
         repo,
         &["rev-parse", &format!("{git_ref}^{{commit}}")],
-        &format!("rev-parse {git_ref}"),
+        &operation,
     )
-    .await
+    .await?;
+    commit_id_printed_by(&operation, &printed)
 }
 
 /// Whether `repo` has `sha` as a commit.
-pub async fn has_commit(repo: impl AsRef<Path>, sha: &str) -> anyhow::Result<bool> {
+pub async fn has_commit(repo: impl AsRef<Path>, sha: &CommitId) -> anyhow::Result<bool> {
     let spec = format!("{sha}^{{commit}}");
     Ok(run_allowing_failure(repo, &["cat-file", "-e", &spec])
         .await?
@@ -199,7 +202,7 @@ pub async fn sha_on_remote(
     repo: impl AsRef<Path>,
     name_or_url: &str,
     git_ref: &str,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<CommitId>> {
     let peeled_pattern = format!("{git_ref}^{{}}");
     let listed = run_expecting_success(
         repo,
@@ -216,7 +219,7 @@ pub async fn sha_on_remote(
     let sha_named = |name: &str| {
         refs.iter()
             .find(|(_, listed)| *listed == name)
-            .map(|(sha, _)| (*sha).to_string())
+            .map(|(sha, _)| *sha)
     };
     let candidates = [
         git_ref.to_string(),
@@ -224,9 +227,75 @@ pub async fn sha_on_remote(
         format!("refs/tags/{git_ref}"),
         format!("refs/heads/{git_ref}"),
     ];
-    Ok(candidates.iter().find_map(|candidate| {
-        sha_named(&format!("{candidate}^{{}}")).or_else(|| sha_named(candidate))
-    }))
+    candidates
+        .iter()
+        .find_map(|candidate| {
+            sha_named(&format!("{candidate}^{{}}")).or_else(|| sha_named(candidate))
+        })
+        .map(|sha| commit_id_printed_by(&format!("ls-remote {name_or_url} {git_ref}"), sha))
+        .transpose()
+}
+
+/// A commit's full object name: 40 hex characters, or 64 in a SHA-256
+/// repository.
+///
+/// Parsing checks the form; deserializing does not, so an event log written
+/// before the check existed still reads.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct CommitId(String);
+
+impl CommitId {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The first 12 characters, for a line a person reads.
+    #[must_use]
+    pub fn short(&self) -> &str {
+        self.0.get(..12).unwrap_or(&self.0)
+    }
+}
+
+impl std::str::FromStr for CommitId {
+    type Err = NotACommitId;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match matches!(text.len(), 40 | 64) && text.chars().all(|c| c.is_ascii_hexdigit()) {
+            true => Ok(Self(text.to_string())),
+            false => Err(NotACommitId(text.to_string())),
+        }
+    }
+}
+
+impl std::fmt::Display for CommitId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotACommitId(String);
+
+impl std::fmt::Display for NotACommitId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "'{}' is not a commit id — give the full 40- or 64-character hex sha, as `git \
+             rev-parse` prints it",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for NotACommitId {}
+
+/// What git printed for `operation`, read as the commit id it must be.
+fn commit_id_printed_by(operation: &str, printed: &str) -> anyhow::Result<CommitId> {
+    printed
+        .parse()
+        .map_err(|e| anyhow::anyhow!("{operation} printed no commit id: {e}"))
 }
 
 /// A ref name and the commit it named when the job was planned.
@@ -234,11 +303,54 @@ pub async fn sha_on_remote(
 /// The name is kept because a clone fetches by name; the sha is what the job
 /// actually starts from, so config read at planning time and the tree the job
 /// runs on are the same commit even if the ref moves in between.
+///
+/// Its text form is `REF@SHA`, as `run --ref` takes it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PinnedRef {
     pub name: String,
-    pub sha: String,
+    pub sha: CommitId,
 }
+
+impl std::fmt::Display for PinnedRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}@{}", self.name, self.sha)
+    }
+}
+
+/// `REF@SHA` split at its last `@`. Text whose part after that `@` is not a
+/// [`CommitId`], or which has nothing before it, is not a pin: it is a ref
+/// name, `@` and all.
+impl std::str::FromStr for PinnedRef {
+    type Err = NotPinned;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let not_pinned = || NotPinned(text.to_string());
+        let (name, sha) = text
+            .rsplit_once('@')
+            .filter(|(name, _)| !name.is_empty())
+            .ok_or_else(not_pinned)?;
+        Ok(Self {
+            name: name.to_string(),
+            sha: sha.parse().map_err(|_| not_pinned())?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotPinned(String);
+
+impl std::fmt::Display for NotPinned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "'{}' is not REF@SHA with a ref name and a full commit id — write it that way to \
+             pin a ref",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for NotPinned {}
 
 /// The URL the remote called `name` fetches from, as `git remote get-url`
 /// gives it, or `None` when the repository has no such remote.
@@ -305,7 +417,7 @@ async fn fetched_sha(
     repo: impl AsRef<Path>,
     name_or_url: &str,
     git_ref: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<CommitId> {
     let repo = repo.as_ref();
     run_expecting_success(
         repo,
@@ -313,12 +425,13 @@ async fn fetched_sha(
         &format!("fetch {name_or_url} {git_ref}"),
     )
     .await?;
-    run_expecting_success(
+    let printed = run_expecting_success(
         repo,
         &["rev-parse", "FETCH_HEAD^{commit}"],
         "rev-parse FETCH_HEAD",
     )
-    .await
+    .await?;
+    commit_id_printed_by("rev-parse FETCH_HEAD", &printed)
 }
 
 /// Whether `name_or_url` answered and does not carry `git_ref` — as opposed
@@ -430,11 +543,11 @@ pub async fn clone_into(
 pub async fn check_out_new_branch(
     clone: impl AsRef<Path>,
     branch: &str,
-    at: &str,
+    at: &CommitId,
 ) -> anyhow::Result<()> {
     run_expecting_success(
         clone,
-        &["checkout", "--quiet", "-b", branch, at],
+        &["checkout", "--quiet", "-b", branch, at.as_str()],
         &format!("checkout -b {branch}"),
     )
     .await
@@ -502,26 +615,26 @@ pub async fn push_head_as(
     .map(|_| ())
 }
 
-/// Create `branch` on `name_or_url` at `sha`, only if the remote has no such
+/// Create `branch` on `name_or_url` at `at`, only if the remote has no such
 /// branch. `false` means somebody already has it.
 ///
 /// Neither the exit code nor the lease decides this alone. A push of the
 /// commit a branch already points at exits 0 as "up to date", lease or not,
 /// so only the porcelain line's `*` (a new branch) counts as created. The
 /// lease — `--force-with-lease=<ref>:`, expecting no such ref — stops the
-/// push fast-forwarding a branch that sits at an ancestor of `sha`. And a
+/// push fast-forwarding a branch that sits at an ancestor of `at`. And a
 /// push that lost its race on the remote itself, after both sides saw the
 /// ref absent, reports "reference already exists" rather than a lost lease.
 /// No hooks run, as for [`push_head_as`].
 pub async fn create_branch_if_absent(
     repo: impl AsRef<Path>,
     name_or_url: &str,
-    sha: &str,
     branch: &str,
+    at: &CommitId,
 ) -> anyhow::Result<bool> {
     let target = format!("refs/heads/{branch}");
     let lease = format!("--force-with-lease={target}:");
-    let refspec = format!("{sha}:{target}");
+    let refspec = format!("{at}:{target}");
     let pushed = run_allowing_failure(
         repo,
         &[
@@ -569,7 +682,10 @@ pub async fn create_branch_if_absent(
 
 /// Stage everything in `clone` and commit it, returning the new commit, or
 /// `None` when there was nothing to commit.
-pub async fn commit_all(clone: impl AsRef<Path>, message: &str) -> anyhow::Result<Option<String>> {
+pub async fn commit_all(
+    clone: impl AsRef<Path>,
+    message: &str,
+) -> anyhow::Result<Option<CommitId>> {
     let clone = clone.as_ref();
     run_expecting_success(clone, &["add", "-A"], "add -A").await?;
 
@@ -585,15 +701,15 @@ pub async fn commit_all(clone: impl AsRef<Path>, message: &str) -> anyhow::Resul
 
 /// Whether `HEAD` carries any commit that `since` does not — work the round
 /// made, whoever committed it.
-pub async fn head_is_ahead_of(repo: impl AsRef<Path>, since: &str) -> anyhow::Result<bool> {
+pub async fn head_is_ahead_of(repo: impl AsRef<Path>, since: &CommitId) -> anyhow::Result<bool> {
     commit_is_ahead_of(repo, "HEAD", since).await
 }
 
 /// Whether `commit` carries any commit that `since` does not.
-pub async fn commit_is_ahead_of(
+async fn commit_is_ahead_of(
     repo: impl AsRef<Path>,
     commit: &str,
-    since: &str,
+    since: &CommitId,
 ) -> anyhow::Result<bool> {
     let range = format!("{since}..{commit}");
     let count = run_expecting_success(repo, &["rev-list", "--count", &range], "rev-list").await?;
@@ -607,7 +723,10 @@ pub struct DiffStat {
     pub deletions: usize,
 }
 
-pub async fn diff_stat_against(clone: impl AsRef<Path>, base: &str) -> anyhow::Result<DiffStat> {
+pub async fn diff_stat_against(
+    clone: impl AsRef<Path>,
+    base: &CommitId,
+) -> anyhow::Result<DiffStat> {
     let numstat = run_expecting_success(
         clone,
         &["diff", "--numstat", &format!("{base}..HEAD")],

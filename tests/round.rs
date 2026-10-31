@@ -68,7 +68,7 @@ async fn a_job_is_cut_from_the_ref_it_names_not_from_head() {
         .unwrap();
     assert_eq!(
         parent.stdout.trim(),
-        earlier,
+        earlier.as_str(),
         "the job ignored the ref it was given"
     );
 
@@ -429,7 +429,7 @@ async fn a_refused_push_fails_the_round_and_says_the_work_is_lost() {
         .unwrap();
     assert_eq!(
         on_remote.stdout.trim(),
-        base,
+        base.as_str(),
         "the push was not refused, so this test proves nothing"
     );
 }

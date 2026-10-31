@@ -2,7 +2,8 @@
 //! on it has passed.
 
 use crate::config::{Delivery, DeliveryMode};
-use crate::git::{GroupKilledOnDrop, PinnedRef};
+use crate::git::{CommitId, GroupKilledOnDrop, PinnedRef};
+use crate::job::JobId;
 use crate::round::Verdict;
 use std::path::Path;
 use std::process::{Output, Stdio};
@@ -17,7 +18,7 @@ pub enum Delivered {
     /// The round pushed the branch, but no pull request was opened — `gh` is
     /// not installed, or it refused.
     Pushed {
-        branch: String,
+        job: JobId,
         because: String,
     },
     Opened {
@@ -34,9 +35,11 @@ impl std::fmt::Display for Delivered {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Skipped(why) => write!(f, "not delivered: {why}"),
-            Self::Pushed { branch, because } => {
-                write!(f, "pushed {branch} — no pull request opened: {because}")
-            }
+            Self::Pushed { job, because } => write!(
+                f,
+                "pushed {} — no pull request opened: {because}",
+                job.branch_name()
+            ),
             Self::Opened { url } => write!(f, "opened {url}"),
             Self::AlreadyOpen { url } => write!(f, "updated {url}"),
         }
@@ -85,11 +88,11 @@ pub enum DeliveryPlan {
 #[must_use]
 pub fn delivery_plan(
     verdict: Verdict,
-    branch_tip: &str,
+    branch_tip: &CommitId,
     base: &PinnedRef,
     pull_request_target: Option<&str>,
 ) -> DeliveryPlan {
-    match (verdict, branch_tip == base.sha) {
+    match (verdict, *branch_tip == base.sha) {
         (Verdict::Failed, _) | (Verdict::Passed, true) => DeliveryPlan::NothingToDeliver,
         (Verdict::Passed, false) => {
             let target = pull_request_target.unwrap_or(&base.name);
@@ -115,23 +118,23 @@ pub struct PullRequestText<'a> {
     pub body: &'a str,
 }
 
-/// Ask for a pull request from `job_branch` into `base`, unless `cancel`
-/// fires first. The round already pushed the branch, so nothing here can lose
-/// work.
+/// Ask for a pull request from job `job`'s branch into `base`, unless
+/// `cancel` fires first. The round already pushed the branch, so nothing
+/// here can lose work.
 pub async fn deliver(
     repo: impl AsRef<Path>,
     delivery: &Delivery,
-    job_branch: &str,
+    job: JobId,
     base: &str,
     text: PullRequestText<'_>,
     cancel: &CancellationToken,
 ) -> Delivered {
     match delivery.mode {
         DeliveryMode::None => Delivered::Skipped("delivery mode is \"none\"".into()),
-        DeliveryMode::Pr => open_pull_request(repo.as_ref(), job_branch, base, text, cancel)
+        DeliveryMode::Pr => open_pull_request(repo.as_ref(), job, base, text, cancel)
             .await
             .unwrap_or_else(|| Delivered::Pushed {
-                branch: job_branch.to_string(),
+                job,
                 because: "cancelled".to_string(),
             }),
     }
@@ -141,18 +144,27 @@ pub async fn deliver(
 /// fatal — the branch is already pushed. `None` once `cancel` has fired.
 async fn open_pull_request(
     repo: &Path,
-    job_branch: &str,
+    job: JobId,
     base: &str,
     text: PullRequestText<'_>,
     cancel: &CancellationToken,
 ) -> Option<Delivered> {
-    if let Some(url) = open_pull_request_of(repo, job_branch, cancel).await? {
+    if let Some(url) = open_pull_request_of(repo, job, cancel).await? {
         return Some(Delivered::AlreadyOpen { url });
     }
+    let job_branch = job.branch_name();
     let attempt = gh_unless_cancelled(
         repo,
         &[
-            "pr", "create", "--base", base, "--head", job_branch, "--title", text.title, "--body",
+            "pr",
+            "create",
+            "--base",
+            base,
+            "--head",
+            &job_branch,
+            "--title",
+            text.title,
+            "--body",
             text.body,
         ],
         cancel,
@@ -161,11 +173,11 @@ async fn open_pull_request(
 
     Some(match attempt {
         Err(e) => Delivered::Pushed {
-            branch: job_branch.to_string(),
+            job,
             because: format!("could not run `gh`: {e}"),
         },
         Ok(out) if !out.status.success() => Delivered::Pushed {
-            branch: job_branch.to_string(),
+            job,
             because: String::from_utf8_lossy(&out.stderr).trim().to_string(),
         },
         Ok(out) => Delivered::Opened {
@@ -174,13 +186,13 @@ async fn open_pull_request(
     })
 }
 
-/// The URL of `job_branch`'s open pull request, or `None` once `cancel` has
-/// fired. An inner `None` covers no pull request, no `gh` and a `gh` that
-/// refuses alike: each falls through to `gh pr create`, which reports its
-/// own failure.
+/// The URL of the open pull request from job `job`'s branch, or `None` once
+/// `cancel` has fired. An inner `None` covers no pull request, no `gh` and a
+/// `gh` that refuses alike: each falls through to `gh pr create`, which
+/// reports its own failure.
 async fn open_pull_request_of(
     repo: &Path,
-    job_branch: &str,
+    job: JobId,
     cancel: &CancellationToken,
 ) -> Option<Option<String>> {
     let viewed = gh_unless_cancelled(
@@ -188,7 +200,7 @@ async fn open_pull_request_of(
         &[
             "pr",
             "view",
-            job_branch,
+            &job.branch_name(),
             "--json",
             "url,state",
             "--jq",

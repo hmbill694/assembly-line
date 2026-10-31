@@ -259,7 +259,7 @@ async fn every_reason_a_container_runner_cannot_run_is_reported_at_once() {
 fn base() -> PinnedRef {
     PinnedRef {
         name: "main".into(),
-        sha: "a".repeat(40),
+        sha: "a".repeat(40).parse().unwrap(),
     }
 }
 

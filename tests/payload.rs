@@ -3,13 +3,15 @@ use assembly_line::git::PinnedRef;
 use assembly_line::job::JobId;
 use assembly_line::payload::{RoundBeforeSettings, RoundPayload, commit_message};
 
+const START_SHA: &str = "abc1230000000000000000000000000000000000";
+
 fn round() -> RoundBeforeSettings<'static> {
     RoundBeforeSettings {
         job_id: 7.into(),
         prompt: "add a README\n\nwith sections",
         start: PinnedRef {
             name: "main".into(),
-            sha: "abc123".into(),
+            sha: START_SHA.parse().unwrap(),
         },
         provision_toolchain: false,
     }
@@ -26,7 +28,7 @@ const RUNNABLE: &str = "provider = \"fake\"\nverify = \"cargo test\"\nmax_durati
 fn a_payload_carries_everything_the_round_needs_already_resolved() {
     let payload = RoundPayload::for_round(&settings(RUNNABLE), round());
 
-    assert_eq!(payload.branch, "al/job-7");
+    assert_eq!(payload.job_id, JobId::from(7));
     assert_eq!(payload.command.program, "agent");
     assert_eq!(
         payload.command.args,
@@ -38,7 +40,7 @@ fn a_payload_carries_everything_the_round_needs_already_resolved() {
     );
     assert_eq!(payload.verify.as_deref(), Some("cargo test"));
     assert_eq!(payload.command_limit_secs, Some(20 * 60));
-    assert_eq!(payload.start.sha, "abc123");
+    assert_eq!(payload.start.sha.as_str(), START_SHA);
 }
 
 #[test]

@@ -2,7 +2,7 @@
 
 use crate::admission::Admitted;
 use crate::claim::claim_job;
-use crate::git::{self, PinnedRef};
+use crate::git::{self, CommitId, PinnedRef};
 use crate::job::JobId;
 use crate::payload::GIT_TOKEN_VAR;
 use crate::remote::Remote;
@@ -43,10 +43,10 @@ impl ScratchClone {
 #[derive(Debug)]
 pub struct RoundWorkspace {
     scratch: ScratchClone,
-    pub branch: String,
+    job: JobId,
     /// The commit the branch was checked out at — every commit since is
     /// this round's.
-    started_at: String,
+    started_at: CommitId,
 }
 
 impl RoundWorkspace {
@@ -151,7 +151,7 @@ fn credential_helper_for_this_environment() -> Option<&'static str> {
 pub async fn pin_in_clone(
     clone: &ScratchClone,
     git_ref: &str,
-    pinned_sha: Option<&str>,
+    pinned_sha: Option<&CommitId>,
 ) -> anyhow::Result<PinnedRef> {
     let url = clone.remote().url();
     let tip = git::pinned(clone.path(), url, git_ref).await?;
@@ -161,12 +161,12 @@ pub async fn pin_in_clone(
     // A ref that moved on past the pin still has it in its history; one that
     // was rewritten may not, so ask the remote for the commit itself.
     if !git::has_commit(clone.path(), sha).await? {
-        git::run_allowing_failure(clone.path(), &["fetch", "--quiet", url, sha]).await?;
+        git::run_allowing_failure(clone.path(), &["fetch", "--quiet", url, sha.as_str()]).await?;
     }
     match git::has_commit(clone.path(), sha).await? {
         true => Ok(PinnedRef {
             name: git_ref.to_string(),
-            sha: sha.to_string(),
+            sha: sha.clone(),
         }),
         false => Err(anyhow::anyhow!(
             "'{sha}' is not a commit {url} can supply for '{git_ref}'"
@@ -174,7 +174,7 @@ pub async fn pin_in_clone(
     }
 }
 
-/// The tip of job branch `branch` on the clone's remote, or `None` when the
+/// The tip of job `id`'s branch on the clone's remote, or `None` when the
 /// remote has no such branch.
 ///
 /// # Errors
@@ -182,12 +182,12 @@ pub async fn pin_in_clone(
 /// When the remote cannot be asked.
 pub async fn job_branch_in_clone(
     clone: &ScratchClone,
-    branch: &str,
+    id: JobId,
 ) -> anyhow::Result<Option<PinnedRef>> {
-    let url = clone.remote().url();
-    match git::remote_lacks_ref(clone.path(), url, branch).await? {
+    let (url, branch) = (clone.remote().url(), id.branch_name());
+    match git::remote_lacks_ref(clone.path(), url, &branch).await? {
         true => Ok(None),
-        false => git::pinned(clone.path(), url, branch).await.map(Some),
+        false => git::pinned(clone.path(), url, &branch).await.map(Some),
     }
 }
 
@@ -203,8 +203,8 @@ pub async fn claim_job_in_clone(
     claim_job(clone.path(), clone.remote().url(), admitted).await
 }
 
-/// Check `branch` out at `start` in `clone`, committing as assembly-line,
-/// and make it the round's workspace.
+/// Check job `job`'s branch out at `start` in `clone`, committing as
+/// assembly-line, and make it the round's workspace.
 ///
 /// # Errors
 ///
@@ -212,13 +212,13 @@ pub async fn claim_job_in_clone(
 pub async fn start_round(
     clone: ScratchClone,
     start: &PinnedRef,
-    branch: &str,
+    job: JobId,
 ) -> anyhow::Result<RoundWorkspace> {
-    git::check_out_new_branch(clone.path(), branch, &start.sha).await?;
+    git::check_out_new_branch(clone.path(), &job.branch_name(), &start.sha).await?;
     git::commit_as_assembly_line(clone.path()).await?;
     Ok(RoundWorkspace {
         scratch: clone,
-        branch: branch.to_string(),
+        job,
         started_at: start.sha.clone(),
     })
 }
@@ -231,7 +231,7 @@ pub async fn start_round(
 /// # Errors
 ///
 /// See [`git::commit_all`].
-pub async fn commit(ws: &RoundWorkspace, message: &str) -> anyhow::Result<Option<String>> {
+pub async fn commit(ws: &RoundWorkspace, message: &str) -> anyhow::Result<Option<CommitId>> {
     git::commit_all(ws.path(), message).await?;
     match git::head_is_ahead_of(ws.path(), &ws.started_at).await? {
         true => git::head_sha(ws.path()).await.map(Some),
@@ -259,18 +259,18 @@ const PUSH_BACKOFF: [Duration; 3] = [
 /// saying what that costs: the branch exists only in this scratch clone, so
 /// the work goes with it.
 pub async fn publish(ws: &RoundWorkspace) -> anyhow::Result<()> {
+    let branch = ws.job.branch_name();
     let mut last_failure = None;
     for wait in PUSH_BACKOFF {
         tokio::time::sleep(wait).await;
-        match git::push_head_as(ws.path(), ws.remote().url(), &ws.branch).await {
+        match git::push_head_as(ws.path(), ws.remote().url(), &branch).await {
             Ok(()) => return Ok(()),
             Err(e) => last_failure = Some(e),
         }
     }
 
     Err(anyhow::anyhow!(
-        "could not publish {} — the work is lost with the scratch checkout: {}",
-        ws.branch,
+        "could not publish {branch} — the work is lost with the scratch checkout: {}",
         last_failure.map(|e| e.to_string()).unwrap_or_default()
     ))
 }

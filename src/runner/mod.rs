@@ -68,7 +68,7 @@ impl LaunchSpec {
             args: [
                 "run".to_string(),
                 format!("--repo={remote_url}"),
-                format!("--ref={}@{}", base.name, base.sha),
+                format!("--ref={base}"),
                 format!("--job={job}"),
                 format!("--prompt={prompt}"),
                 format!("--provider={provider}"),

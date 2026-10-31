@@ -23,7 +23,6 @@ pub struct RoundPayload {
     /// The commit the round starts from — the base for round 1, the job's
     /// branch tip for a revise.
     pub start: PinnedRef,
-    pub branch: String,
     pub command: CommandSpec,
     pub commit_message: String,
     pub verify: Option<String>,
@@ -52,7 +51,6 @@ impl RoundPayload {
         RoundPayload {
             job_id: round.job_id,
             start: round.start,
-            branch: round.job_id.branch_name(),
             command: render_command(&settings.provider, round.prompt),
             commit_message: commit_message(round.job_id, round.prompt),
             verify: settings.verify.clone(),

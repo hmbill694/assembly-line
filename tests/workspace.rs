@@ -1,4 +1,5 @@
 use assembly_line::git::{self, PinnedRef, head_sha};
+use assembly_line::job::JobId;
 use assembly_line::remote::Remote;
 use assembly_line::workspace;
 use std::path::PathBuf;
@@ -43,7 +44,7 @@ impl Fixture {
     /// builds one.
     async fn workspace_at(&self, start: &PinnedRef) -> anyhow::Result<workspace::RoundWorkspace> {
         let clone = workspace::clone_scratch(&self.remote(), self.scratch(), None).await?;
-        workspace::start_round(clone, start, "al/job-1").await
+        workspace::start_round(clone, start, JobId::from(1)).await
     }
 }
 
@@ -106,7 +107,7 @@ async fn discarding_a_workspace_removes_it_and_the_published_branch_survives() {
     let on_remote = git::run_allowing_failure(&fx.origin, &["rev-parse", "al/job-1"])
         .await
         .unwrap();
-    assert_eq!(on_remote.stdout.trim(), sha);
+    assert_eq!(on_remote.stdout.trim(), sha.as_str());
 }
 
 /// What a revise round does: the checkout from the last round is long gone,
@@ -159,7 +160,7 @@ async fn publishing_runs_no_hook_from_the_clone() {
     let on_remote = git::run_allowing_failure(&fx.origin, &["rev-parse", "al/job-1"])
         .await
         .unwrap();
-    assert_eq!(on_remote.stdout.trim(), sha);
+    assert_eq!(on_remote.stdout.trim(), sha.as_str());
 }
 
 #[tokio::test]
@@ -190,7 +191,7 @@ async fn a_pin_the_remote_cannot_supply_is_an_error() {
         .await
         .unwrap();
 
-    let err = workspace::pin_in_clone(&clone, "main", Some(&"0".repeat(40)))
+    let err = workspace::pin_in_clone(&clone, "main", Some(&"0".repeat(40).parse().unwrap()))
         .await
         .unwrap_err()
         .to_string();
@@ -232,7 +233,7 @@ async fn a_job_branch_the_remote_lacks_is_none_not_an_error() {
         .unwrap();
 
     assert_eq!(
-        workspace::job_branch_in_clone(&clone, "al/job-9")
+        workspace::job_branch_in_clone(&clone, JobId::from(9))
             .await
             .unwrap(),
         None

@@ -1,5 +1,5 @@
 use assembly_line::event::{Event, EventKind};
-use assembly_line::git::PinnedRef;
+use assembly_line::git::{CommitId, PinnedRef};
 use assembly_line::job::JobId;
 use assembly_line::report::{JobReport, JobRequests, RoundRequest};
 use assembly_line::state::JobState;
@@ -31,12 +31,17 @@ fn state_after(kinds: Vec<EventKind>) -> JobState {
     JobReport::from_events(JobId::from(1), &events).state
 }
 
+/// A commit id of `pair`, two hex digits, repeated to full length.
+fn commit(pair: &str) -> CommitId {
+    pair.repeat(20).parse().unwrap()
+}
+
 fn requested(prompt: &str, sha: &str) -> EventKind {
     EventKind::RoundRequested {
         remote_url: "git@github.com:o/r.git".into(),
         base: PinnedRef {
             name: "main".into(),
-            sha: sha.into(),
+            sha: commit(sha),
         },
         prompt: prompt.into(),
         provider: "claude".into(),
@@ -593,7 +598,7 @@ fn a_jobs_identity_is_its_first_requested_round_and_a_revise_replaces_the_latest
                 remote_url: "ssh://git@github.com/o/r".into(),
                 base: PinnedRef {
                     name: "develop".into(),
-                    sha: "b2".into(),
+                    sha: commit("b2"),
                 },
                 prompt: "use sessions".into(),
                 provider: "codex".into(),
@@ -610,7 +615,7 @@ fn a_jobs_identity_is_its_first_requested_round_and_a_revise_replaces_the_latest
                 remote_url: "git@github.com:o/r.git".into(),
                 base: PinnedRef {
                     name: "main".into(),
-                    sha: "a1".into(),
+                    sha: commit("a1"),
                 },
                 prompt: "add auth".into(),
                 provider: "claude".into(),
@@ -620,7 +625,7 @@ fn a_jobs_identity_is_its_first_requested_round_and_a_revise_replaces_the_latest
                 remote_url: "ssh://git@github.com/o/r".into(),
                 base: PinnedRef {
                     name: "develop".into(),
-                    sha: "b2".into(),
+                    sha: commit("b2"),
                 },
                 prompt: "use sessions".into(),
                 provider: "codex".into(),
