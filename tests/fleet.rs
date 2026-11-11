@@ -3,9 +3,12 @@
 use assembly_line::daemon::fleet::{Resumption, jobs_under};
 use assembly_line::event::{Event, EventKind, EventLog};
 use assembly_line::git::PinnedRef;
-use assembly_line::paths::RepoKey;
+use assembly_line::job::JobId;
+use assembly_line::paths::JobPlace;
+use assembly_line::remote::Remote;
 use assembly_line::report::JobReport;
 use assembly_line::runner::RoundHandle;
+use std::path::Path;
 
 fn report_of(kinds: Vec<EventKind>) -> JobReport {
     let events: Vec<Event> = kinds
@@ -15,7 +18,7 @@ fn report_of(kinds: Vec<EventKind>) -> JobReport {
             kind,
         })
         .collect();
-    JobReport::from_events(1, &events)
+    JobReport::from_events(JobId::from(1), &events)
 }
 
 fn requested() -> EventKind {
@@ -23,7 +26,7 @@ fn requested() -> EventKind {
         remote_url: "/o.git".into(),
         base: PinnedRef {
             name: "main".into(),
-            sha: "a".repeat(40),
+            sha: "a".repeat(40).parse().unwrap(),
         },
         prompt: "x".into(),
         provider: "p".into(),
@@ -125,36 +128,67 @@ fn a_handle_round_trips_through_the_event_log() {
     );
 }
 
-/// Every job under the root is found where its remote's key puts it, and
-/// what is not a job's — a directory without a log, a name that is not an
-/// id — is passed over.
-#[test]
-fn every_job_under_the_root_is_found_by_its_address() {
-    let root = tempfile::tempdir().unwrap();
-    let key = RepoKey::from_remote_url("/o.git").unwrap();
-    let jobs_dir = key.jobs_dir(root.path());
-    [1, 2].iter().for_each(|id| {
-        EventLog::open_append(jobs_dir.join(id.to_string()).join("events.jsonl"))
-            .unwrap()
-            .append(requested())
-            .unwrap();
-    });
-    std::fs::create_dir_all(jobs_dir.join("3")).unwrap();
-    EventLog::open_append(jobs_dir.join("notes").join("events.jsonl"))
-        .unwrap()
-        .append(requested())
-        .unwrap();
+fn requested_job(root: &Path, url: &str, id: u64) -> JobPlace {
+    let place = JobPlace {
+        key: Remote::from_url(url).repo_key().unwrap(),
+        id: JobId::from(id),
+    };
+    place.create(root).unwrap().append(requested()).unwrap();
+    place
+}
 
-    let mut found: Vec<(u64, RepoKey, std::path::PathBuf)> = jobs_under(root.path())
+/// Every job under the root is found at the place its directories name, and
+/// what is not a job's — a directory without a log, a name that is not an
+/// id, a repository directory no key is named by — is passed over.
+#[test]
+fn every_job_under_the_root_is_found_by_its_place() {
+    let root = tempfile::tempdir().unwrap();
+    let places = [1, 2].map(|id| requested_job(root.path(), "/o.git", id));
+    let jobs_dir = places[0].key.jobs_dir(root.path());
+    std::fs::create_dir_all(jobs_dir.join("3")).unwrap();
+    [jobs_dir.join("notes"), root.path().join("jobs/not a key/4")]
+        .iter()
+        .for_each(|dir| {
+            EventLog::open_append(dir.join("events.jsonl"))
+                .unwrap()
+                .append(requested())
+                .unwrap();
+        });
+
+    let mut found: Vec<(JobPlace, JobId)> = jobs_under(root.path())
         .unwrap()
         .into_iter()
-        .map(|(address, report)| (report.id, address.key, address.jobs_dir))
+        .map(|(place, report)| (place, report.id))
         .collect();
-    found.sort_by_key(|(id, ..)| *id);
+    found.sort_by_key(|(place, _)| place.id);
 
     assert_eq!(
         found,
-        [(1, key.clone(), jobs_dir.clone()), (2, key, jobs_dir)]
+        places.map(|place| {
+            let id = place.id;
+            (place, id)
+        })
+    );
+}
+
+/// `/x/a/7.git`'s jobs directory and `/x/a.git`'s job 7 used to be one
+/// directory, and the walk stopped at the first log it found.
+#[test]
+fn jobs_of_repositories_whose_directories_once_nested_are_both_resumed() {
+    let root = tempfile::tempdir().unwrap();
+    let places =
+        [("/x/a/7.git", 1), ("/x/a.git", 7)].map(|(url, id)| requested_job(root.path(), url, id));
+
+    let mut found: Vec<(JobPlace, Option<Resumption>)> = jobs_under(root.path())
+        .unwrap()
+        .into_iter()
+        .map(|(place, report)| (place, Resumption::for_report(&report)))
+        .collect();
+    found.sort_by_key(|(place, _)| place.id);
+
+    assert_eq!(
+        found,
+        places.map(|place| (place, Some(Resumption::Requeue)))
     );
 }
 

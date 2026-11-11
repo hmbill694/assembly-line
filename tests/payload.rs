@@ -1,24 +1,24 @@
-use assembly_line::config::RepoConfig;
+use assembly_line::config::{JobSettings, RepoConfig};
 use assembly_line::git::PinnedRef;
 use assembly_line::job::JobId;
-use assembly_line::payload::{RoundPayload, RoundRequest, commit_message};
+use assembly_line::payload::{RoundBeforeSettings, RoundPayload, commit_message};
 
-fn request(provider: &str) -> RoundRequest<'_> {
-    RoundRequest {
+const START_SHA: &str = "abc1230000000000000000000000000000000000";
+
+fn round() -> RoundBeforeSettings<'static> {
+    RoundBeforeSettings {
         job_id: 7.into(),
         prompt: "add a README\n\nwith sections",
-        provider,
         start: PinnedRef {
             name: "main".into(),
-            sha: "abc123".into(),
+            sha: START_SHA.parse().unwrap(),
         },
-        remote_name: "origin",
-        remote_url: "https://example.com/o/r.git".into(),
+        provision_toolchain: false,
     }
 }
 
-fn config(body: &str) -> RepoConfig {
-    RepoConfig::parse(body).unwrap()
+fn settings(body: &str) -> JobSettings {
+    RepoConfig::parse(body).unwrap().settings_for(None).unwrap()
 }
 
 const RUNNABLE: &str = "provider = \"fake\"\nverify = \"cargo test\"\nmax_duration = \"20m\"\n\
@@ -26,9 +26,9 @@ const RUNNABLE: &str = "provider = \"fake\"\nverify = \"cargo test\"\nmax_durati
 
 #[test]
 fn a_payload_carries_everything_the_round_needs_already_resolved() {
-    let payload = RoundPayload::for_round(&config(RUNNABLE), request("fake")).unwrap();
+    let payload = RoundPayload::for_round(&settings(RUNNABLE), round());
 
-    assert_eq!(payload.branch, "al/job-7");
+    assert_eq!(payload.job_id, JobId::from(7));
     assert_eq!(payload.command.program, "agent");
     assert_eq!(
         payload.command.args,
@@ -40,11 +40,21 @@ fn a_payload_carries_everything_the_round_needs_already_resolved() {
     );
     assert_eq!(payload.verify.as_deref(), Some("cargo test"));
     assert_eq!(payload.command_limit_secs, Some(20 * 60));
-    assert_eq!(payload.start.sha, "abc123");
-    assert!(
-        !payload.provision_toolchain,
-        "the host opts a runner in, never the default"
-    );
+    assert_eq!(payload.start.sha.as_str(), START_SHA);
+}
+
+#[test]
+fn the_toolchain_flag_reaches_the_payload_as_given() {
+    [true, false].into_iter().for_each(|provision_toolchain| {
+        let payload = RoundPayload::for_round(
+            &settings(RUNNABLE),
+            RoundBeforeSettings {
+                provision_toolchain,
+                ..round()
+            },
+        );
+        assert_eq!(payload.provision_toolchain, provision_toolchain);
+    });
 }
 
 #[test]
@@ -60,10 +70,4 @@ fn a_commit_message_is_the_first_line_then_the_whole_prompt() {
 #[test]
 fn a_blank_prompt_still_makes_a_commit_message() {
     assert_eq!(commit_message(JobId::from(7), "  \n"), "job 7: agent work");
-}
-
-#[test]
-fn an_undeclared_provider_cannot_become_a_payload() {
-    let err = RoundPayload::for_round(&config(RUNNABLE), request("other")).unwrap_err();
-    assert!(err.to_string().contains("'other'"), "{err}");
 }

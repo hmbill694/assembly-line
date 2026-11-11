@@ -1,27 +1,42 @@
-use assembly_line::daemon::Daemon;
+use assembly_line::config::{JobSettings, RepoConfig};
+use assembly_line::daemon::api::{Queued, Refused, Submission};
+use assembly_line::daemon::dispatch::{JobQueue, RepoLocks};
+use assembly_line::daemon::submit::accept;
+use assembly_line::daemon::{Daemon, Serving};
 use assembly_line::git::PinnedRef;
 use assembly_line::paths::JobPaths;
-use assembly_line::payload::{
-    FORGE_TOKEN_VAR, GIT_TOKEN_VAR, https_equivalent, is_path_on_this_machine,
-};
+use assembly_line::payload::{FORGE_TOKEN_VAR, GIT_TOKEN_VAR};
+use assembly_line::remote::Remote;
+use assembly_line::report::{JobRequests, RoundRequest};
 use assembly_line::runner::docker::{DockerRunner, docker_create_args};
+use assembly_line::runner::kubernetes::KubernetesRunner;
 use assembly_line::runner::local::{LocalRound, LocalRunner};
 use assembly_line::runner::{
-    JobSecrets, LaunchSpec, RoundHandle, Runner, RunnerProblem, reasons_a_container_cannot_run,
+    JobSecrets, LaunchSpec, Reach, RoundEnvironment, RoundHandle, Runner, RunnerProblem,
 };
+use chrono::Utc;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
-/// A runner that reports `problems` and never launches, running rounds in a
-/// container or not as `IN_A_CONTAINER` says.
+/// A runner that reports `problems` and never launches, running rounds
+/// where `R` runs them.
 #[derive(Debug)]
-struct RunnerReporting<const IN_A_CONTAINER: bool> {
+struct RunnerReporting<R> {
     problems: Vec<RunnerProblem>,
+    runs_rounds_like: PhantomData<R>,
 }
 
-impl<const IN_A_CONTAINER: bool> Runner for RunnerReporting<IN_A_CONTAINER> {
+fn reporting<R>(problems: Vec<RunnerProblem>) -> RunnerReporting<R> {
+    RunnerReporting {
+        problems,
+        runs_rounds_like: PhantomData,
+    }
+}
+
+impl<R: Runner> Runner for RunnerReporting<R> {
     type Running = LocalRound;
-    const RUNS_IN_A_CONTAINER: bool = IN_A_CONTAINER;
+    const ENVIRONMENT: RoundEnvironment = R::ENVIRONMENT;
 
     fn reasons_it_cannot_run(&self) -> impl Future<Output = Vec<RunnerProblem>> + Send {
         std::future::ready(self.problems.clone())
@@ -44,9 +59,6 @@ impl<const IN_A_CONTAINER: bool> Runner for RunnerReporting<IN_A_CONTAINER> {
     }
 }
 
-type HostRunner = RunnerReporting<false>;
-type ContainerRunner = RunnerReporting<true>;
-
 fn unreachable_runner() -> RunnerProblem {
     RunnerProblem::Unreachable {
         runner: "docker",
@@ -58,55 +70,6 @@ fn host_with_both_tokens(name: &str) -> Option<String> {
     [GIT_TOKEN_VAR, FORGE_TOKEN_VAR]
         .contains(&name)
         .then(|| "t0ken".to_string())
-}
-
-#[test]
-fn ssh_remotes_become_the_https_url_a_token_can_authenticate() {
-    assert_eq!(
-        https_equivalent("git@github.com:o/r.git"),
-        "https://github.com/o/r.git"
-    );
-    assert_eq!(
-        https_equivalent("ssh://git@github.com/o/r.git"),
-        "https://github.com/o/r.git"
-    );
-    assert_eq!(
-        https_equivalent("ssh://git@github.com:22/o/r.git"),
-        "https://github.com/o/r.git"
-    );
-    assert_eq!(
-        https_equivalent("git@git.example.com:/srv/r.git"),
-        "https://git.example.com/srv/r.git"
-    );
-}
-
-/// An IPv6 literal's own colons are not the port's, nor scp-like's.
-#[test]
-fn an_ipv6_host_keeps_its_brackets() {
-    assert_eq!(
-        https_equivalent("ssh://git@[::1]/o/r.git"),
-        "https://[::1]/o/r.git"
-    );
-    assert_eq!(
-        https_equivalent("ssh://git@[::1]:22/o/r.git"),
-        "https://[::1]/o/r.git"
-    );
-    assert_eq!(
-        https_equivalent("git@[::1]:o/r.git"),
-        "https://[::1]/o/r.git"
-    );
-}
-
-#[test]
-fn urls_a_token_already_works_with_are_left_alone() {
-    for url in [
-        "https://github.com/o/r.git",
-        "/tmp/origin.git",
-        "file:///tmp/origin.git",
-        "../origin",
-    ] {
-        assert_eq!(https_equivalent(url), url);
-    }
 }
 
 #[test]
@@ -198,10 +161,11 @@ fn passing_a_variable_assembly_line_sets_itself_is_refused() {
 const NETWORK_REMOTE: &str = "https://github.com/o/r.git";
 
 #[test]
-fn a_remote_that_is_a_path_on_this_machine_cannot_run_in_a_container() {
+fn a_round_that_reaches_only_network_remotes_cannot_reach_a_path_on_this_machine() {
+    let reasons = |url| Reach::FromAnywhere.reasons_it_cannot_reach(&Remote::from_url(url));
     for url in ["/tmp/origin.git", "../origin", "file:///tmp/origin.git"] {
         assert_eq!(
-            reasons_a_container_cannot_run(url),
+            reasons(url),
             [RunnerProblem::RemoteIsLocalPath { url: url.into() }],
             "{url}"
         );
@@ -211,7 +175,7 @@ fn a_remote_that_is_a_path_on_this_machine_cannot_run_in_a_container() {
         "git@github.com:o/r.git",
         "ssh://git@github.com/o/r.git",
     ] {
-        assert!(!is_path_on_this_machine(url), "{url}");
+        assert_eq!(reasons(url), [], "{url}");
     }
 }
 
@@ -224,33 +188,34 @@ async fn daemon_on<R: Runner>(
     Daemon::prepare(PathBuf::from("/unused"), runner, 1, &pass_env, host).await
 }
 
-/// The host's own credentials are all there for a round that runs beside
-/// them.
-#[tokio::test]
-async fn a_host_runner_carries_no_secrets() {
-    let daemon = daemon_on(
-        HostRunner {
-            problems: Vec::new(),
-        },
-        &["ANTHROPIC_API_KEY"],
-        |_| None,
-    )
+/// What a daemon on `R` sends each round from a host that has every
+/// variable, when `--pass-env` names `ANTHROPIC_API_KEY`.
+async fn secrets_sent_on<R: Runner>() -> Vec<String> {
+    daemon_on(reporting::<R>(Vec::new()), &["ANTHROPIC_API_KEY"], |name| {
+        Some(format!("value of {name}"))
+    })
     .await
-    .unwrap();
+    .unwrap()
+    .secrets()
+    .names()
+    .into_iter()
+    .collect()
+}
 
-    assert!(
-        daemon.secrets().names().is_empty(),
-        "{:?}",
-        daemon.secrets()
-    );
+/// A round on the host has the host's own credentials; a round in a
+/// container has only what is sent to it.
+#[tokio::test]
+async fn only_a_container_runner_sends_secrets() {
+    let sent = ["ANTHROPIC_API_KEY", GIT_TOKEN_VAR, FORGE_TOKEN_VAR];
+    assert_eq!(secrets_sent_on::<LocalRunner>().await, [] as [&str; 0]);
+    assert_eq!(secrets_sent_on::<DockerRunner>().await, sent);
+    assert_eq!(secrets_sent_on::<KubernetesRunner>().await, sent);
 }
 
 #[tokio::test]
 async fn a_host_runner_is_refused_for_its_own_problems() {
     let problems = daemon_on(
-        HostRunner {
-            problems: vec![unreachable_runner()],
-        },
+        reporting::<LocalRunner>(vec![unreachable_runner()]),
         &[],
         |_| None,
     )
@@ -260,30 +225,73 @@ async fn a_host_runner_is_refused_for_its_own_problems() {
     assert_eq!(problems, [unreachable_runner()]);
 }
 
-#[tokio::test]
-async fn a_container_runner_carries_both_tokens_from_the_host() {
-    let daemon = daemon_on(
-        ContainerRunner {
-            problems: Vec::new(),
+/// How a daemon on `R` answers a submit whose remote is a path on this
+/// machine that holds no repository.
+async fn answer_to_a_local_path_on<R: Runner>() -> Result<Queued, Refused> {
+    let root = tempfile::tempdir().unwrap();
+    let serving = Serving {
+        daemon: Daemon::prepare(
+            root.path().to_path_buf(),
+            reporting::<R>(Vec::new()),
+            1,
+            &[],
+            |name| Some(format!("value of {name}")),
+        )
+        .await
+        .unwrap(),
+        repos: RepoLocks::default(),
+        queue: JobQueue::new().0,
+    };
+    accept(
+        &serving,
+        Submission {
+            remote_url: "/nonexistent/origin.git".into(),
+            base_ref: Some("main".into()),
+            job: None,
+            prompt: "x".into(),
+            provider: None,
         },
-        &[],
-        host_with_both_tokens,
     )
     .await
-    .unwrap();
+}
 
+/// A container cannot see the host's paths, so a container runner refuses
+/// the remote before looking at it; the host runner goes on to find that
+/// nothing is there.
+#[tokio::test]
+async fn only_a_container_runner_refuses_a_remote_that_is_a_local_path() {
+    let for_being_a_local_path = Refused {
+        summary: "the job cannot run on this daemon's runner".into(),
+        reasons: vec![
+            RunnerProblem::RemoteIsLocalPath {
+                url: "/nonexistent/origin.git".into(),
+            }
+            .to_string(),
+        ],
+    };
+
+    let local = answer_to_a_local_path_on::<LocalRunner>()
+        .await
+        .unwrap_err();
+    assert_ne!(local.summary, for_being_a_local_path.summary, "{local:?}");
     assert_eq!(
-        daemon.secrets().names().into_iter().collect::<Vec<_>>(),
-        [GIT_TOKEN_VAR, FORGE_TOKEN_VAR]
+        answer_to_a_local_path_on::<DockerRunner>()
+            .await
+            .unwrap_err(),
+        for_being_a_local_path
+    );
+    assert_eq!(
+        answer_to_a_local_path_on::<KubernetesRunner>()
+            .await
+            .unwrap_err(),
+        for_being_a_local_path
     );
 }
 
 #[tokio::test]
 async fn every_reason_a_container_runner_cannot_run_is_reported_at_once() {
     let problems = daemon_on(
-        ContainerRunner {
-            problems: vec![unreachable_runner()],
-        },
+        reporting::<DockerRunner>(vec![unreachable_runner()]),
         &["ANTHROPIC_API_KEY"],
         host_with_both_tokens,
     )
@@ -302,8 +310,35 @@ async fn every_reason_a_container_runner_cannot_run_is_reported_at_once() {
 fn base() -> PinnedRef {
     PinnedRef {
         name: "main".into(),
-        sha: "a".repeat(40),
+        sha: "a".repeat(40).parse().unwrap(),
     }
+}
+
+/// A job asked for once, so its first request is its latest.
+fn requests(remote_url: &str, prompt: &str, provider: &str) -> JobRequests {
+    let request = RoundRequest {
+        remote_url: remote_url.into(),
+        base: base(),
+        prompt: prompt.into(),
+        provider: provider.into(),
+        requested_at: Utc::now(),
+    };
+    JobRequests {
+        first: request.clone(),
+        latest: request,
+    }
+}
+
+fn settings(max_duration: Option<&str>) -> JobSettings {
+    let limit = max_duration
+        .map(|limit| format!("max_duration = \"{limit}\"\n"))
+        .unwrap_or_default();
+    RepoConfig::parse(&format!(
+        "provider = \"p\"\n{limit}[providers.p]\ncmd = \"true\"\n"
+    ))
+    .unwrap()
+    .settings_for(None)
+    .unwrap()
 }
 
 fn job(id: u64) -> JobPaths {
@@ -348,14 +383,12 @@ async fn a_round_launched_by_another_runner_is_not_reattached() {
 
 #[test]
 fn a_container_round_runs_assembly_run_over_https_and_provisions_first() {
-    let spec = LaunchSpec::for_round::<ContainerRunner>(
+    let spec = LaunchSpec::for_round::<DockerRunner>(
         &job(7),
         2,
-        "git@github.com:o/r.git",
+        &requests("git@github.com:o/r.git", "fix it", "claude"),
         &base(),
-        "fix it",
-        "claude",
-        Some(60),
+        &settings(Some("1m")),
     );
 
     assert_eq!(
@@ -379,43 +412,52 @@ fn a_container_round_runs_assembly_run_over_https_and_provisions_first() {
     );
 }
 
-#[test]
-fn a_host_round_runs_assembly_run_with_the_remote_and_toolchain_as_they_are() {
-    let spec = LaunchSpec::for_round::<HostRunner>(
-        &job(7),
+fn provisions_the_toolchain<R: Runner>() -> bool {
+    LaunchSpec::for_round::<R>(
+        &job(1),
         1,
-        "git@github.com:o/r.git",
+        &requests(NETWORK_REMOTE, "x", "p"),
         &base(),
-        "x",
-        "claude",
-        None,
-    );
-
-    assert!(
-        spec.args
-            .contains(&"--repo=git@github.com:o/r.git".to_string())
-    );
-    assert!(!spec.args.contains(&"--provision-toolchain".to_string()));
+        &settings(None),
+    )
+    .args
+    .contains(&"--provision-toolchain".to_string())
 }
 
-/// A remote that is a path could be read by `run` as a checkout whose own
-/// remote is somewhere else; a URL cannot.
+/// A round on the host uses the host's toolchain; a container brings none.
 #[test]
-fn a_host_round_names_a_remote_on_this_machine_by_its_file_url() {
-    let spec = LaunchSpec::for_round::<HostRunner>(
-        &job(7),
-        1,
-        "/srv/origin",
-        &base(),
-        "x",
-        "claude",
-        None,
-    );
+fn only_a_container_runner_provisions_the_toolchain() {
+    assert!(!provisions_the_toolchain::<LocalRunner>());
+    assert!(provisions_the_toolchain::<DockerRunner>());
+    assert!(provisions_the_toolchain::<KubernetesRunner>());
+}
 
-    assert!(
-        spec.args.contains(&"--repo=file:///srv/origin".to_string()),
-        "{:?}",
-        spec.args
+/// A revise records the URL as it was typed, which can be another spelling
+/// of the job's remote; the job still pushes where its first request said.
+#[test]
+fn a_revised_round_runs_against_the_first_remote_with_the_latest_prompt() {
+    let revised = JobRequests {
+        latest: RoundRequest {
+            remote_url: "ssh://git@github.com/o/r".into(),
+            prompt: "now the tests".into(),
+            provider: "codex".into(),
+            ..requests("git@github.com:o/r.git", "x", "claude").latest
+        },
+        ..requests("git@github.com:o/r.git", "fix it", "claude")
+    };
+
+    let spec = LaunchSpec::for_round::<LocalRunner>(&job(7), 2, &revised, &base(), &settings(None));
+
+    assert_eq!(
+        spec.args[1..],
+        [
+            "--repo=git@github.com:o/r.git".to_string(),
+            format!("--ref=main@{}", "a".repeat(40)),
+            "--job=7".into(),
+            "--prompt=now the tests".into(),
+            "--provider=codex".into(),
+            "--frames".into(),
+        ]
     );
 }
 
@@ -423,14 +465,12 @@ fn a_host_round_names_a_remote_on_this_machine_by_its_file_url() {
 /// can be mistaken for a flag.
 #[test]
 fn every_value_on_the_command_line_is_attached_to_its_flag() {
-    let spec = LaunchSpec::for_round::<HostRunner>(
+    let spec = LaunchSpec::for_round::<LocalRunner>(
         &job(1),
         1,
-        "/o.git",
+        &requests("/o.git", "--frames\n\"quoted\"", "p"),
         &base(),
-        "--frames\n\"quoted\"",
-        "p",
-        None,
+        &settings(None),
     );
 
     assert!(

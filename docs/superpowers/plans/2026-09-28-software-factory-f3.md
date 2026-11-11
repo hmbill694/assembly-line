@@ -16,17 +16,16 @@ Known places this plan is stale, so that nobody copies them back in:
 
 Known open:
 
-- Nested `RepoKey` paths can collide: `/x/a.git` and `/x/a/7.git`.
+- ~~Nested `RepoKey` paths can collide: `/x/a.git` and `/x/a/7.git`.~~
+  Fixed by arch #5: one flat directory per repository, segments joined
+  with `~`.
 - A revise's pull request takes its title and body from the feedback
   alone when no pull request is open yet.
-- A refusal inside `run` shows in `status` only as "ended without reporting
-  a verdict: exit 2"; its reason is in `assembly logs`.
 - A revise cancelled before it starts shows "failed (round 1)", naming the
   round before it.
-- A round with a verdict still delivering when the daemon stops loses its
-  `PullRequestOpened` event; the pull request is still opened.
-- `tests/kubernetes_runner.rs` cancels after a fixed 300ms and may be
-  timing-sensitive.
+- Fixed by #11 of the architecture handoff: `tests/kubernetes_runner.rs`
+  cancelled after a fixed 300ms; it now cancels once the fake has been
+  asked for `get pods`.
 - The stack's revisions below `rtuzrxvq` still carry the flaky
   `cancelling_a_round_stops_a_clone_in_progress`; `rtuzrxvq` fixes it.
 

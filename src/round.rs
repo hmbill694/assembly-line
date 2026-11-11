@@ -9,19 +9,15 @@
 use crate::event::EventKind;
 use crate::exec::{ShellOutcome, run_command, run_shell};
 use crate::frame::FrameWriter;
-use crate::git;
-use crate::payload::{GIT_TOKEN_VAR, RoundPayload};
+use crate::git::{self, CommitId};
+use crate::job::JobId;
+use crate::payload::RoundPayload;
 use crate::provider::CommandSpec;
-use crate::workspace::{self, RoundWorkspace};
+use crate::workspace::{self, PROVISIONING_LIMIT, RoundWorkspace, ScratchClone};
 use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
-
-/// How long cloning and provisioning may take together. Not `max_duration`:
-/// that is the repository's statement about its own commands, and a cold
-/// toolchain install should not eat the agent's budget.
-pub const PROVISIONING_LIMIT: Duration = Duration::from_mins(15);
 
 /// `mise trust` first: `mise` refuses to act on a `mise.toml` in a directory
 /// it has not been told to trust, and a fresh clone is exactly that.
@@ -43,14 +39,91 @@ impl Verdict {
     }
 }
 
+/// A round's verdict and the events that record it — always the last a
+/// round reports.
+#[derive(Debug)]
+struct RoundClosing {
+    verdict: Verdict,
+    events: Vec<EventKind>,
+}
+
+impl RoundClosing {
+    fn passed() -> Self {
+        Self {
+            verdict: Verdict::Passed,
+            events: vec![EventKind::RoundPassed],
+        }
+    }
+
+    fn failed_because(reason: String) -> Self {
+        Self {
+            verdict: Verdict::Failed,
+            events: vec![EventKind::RoundFailed { reason }],
+        }
+    }
+}
+
+/// A round whose work is recorded but whose verdict is not, holding its
+/// checkout until [`FinishedRound::close`].
+#[derive(Debug)]
+#[must_use = "a round reports its verdict and discards its checkout only when closed"]
+pub struct FinishedRound {
+    closing: RoundClosing,
+    branch_tip: CommitId,
+    workspace: Option<RoundWorkspace>,
+}
+
+impl FinishedRound {
+    #[must_use]
+    pub fn verdict(&self) -> Verdict {
+        self.closing.verdict
+    }
+
+    /// The commit the round left the job's branch at on the remote: its own,
+    /// or the one it started from when it pushed nothing.
+    #[must_use]
+    pub fn branch_tip(&self) -> &CommitId {
+        &self.branch_tip
+    }
+
+    /// The round's checkout, which is where `gh` runs. `None` for a round
+    /// that failed before it had one.
+    #[must_use]
+    pub fn workspace_path(&self) -> Option<&Path> {
+        self.workspace.as_ref().map(RoundWorkspace::path)
+    }
+
+    /// The same round, failed for `reason` whatever it ended as.
+    pub fn failed_because(self, reason: String) -> Self {
+        Self {
+            closing: RoundClosing::failed_because(reason),
+            ..self
+        }
+    }
+
+    /// Report the verdict, then discard the checkout.
+    ///
+    /// # Errors
+    ///
+    /// When the frames cannot be written.
+    pub fn close<W: Write>(self, frames: &FrameWriter<W>) -> std::io::Result<Verdict> {
+        let FinishedRound {
+            closing, workspace, ..
+        } = self;
+        append_all(frames, closing.events)?;
+        workspace.map_or(Ok(()), |ws| discard_reporting_failure(ws, frames))?;
+        Ok(closing.verdict)
+    }
+}
+
 /// What an agent left behind, recorded on the job's branch.
 #[derive(Debug)]
 struct AgentWork {
-    branch: String,
-    sha: String,
+    job: JobId,
+    sha: CommitId,
     stat: git::DiffStat,
-    /// The remote the branch reached. A round that could not push has no
-    /// `AgentWork` at all.
+    /// The URL of the remote the branch reached. A round that could not push
+    /// has no `AgentWork` at all.
     pushed_to: String,
 }
 
@@ -75,14 +148,20 @@ enum RoundResult {
     },
 }
 
+impl RoundResult {
+    fn work(&self) -> Option<&AgentWork> {
+        match self {
+            Self::PassedUnchanged => None,
+            Self::PassedWithWork { work } => Some(work),
+            Self::Rejected { work, .. } | Self::Failed { work, .. } => work.as_ref(),
+        }
+    }
+}
+
 /// Remove the round's checkout. That is housekeeping: failing at it neither
 /// undoes a pushed branch nor says anything about the work, so it is
 /// reported as output rather than allowed to replace what the round did.
-///
-/// # Errors
-///
-/// Only when the report cannot be written.
-pub fn discard_reporting_failure<W: Write>(
+fn discard_reporting_failure<W: Write>(
     ws: RoundWorkspace,
     frames: &FrameWriter<W>,
 ) -> std::io::Result<()> {
@@ -92,24 +171,53 @@ pub fn discard_reporting_failure<W: Write>(
     }
 }
 
-/// One round in `ws`, which the caller cloned and will discard: provision,
-/// agent, commit, push, `verify`, and the events that record them. No
-/// `RoundStarted`: whoever collects the round numbers it.
+/// One round in `clone`: check out the job's branch, provision, agent,
+/// commit, push, `verify`, and the events that record its work. No
+/// `RoundStarted`: whoever collects the round numbers it. The verdict waits
+/// in the [`FinishedRound`] until it is closed.
 ///
 /// `provisioning_deadline` is what is left of the budget the clone and
 /// provisioning share, fixed before the clone began.
 ///
 /// # Errors
 ///
-/// Only when the round's frames cannot be written. An agent that fails and a
-/// push that fails are both [`Verdict::Failed`], reported as events.
-pub async fn run_round_in<W: Write + Send + 'static>(
+/// Only when the round's frames cannot be written. A checkout that cannot be
+/// started, an agent that fails and a push that fails all finish the round
+/// as [`Verdict::Failed`].
+pub async fn run_round<W: Write + Send + 'static>(
+    clone: ScratchClone,
+    payload: &RoundPayload,
+    frames: &FrameWriter<W>,
+    provisioning_deadline: Instant,
+    cancel: CancellationToken,
+) -> anyhow::Result<FinishedRound> {
+    match workspace::start_round(clone, &payload.start, payload.job_id).await {
+        Ok(ws) => {
+            let (branch_tip, closing) =
+                run_round_in(payload, &ws, frames, provisioning_deadline, cancel).await?;
+            Ok(FinishedRound {
+                closing,
+                branch_tip,
+                workspace: Some(ws),
+            })
+        }
+        Err(e) => Ok(FinishedRound {
+            closing: RoundClosing::failed_because(e.to_string()),
+            branch_tip: payload.start.sha.clone(),
+            workspace: None,
+        }),
+    }
+}
+
+/// The round in `ws`, its work events written, and the commit it left the
+/// branch at with its closing events, unwritten.
+async fn run_round_in<W: Write + Send + 'static>(
     payload: &RoundPayload,
     ws: &RoundWorkspace,
     frames: &FrameWriter<W>,
     provisioning_deadline: Instant,
     cancel: CancellationToken,
-) -> anyhow::Result<Verdict> {
+) -> anyhow::Result<(CommitId, RoundClosing)> {
     let timeout = payload.command_limit_secs.map(Duration::from_secs);
     let result = result_in_workspace(payload, ws, frames, provisioning_deadline, timeout, cancel)
         .await
@@ -121,40 +229,12 @@ pub async fn run_round_in<W: Write + Send + 'static>(
             work: None,
         });
 
-    record_completion(frames, result)
-}
-
-/// `cloning`, cut off at [`PROVISIONING_LIMIT`] or by `cancel`.
-///
-/// Unlike `mise`, a clone may be dropped from outside, because dropping
-/// `git` kills its whole process group (`git::run_allowing_failure`).
-///
-/// # Errors
-///
-/// The clone's own error, or one saying it timed out or was cancelled.
-pub async fn within_provisioning_limit<T>(
-    cloning: impl Future<Output = anyhow::Result<T>>,
-    cancel: &CancellationToken,
-) -> anyhow::Result<T> {
-    tokio::select! {
-        cloned = tokio::time::timeout(PROVISIONING_LIMIT, cloning) => cloned.map_err(|_| {
-            anyhow::anyhow!(
-                "provisioning timed out after {}",
-                humantime::format_duration(PROVISIONING_LIMIT)
-            )
-        })?,
-        () = cancel.cancelled() => Err(anyhow::anyhow!("cancelled")),
-    }
-}
-
-/// The credential helper a job's clone authenticates with. A container
-/// runner always sends the token, having no other credentials to offer;
-/// without one, git uses whatever this environment already has.
-#[must_use]
-pub fn credential_helper_for_this_environment() -> Option<&'static str> {
-    std::env::var_os(GIT_TOKEN_VAR)
-        .is_some()
-        .then_some(git::TOKEN_CREDENTIAL_HELPER)
+    let branch_tip = result
+        .work()
+        .map_or_else(|| payload.start.sha.clone(), |work| work.sha.clone());
+    let (work, closing) = events_for_completion(result);
+    append_all(frames, work)?;
+    Ok((branch_tip, closing))
 }
 
 /// One round in a checkout it is handed.
@@ -335,24 +415,17 @@ async fn agent_work_on_branch(
     workspace::publish(ws).await?;
 
     Ok(Some(AgentWork {
-        branch: ws.branch.clone(),
+        job: payload.job_id,
         sha,
         stat,
-        pushed_to: payload.remote_name.clone(),
+        pushed_to: ws.remote().url().to_string(),
     }))
 }
 
-fn record_completion<W: Write>(
-    frames: &FrameWriter<W>,
-    result: RoundResult,
-) -> anyhow::Result<Verdict> {
-    let (events, verdict) = events_for_completion(result);
-
+fn append_all<W: Write>(frames: &FrameWriter<W>, events: Vec<EventKind>) -> std::io::Result<()> {
     events
         .into_iter()
-        .try_for_each(|kind| frames.append_event(kind).map(|_| ()))?;
-
-    Ok(verdict)
+        .try_for_each(|kind| frames.append_event(kind).map(|_| ()))
 }
 
 /// Empty for an agent that correctly changed nothing.
@@ -360,13 +433,13 @@ fn work_recorded(work: Option<&AgentWork>) -> Vec<EventKind> {
     work.map(|w| {
         vec![
             EventKind::RoundCommitted {
-                sha: w.sha.clone(),
+                sha: w.sha.to_string(),
                 files: w.stat.files,
                 insertions: w.stat.insertions,
                 deletions: w.stat.deletions,
             },
             EventKind::BranchPushed {
-                branch: w.branch.clone(),
+                branch: w.job.branch_name(),
                 pushed_to: w.pushed_to.clone(),
             },
         ]
@@ -374,41 +447,36 @@ fn work_recorded(work: Option<&AgentWork>) -> Vec<EventKind> {
     .unwrap_or_default()
 }
 
-/// The events a completion implies, in the order things settled, paired with
-/// the verdict they add up to.
+/// The events a completion implies, in the order things settled: those
+/// recording the work, then those closing the round with the verdict they
+/// add up to.
 ///
-/// Pure, so the ordering that makes replay correct can be asserted without
-/// running anything. Work is recorded before the verdict that judges it.
-fn events_for_completion(result: RoundResult) -> (Vec<EventKind>, Verdict) {
+/// A verdict is the last event a round reports. A restarted daemon replays
+/// each job's log and owes nothing to a round with a verdict, so it would
+/// never reattach to collect an event the round reported after one.
+fn events_for_completion(result: RoundResult) -> (Vec<EventKind>, RoundClosing) {
     match result {
-        RoundResult::PassedUnchanged => (vec![EventKind::RoundPassed], Verdict::Passed),
-        RoundResult::PassedWithWork { work } => (
-            work_recorded(Some(&work))
-                .into_iter()
-                .chain([EventKind::RoundPassed])
-                .collect(),
-            Verdict::Passed,
-        ),
+        RoundResult::PassedUnchanged => (Vec::new(), RoundClosing::passed()),
+        RoundResult::PassedWithWork { work } => {
+            (work_recorded(Some(&work)), RoundClosing::passed())
+        }
         RoundResult::Rejected { reason, work } => (
-            work_recorded(work.as_ref())
-                .into_iter()
-                .chain([
+            work_recorded(work.as_ref()),
+            RoundClosing {
+                verdict: Verdict::Failed,
+                events: vec![
                     EventKind::VerifyRejected {
                         reason: reason.clone(),
                     },
                     EventKind::RoundFailed {
                         reason: format!("verify rejected the work: {reason}"),
                     },
-                ])
-                .collect(),
-            Verdict::Failed,
+                ],
+            },
         ),
         RoundResult::Failed { reason, work } => (
-            work_recorded(work.as_ref())
-                .into_iter()
-                .chain([EventKind::RoundFailed { reason }])
-                .collect(),
-            Verdict::Failed,
+            work_recorded(work.as_ref()),
+            RoundClosing::failed_because(reason),
         ),
     }
 }
@@ -429,13 +497,10 @@ mod provisioning_tests {
     fn payload_asking_for_provisioning() -> RoundPayload {
         RoundPayload {
             job_id: 1.into(),
-            remote_url: "does-not-matter".to_string(),
-            remote_name: "origin".to_string(),
             start: PinnedRef {
                 name: "main".to_string(),
-                sha: "0".repeat(40),
+                sha: "0".repeat(40).parse().unwrap(),
             },
-            branch: "al/job-1".to_string(),
             command: CommandSpec {
                 program: "true".to_string(),
                 args: Vec::new(),

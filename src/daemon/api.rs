@@ -1,9 +1,10 @@
 //! What travels over the daemon's socket, and the routes that answer it.
 
-use super::dispatch::{CANCELLED_BEFORE_IT_STARTED, JobAddress};
+use super::dispatch::CANCELLED_BEFORE_IT_STARTED;
 use super::{Serving, submit};
 use crate::job::JobId;
-use crate::paths::RepoKey;
+use crate::paths::JobPlace;
+use crate::remote::Remote;
 use crate::runner::Runner;
 use crate::state::JobState;
 use axum::extract::State;
@@ -115,15 +116,16 @@ async fn cancel_job<R: Runner + Send + Sync + 'static>(
             }),
         )
     };
-    let key = RepoKey::from_remote_url(&request.remote_url).map_err(|e| refuse(e.to_string()))?;
-    let address = JobAddress {
-        jobs_dir: key.jobs_dir(&serving.daemon.root),
+    let key = Remote::from_url(request.remote_url)
+        .repo_key()
+        .map_err(|e| refuse(e.to_string()))?;
+    let place = JobPlace {
         key,
         id: JobId::from(request.job),
     };
     serving
         .queue
-        .cancel(&address)
+        .cancel(&place, &serving.daemon.root)
         .map(|was| {
             Json(Cancelling {
                 job: request.job,

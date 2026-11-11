@@ -122,9 +122,14 @@ everything the daemon writes. A lock file allows one daemon per root.
 
 ```
 <root>/daemon.sock  daemon.lock
-<root>/repos/<host>/<owner>/<name>.git          bare; claim refs and config reads only
-<root>/jobs/<host>/<owner>/<name>/<id>/events.jsonl  job.log  frames
+<root>/repos/<host>~<owner>~<name>.git          bare; claim refs and config reads only
+<root>/jobs/<host>~<owner>~<name>/<id>/events.jsonl  job.log  frames
 ```
+
+One flat directory per repository, its key's segments joined with `~`, so
+no repository's directory is inside another's. A repository on this
+machine has the host `@local`: `/srv/git/origin.git` is
+`<root>/jobs/@local~srv~git~origin/`.
 
 **The API** is two routes over the socket: `POST /jobs` submits a new job or
 a new round of an existing one, and `POST /jobs/…/cancel` stops one; a health
@@ -277,7 +282,7 @@ service accounts) comes for free, and the implementors stay testable offline
 against shell-script fakes of `docker` and `kubectl`. Moving one implementor
 to its API later is invisible above the trait.
 
-**What runs inside the boundary is the whole job, as `assembly run`** — the
+**What runs inside the boundary is one round, as `assembly run`** — the
 command a human types. It claims an id unless given `--job`, clones the job's
 branch into scratch, reads and validates the config at the base SHA,
 provisions the toolchain when told to, runs the agent, commits, runs
@@ -599,7 +604,7 @@ would need a cluster, and none is part of the suite.
 |---|---|
 | **F1** ✅ | Subtraction. Delete the DAG, run branch, merge, shell nodes, graph loading, review inbox. `assembly run --repo --ref --prompt` is a single job. `verify` enforced. `.assembly/config.toml`. |
 | **F2** ✅ | The runner seam. One trait; local, `docker run`, and k8s Job implementors driving their CLIs. The whole job inside the boundary as `job-exec`; clone, push or fail. NDJSON frames on stdout. Host-resolved payload. Host-chosen per-job credentials. One published image; `mise` provisioning. |
-| **F3** ✅ | The daemon. `assembly run` is the whole job and what every runner launches; `job-exec`, `revise` and `copy` go. `assembly daemon` with one runner and a concurrency cap; job state, a bare claim cache and an HTTP-over-Unix-socket API under its own root. Preflight and claim-by-ref at submit; queue; fold across all jobs; cancel; reattach for every runner. `submit`, `cancel`; `status` and `logs` read the root. |
+| **F3** ✅ | The daemon. `assembly run` is one round and what every runner launches; `job-exec`, `revise` and `copy` go. `assembly daemon` with one runner and a concurrency cap; job state, a bare claim cache and an HTTP-over-Unix-socket API under its own root. Preflight and claim-by-ref at submit; queue; fold across all jobs; cancel; reattach for every runner. `submit`, `cancel`; `status` and `logs` read the root. |
 | **F4** | Sources and the watcher. Source trait; GitHub issues and Slack. Claim-by-ref, ordering, fairness, dispatch, pull request delivery. Stretch: short-lived, per-job git credentials minted from a GitHub App. |
 | **F5** | The tester loop. CI, mergeability and comment signals; budget and refill; `needs-human` escalation; the `auto-merge` path. |
 | **F6** | The web UI, served by the daemon. |

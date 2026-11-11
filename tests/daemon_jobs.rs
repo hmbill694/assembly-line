@@ -4,9 +4,12 @@
 use assembly_line::config::REPO_CONFIG_PATH;
 use assembly_line::daemon::{self, Daemon, fleet};
 use assembly_line::event::{EventKind, EventLog};
-use assembly_line::paths::RepoKey;
-use assembly_line::runner::local::LocalRound;
-use assembly_line::runner::{JobSecrets, LaunchSpec, RoundHandle, Runner, RunnerProblem};
+use assembly_line::paths::{JobPaths, JobPlace};
+use assembly_line::remote::Remote;
+use assembly_line::runner::local::{LocalRound, LocalRunner};
+use assembly_line::runner::{
+    JobSecrets, LaunchSpec, RoundEnvironment, RoundHandle, Runner, RunnerProblem,
+};
 use assembly_line::state::JobState;
 use assert_cmd::Command;
 use chrono::{DateTime, Utc};
@@ -43,10 +46,25 @@ impl Fixture {
     }
 
     async fn repository(config: &str) -> Self {
+        Self::configured(&format!("{config}\n{DELIVERY_OFF}")).await
+    }
+
+    /// Like [`Fixture::running`], but its passing rounds open pull requests
+    /// through whatever `gh` the daemon's `PATH` finds.
+    async fn delivering(script: &str, daemon_env: &[(&str, &str)]) -> Self {
+        let fx = Self::configured(&format!(
+            "verify = \"true\"\n{}",
+            support::config_running(script)
+        ))
+        .await;
+        fx.with_daemon(&[], daemon_env)
+    }
+
+    async fn configured(config: &str) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let origin = tmp.path().join("origin.git");
-        publish_opted_in_repository(&repo, &origin, config).await;
+        publish_configured_repository(&repo, &origin, config).await;
         Fixture {
             daemon: None,
             tmp,
@@ -77,11 +95,18 @@ impl Fixture {
         self.tmp.path().join("root")
     }
 
+    fn job(&self, id: u64) -> JobPaths {
+        JobPlace {
+            key: Remote::from_url(self.origin.to_str().unwrap())
+                .repo_key()
+                .unwrap(),
+            id: id.into(),
+        }
+        .paths(&self.root())
+    }
+
     fn job_dir(&self, id: u64) -> PathBuf {
-        RepoKey::from_remote_url(self.origin.to_str().unwrap())
-            .unwrap()
-            .jobs_dir(&self.root())
-            .join(id.to_string())
+        self.job(id).dir
     }
 
     fn events_of(&self, id: u64) -> Vec<EventKind> {
@@ -114,7 +139,9 @@ impl Drop for Fixture {
         let pids: Vec<Pid> = fleet::jobs_under(&self.root())
             .unwrap_or_default()
             .iter()
-            .flat_map(|(address, _)| EventLog::read(address.paths().events()).unwrap_or_default())
+            .flat_map(|(place, _)| {
+                EventLog::read(place.paths(&self.root()).events()).unwrap_or_default()
+            })
             .filter_map(|event| match event.kind {
                 EventKind::RoundLaunched {
                     handle: RoundHandle::Local { pid, .. },
@@ -137,16 +164,20 @@ impl Drop for Fixture {
     }
 }
 
-/// A checkout at `repo` that opts in with `config`, published to a bare
-/// `origin`.
+const DELIVERY_OFF: &str = "[delivery]\nmode = \"none\"\n";
+
+/// A checkout at `repo` that opts in with `config` and delivers nothing,
+/// published to a bare `origin`.
 async fn publish_opted_in_repository(repo: &Path, origin: &Path, config: &str) {
+    publish_configured_repository(repo, origin, &format!("{config}\n{DELIVERY_OFF}")).await;
+}
+
+/// A checkout at `repo` whose whole config is `config`, published to a bare
+/// `origin`.
+async fn publish_configured_repository(repo: &Path, origin: &Path, config: &str) {
     support::init_git_repo(repo).await;
     std::fs::create_dir_all(repo.join(".assembly")).unwrap();
-    std::fs::write(
-        repo.join(REPO_CONFIG_PATH),
-        format!("{config}\n[delivery]\nmode = \"none\"\n"),
-    )
-    .unwrap();
+    std::fs::write(repo.join(REPO_CONFIG_PATH), config).unwrap();
     support::commit_all(repo, "opt in").await.unwrap().unwrap();
     support::add_origin(repo, origin).await;
     support::publish_main(repo).await;
@@ -171,7 +202,7 @@ async fn a_submitted_job_is_queued_then_run_by_the_daemon() {
         .assert()
         .success()
         .stdout(contains("job 1 queued on al/job-1"));
-    let report = wait_for_verdict(&fx.job_dir(1));
+    let report = wait_for_verdict(&fx.job(1));
 
     assert_eq!(report.state, JobState::Passed);
     fx.assembly().arg("status").assert().success().stdout(
@@ -229,7 +260,7 @@ async fn a_config_without_verify_is_queued_with_a_warning() {
         .success()
         .stdout(contains("job 1 queued"))
         .stderr(contains("warn:").and(contains("verify")));
-    wait_for_verdict(&fx.job_dir(1));
+    wait_for_verdict(&fx.job(1));
 }
 
 /// Review focus 4.
@@ -258,8 +289,8 @@ async fn two_submits_at_once_to_one_repository_get_two_jobs() {
         outputs.iter().all(|out| out.status.success()),
         "{outputs:?}"
     );
-    assert_eq!(wait_for_verdict(&fx.job_dir(1)).state, JobState::Passed);
-    assert_eq!(wait_for_verdict(&fx.job_dir(2)).state, JobState::Passed);
+    assert_eq!(wait_for_verdict(&fx.job(1)).state, JobState::Passed);
+    assert_eq!(wait_for_verdict(&fx.job(2)).state, JobState::Passed);
 }
 
 /// The cap, proven by observation: every copy of the probe agent records how
@@ -283,7 +314,7 @@ async fn the_daemon_never_runs_more_rounds_at_once_than_its_cap() {
             .success();
     });
     (1..=5).for_each(|id| {
-        assert_eq!(wait_for_verdict(&fx.job_dir(id)).state, JobState::Passed);
+        assert_eq!(wait_for_verdict(&fx.job(id)).state, JobState::Passed);
     });
 
     let seen: Vec<u32> = std::fs::read_to_string(probe.path().join("seen"))
@@ -302,14 +333,14 @@ async fn a_revise_through_the_daemon_is_the_jobs_next_round() {
         .args(["submit", "--prompt", "hi"])
         .assert()
         .success();
-    wait_for_verdict(&fx.job_dir(1));
+    wait_for_verdict(&fx.job(1));
 
     fx.assembly()
         .args(["submit", "--job", "1", "--prompt", "more"])
         .assert()
         .success()
         .stdout(contains("job 1 queued"));
-    wait_for_verdict(&fx.job_dir(1));
+    wait_for_verdict(&fx.job(1));
 
     fx.assembly()
         .args(["status", "1"])
@@ -328,12 +359,12 @@ async fn every_round_asked_for_is_recorded_before_it_starts() {
         .args(["submit", "--prompt", "add auth"])
         .assert()
         .success();
-    wait_for_verdict(&fx.job_dir(1));
+    wait_for_verdict(&fx.job(1));
     fx.assembly()
         .args(["submit", "--job", "1", "--prompt", "use sessions"])
         .assert()
         .success();
-    wait_for_verdict(&fx.job_dir(1));
+    wait_for_verdict(&fx.job(1));
 
     let events = fx.events_of(1);
     let asked_and_started: Vec<String> = events
@@ -365,7 +396,7 @@ async fn a_revise_is_numbered_past_the_highest_round_recorded() {
         .args(["submit", "--prompt", "x"])
         .assert()
         .success();
-    wait_for_verdict(&fx.job_dir(1));
+    wait_for_verdict(&fx.job(1));
     let mut log = EventLog::open_append(fx.job_dir(1).join("events.jsonl")).unwrap();
     log.append(EventKind::RoundStarted { round: 3 }).unwrap();
     log.append(EventKind::RoundPassed).unwrap();
@@ -375,7 +406,7 @@ async fn a_revise_is_numbered_past_the_highest_round_recorded() {
         .assert()
         .success();
 
-    assert_eq!(wait_for_verdict(&fx.job_dir(1)).rounds, 4);
+    assert_eq!(wait_for_verdict(&fx.job(1)).rounds, 4);
 }
 
 #[tokio::test]
@@ -410,7 +441,7 @@ async fn cancelling_a_running_job_stops_its_agent_and_records_it() {
         .success()
         .stdout(contains("job 1: cancelling"));
 
-    let report = wait_for_verdict(&fx.job_dir(1));
+    let report = wait_for_verdict(&fx.job(1));
     assert_eq!(report.state, JobState::Failed);
     assert_eq!(report.detail.as_deref(), Some("cancelled"));
     wait_until_empty(&fx.tmp.path().join("scratch"));
@@ -435,14 +466,17 @@ async fn cancelling_a_queued_job_means_it_never_runs() {
         .success()
         .stdout(contains("job 2: cancelled before it started"));
     fx.assembly().args(["cancel", "1"]).assert().success();
-    assert_eq!(wait_for_verdict(&fx.job_dir(1)).state, JobState::Failed);
+    assert_eq!(wait_for_verdict(&fx.job(1)).state, JobState::Failed);
     // The third job is behind the second in line, so once it runs the
     // dispatcher has had its chance to start the second.
     wait_until_logged(&fx.job_dir(3), "sleeping-agent:");
     fx.assembly().args(["cancel", "3"]).assert().success();
 
-    let second = wait_for_verdict(&fx.job_dir(2));
-    assert_eq!(second.rounds, 0, "the cancelled job was started anyway");
+    let second = wait_for_verdict(&fx.job(2));
+    assert!(
+        !second.any_round_started,
+        "the cancelled job was started anyway"
+    );
     assert_eq!(
         second.detail.as_deref(),
         Some("cancelled before it started")
@@ -458,6 +492,44 @@ async fn cancelling_a_queued_job_means_it_never_runs() {
         "{:?}",
         fx.events_of(2)
     );
+}
+
+/// The round a cancel closed before it started keeps its number, so the
+/// revise after it is the job's second round, not a second first one.
+#[tokio::test]
+async fn a_revise_after_a_cancelled_queued_round_is_the_jobs_second_round() {
+    let fx = Fixture::running("sleeping-agent.sh", &["--max-jobs", "1"], &[]).await;
+    ["first", "second"].iter().for_each(|prompt| {
+        fx.assembly()
+            .args(["submit", "--prompt", prompt])
+            .assert()
+            .success();
+    });
+    wait_until_logged(&fx.job_dir(1), "sleeping-agent:");
+    fx.assembly().args(["cancel", "2"]).assert().success();
+    fx.assembly()
+        .args(["status", "2"])
+        .assert()
+        .success()
+        .stdout(contains(
+            "job 2: failed (round 1) — cancelled before it started",
+        ));
+    fx.assembly()
+        .args(["submit", "--job", "2", "--prompt", "again"])
+        .assert()
+        .success();
+
+    fx.assembly().args(["cancel", "1"]).assert().success();
+    wait_until_logged(&fx.job_dir(2), "sleeping-agent:");
+    fx.assembly().args(["cancel", "2"]).assert().success();
+
+    assert_eq!(wait_for_verdict(&fx.job(2)).rounds, 2);
+    let starts: Vec<EventKind> = fx
+        .events_of(2)
+        .into_iter()
+        .filter(|kind| matches!(kind, EventKind::RoundStarted { .. }))
+        .collect();
+    assert_eq!(starts, [EventKind::RoundStarted { round: 2 }]);
 }
 
 /// A job whose round was dispatched but is still reading its config has not
@@ -486,9 +558,9 @@ async fn cancelling_a_job_still_reading_its_config_closes_it() {
         .success()
         .stdout(contains("job 2: cancelling"));
 
-    let second = wait_for_verdict(&fx.job_dir(2));
+    let second = wait_for_verdict(&fx.job(2));
     std::fs::remove_file(&stall).unwrap();
-    assert_eq!(second.rounds, 0);
+    assert!(!second.any_round_started);
     assert_eq!(
         second.detail.as_deref(),
         Some("cancelled before it started")
@@ -547,47 +619,115 @@ async fn a_job_in_line_twice_is_launched_once() {
         .assert()
         .success();
     fx.assembly().args(["cancel", "3"]).assert().success();
-    let third = wait_for_verdict(&fx.job_dir(3));
+    let third = wait_for_verdict(&fx.job(3));
     std::fs::remove_file(&stall).unwrap();
-    assert_eq!(third.rounds, 0, "{:?}", fx.events_of(3));
+    assert!(!third.any_round_started, "{:?}", fx.events_of(3));
 }
 
-/// A round's verdict is recorded before `run` has delivered it. From then
-/// on the job is over: a cancel is refused, and a revise is its next round
-/// rather than lost behind the one still delivering.
+/// A round reports its verdict only once its pull request is open, so a
+/// daemon restarted mid-delivery still has a round to reattach to, and
+/// collects the pull request.
 #[tokio::test]
-async fn a_job_whose_round_is_still_delivering_has_its_verdict() {
+async fn a_round_delivering_across_a_daemon_restart_still_reports_its_pull_request() {
     let fakes = tempfile::tempdir().unwrap();
     let stall = fakes.path().join("stall");
-    let path = path_where_git_stalls(fakes.path(), &stall, DELIVERY_CHECK_IN_A_CLONE);
+    let path = path_where_gh_stalls(fakes.path(), &stall, "create");
     std::fs::write(&stall, "").unwrap();
-    let fx = Fixture::running(
-        "fake-agent.sh",
-        &["--max-jobs", "2"],
-        &[("PATH", path.as_str())],
-    )
-    .await;
+    let mut fx = Fixture::delivering("fake-agent.sh", &[("PATH", path.as_str())]).await;
     fx.assembly()
         .args(["submit", "--prompt", "x"])
         .assert()
         .success();
     wait_until_stalled_times(&stall, 1);
-    assert_eq!(wait_for_verdict(&fx.job_dir(1)).state, JobState::Passed);
+
+    assert!(fx.daemon.take().unwrap().stop().success());
+    let fx = fx.with_daemon(&[], &[("PATH", path.as_str())]);
+    std::fs::remove_file(&stall).unwrap();
+    let report = wait_for_verdict(&fx.job(1));
+
+    assert_eq!(report.state, JobState::Passed);
+    let events = fx.events_of(1);
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                ..,
+                EventKind::PullRequestOpened { .. },
+                EventKind::RoundPassed
+            ]
+        ),
+        "{events:?}"
+    );
+    fx.assembly()
+        .args(["status", "1"])
+        .assert()
+        .success()
+        .stdout(contains("pull request: https://example.invalid/pr/1"));
+}
+
+/// A round delivering its pull request has no verdict yet, so it can be
+/// cancelled, and fails saying where it was.
+#[tokio::test]
+async fn a_round_cancelled_while_delivering_fails_as_cancelled() {
+    let fakes = tempfile::tempdir().unwrap();
+    let stall = fakes.path().join("stall");
+    let path = path_where_gh_stalls(fakes.path(), &stall, "create");
+    std::fs::write(&stall, "").unwrap();
+    let fx = Fixture::delivering("fake-agent.sh", &[("PATH", path.as_str())]).await;
+    fx.assembly()
+        .args(["submit", "--prompt", "x"])
+        .assert()
+        .success();
+    wait_until_stalled_times(&stall, 1);
 
     fx.assembly()
         .args(["cancel", "1"])
         .assert()
-        .code(2)
-        .stderr(contains("job 1 is not queued or running"));
-    fx.assembly()
-        .args(["submit", "--job", "1", "--prompt", "more"])
-        .assert()
-        .success();
-    let revised = wait_for_verdict(&fx.job_dir(1));
+        .success()
+        .stdout(contains("job 1: cancelling"));
+    wait_for_verdict(&fx.job(1));
     std::fs::remove_file(&stall).unwrap();
 
-    assert_eq!(revised.state, JobState::Passed);
-    assert_eq!(revised.rounds, 2);
+    fx.assembly()
+        .args(["status", "1"])
+        .assert()
+        .success()
+        .stdout(
+            contains(
+                "job 1: failed (round 1, 1 file +1/-0) — cancelled while delivering its pull \
+                 request",
+            )
+            .and(contains("pull request:").not()),
+        );
+}
+
+/// A cancel while `gh` looks for the branch's pull request ends delivery
+/// there: an interrupted look is not "none open", so none is asked for.
+#[tokio::test]
+async fn a_round_cancelled_while_looking_for_its_pull_request_asks_for_none() {
+    let fakes = tempfile::tempdir().unwrap();
+    let stall = fakes.path().join("stall");
+    let path = path_where_gh_stalls(fakes.path(), &stall, "view");
+    std::fs::write(&stall, "").unwrap();
+    let fx = Fixture::delivering("fake-agent.sh", &[("PATH", path.as_str())]).await;
+    fx.assembly()
+        .args(["submit", "--prompt", "x"])
+        .assert()
+        .success();
+    wait_until_stalled_times(&stall, 1);
+
+    fx.assembly().args(["cancel", "1"]).assert().success();
+    let report = wait_for_verdict(&fx.job(1));
+    std::fs::remove_file(&stall).unwrap();
+
+    assert_eq!(
+        report.detail.as_deref(),
+        Some("cancelled while delivering its pull request")
+    );
+    assert_eq!(
+        std::fs::read_to_string(stall.with_extension("calls")).unwrap(),
+        "pr view\n"
+    );
 }
 
 #[tokio::test]
@@ -597,7 +737,7 @@ async fn cancelling_a_job_that_is_not_running_is_refused() {
         .args(["submit", "--prompt", "x"])
         .assert()
         .success();
-    wait_for_verdict(&fx.job_dir(1));
+    wait_for_verdict(&fx.job(1));
 
     fx.assembly()
         .args(["cancel", "1"])
@@ -649,7 +789,10 @@ async fn a_job_with_no_recorded_request_cannot_be_revised() {
         .args(["submit", "--job", "1", "--prompt", "more"])
         .assert()
         .code(2)
-        .stderr(contains("no recorded request"));
+        .stderr(contains(
+            "job 1 has no recorded request in its event log, so there is nothing to revise; \
+             submit without --job to start a new job",
+        ));
 }
 
 #[tokio::test]
@@ -659,7 +802,7 @@ async fn revising_a_job_whose_branch_was_deleted_says_there_is_nothing_to_revise
         .args(["submit", "--prompt", "x"])
         .assert()
         .success();
-    wait_for_verdict(&fx.job_dir(1));
+    wait_for_verdict(&fx.job(1));
     fx.on_origin(&["branch", "-D", "al/job-1"]);
     let events_before = fx.events_of(1);
 
@@ -667,7 +810,11 @@ async fn revising_a_job_whose_branch_was_deleted_says_there_is_nothing_to_revise
         .args(["submit", "--job", "1", "--prompt", "try again"])
         .assert()
         .code(2)
-        .stderr(contains("job 1 has no branch").and(contains("nothing to revise")));
+        .stderr(contains(format!(
+            "job 1 has no branch on {} — it was deleted, or the job never pushed one, so there \
+             is nothing to revise; submit without --job to start a new job",
+            fx.origin.display()
+        )));
     assert_eq!(fx.events_of(1), events_before);
 }
 
@@ -680,7 +827,7 @@ async fn a_job_whose_branch_was_deleted_keeps_its_directory_to_itself() {
         .args(["submit", "--prompt", "first job"])
         .assert()
         .success();
-    wait_for_verdict(&fx.job_dir(1));
+    wait_for_verdict(&fx.job(1));
     fx.on_origin(&["branch", "-D", "al/job-1"]);
     let first_events = fx.events_of(1);
 
@@ -696,13 +843,12 @@ async fn a_job_whose_branch_was_deleted_keeps_its_directory_to_itself() {
         .assert()
         .success()
         .stdout(contains("job 2 queued"));
-    assert_eq!(wait_for_verdict(&fx.job_dir(2)).state, JobState::Passed);
+    assert_eq!(wait_for_verdict(&fx.job(2)).state, JobState::Passed);
 }
 
 /// `run` can still refuse a job the daemon accepted — its branch deleted
-/// while it waited, say. That refusal is `run`'s exit and its stderr, not a
-/// frame: the round fails for want of a verdict, and the reason is in the
-/// job's log.
+/// while it waited, say. The refusal is the round's verdict, and `status`
+/// gives its reason without the advice meant for a hand-typed `run`.
 #[tokio::test]
 async fn a_round_that_run_refuses_fails_with_the_reason_in_its_log() {
     // One slot, held by a first job until its time runs out, so the second
@@ -730,22 +876,22 @@ async fn a_round_that_run_refuses_fails_with_the_reason_in_its_log() {
         "the second job started before its branch was deleted"
     );
 
-    let report = wait_for_verdict(&fx.job_dir(2));
+    let report = wait_for_verdict(&fx.job(2));
 
     assert_eq!(report.state, JobState::Failed);
-    assert!(
-        report
-            .detail
-            .as_deref()
-            .unwrap_or_default()
-            .contains("without reporting a verdict: exit 2"),
+    assert_eq!(
+        report.detail,
+        Some(format!(
+            "job 2 has no branch on file://{} — it was deleted, or the job never pushed one",
+            fx.origin.display()
+        )),
         "{report:?}"
     );
     fx.assembly()
         .args(["logs", "2"])
         .assert()
         .success()
-        .stdout(contains("job 2 has no branch"));
+        .stdout(contains("run without --job to start a new job"));
 }
 
 #[tokio::test]
@@ -755,7 +901,7 @@ async fn a_revise_with_a_missing_prompt_file_starts_no_round() {
         .args(["submit", "--prompt", "x"])
         .assert()
         .success();
-    wait_for_verdict(&fx.job_dir(1));
+    wait_for_verdict(&fx.job(1));
     let first_events = fx.events_of(1);
 
     fx.assembly()
@@ -778,7 +924,7 @@ async fn the_users_repository_gains_nothing_from_a_job() {
         .args(["submit", "--prompt", "x"])
         .assert()
         .success();
-    wait_for_verdict(&fx.job_dir(1));
+    wait_for_verdict(&fx.job(1));
 
     assert!(
         !fx.repo.join(".git/FETCH_HEAD").exists(),
@@ -810,13 +956,13 @@ async fn a_round_outlives_its_daemon_and_the_next_one_collects_it() {
         .args(["submit", "--prompt", "x"])
         .assert()
         .success();
-    wait_until_launched(&fx.job_dir(1));
+    wait_until_launched(&fx.job(1));
 
     assert!(fx.daemon.take().unwrap().stop().success());
     std::fs::write(&gate, "").unwrap();
     let fx = fx.with_daemon(&[], &[("GATE", gate.to_str().unwrap())]);
 
-    let report = wait_for_verdict(&fx.job_dir(1));
+    let report = wait_for_verdict(&fx.job(1));
     assert_eq!(report.state, JobState::Passed, "{:?}", fx.events_of(1));
     let log = std::fs::read_to_string(fx.job_dir(1).join("job.log")).unwrap();
     assert_eq!(log.matches("gated-agent: x").count(), 1, "{log}");
@@ -834,7 +980,7 @@ async fn jobs_left_queued_run_after_a_restart_in_the_order_they_were_asked_for()
             .assert()
             .success();
     });
-    wait_until_launched(&fx.job_dir(1));
+    wait_until_launched(&fx.job(1));
 
     assert!(fx.daemon.take().unwrap().stop().success());
     std::fs::write(&gate, "").unwrap();
@@ -842,7 +988,7 @@ async fn jobs_left_queued_run_after_a_restart_in_the_order_they_were_asked_for()
 
     let started: Vec<DateTime<Utc>> = (1..=3)
         .map(|id| {
-            assert_eq!(wait_for_verdict(&fx.job_dir(id)).state, JobState::Passed);
+            assert_eq!(wait_for_verdict(&fx.job(id)).state, JobState::Passed);
             round_started_at(&fx.job_dir(id))
         })
         .collect();
@@ -872,10 +1018,10 @@ async fn a_reattached_round_can_be_cancelled_and_counts_under_the_cap() {
         .assert()
         .success()
         .stdout(contains("job 1: cancelling"));
-    let first = wait_for_verdict(&fx.job_dir(1));
+    let first = wait_for_verdict(&fx.job(1));
     wait_until_logged(&fx.job_dir(2), "sleeping-agent:");
     fx.assembly().args(["cancel", "2"]).assert().success();
-    wait_for_verdict(&fx.job_dir(2));
+    wait_for_verdict(&fx.job(2));
 
     assert_eq!(first.detail.as_deref(), Some("cancelled"));
     let first_ended = verdict_at(&fx.job_dir(1));
@@ -895,7 +1041,7 @@ struct LaunchingUntilGivenUp {
 
 impl Runner for LaunchingUntilGivenUp {
     type Running = LocalRound;
-    const RUNS_IN_A_CONTAINER: bool = false;
+    const ENVIRONMENT: RoundEnvironment = LocalRunner::ENVIRONMENT;
 
     fn reasons_it_cannot_run(&self) -> impl Future<Output = Vec<RunnerProblem>> + Send {
         std::future::ready(Vec::new())
@@ -960,7 +1106,7 @@ async fn stopping_the_daemon_mid_launch_gives_the_launch_up_and_says_so() {
         .unwrap();
 
     assert!(marks.join("given-up").exists(), "the launch was abandoned");
-    let report = wait_for_verdict(&fx.job_dir(1));
+    let report = wait_for_verdict(&fx.job(1));
     let detail = report.detail.unwrap_or_default();
     assert!(
         detail.contains("stopped while this round was launching")
@@ -988,7 +1134,7 @@ async fn a_round_lost_while_launching_is_closed_on_restart() {
         .args(["submit", "--prompt", "x"])
         .assert()
         .success();
-    wait_for_verdict(&fx.job_dir(1));
+    wait_for_verdict(&fx.job(1));
     assert!(fx.daemon.take().unwrap().stop().success());
     // A daemon that died between starting a round and launching it leaves
     // exactly this: a request and a start, and nothing after.
@@ -997,7 +1143,7 @@ async fn a_round_lost_while_launching_is_closed_on_restart() {
     log.append(EventKind::RoundStarted { round: 2 }).unwrap();
     let fx = fx.with_daemon(&[], &[]);
 
-    let report = wait_for_verdict(&fx.job_dir(1));
+    let report = wait_for_verdict(&fx.job(1));
     assert_eq!(report.rounds, 2);
     let detail = report.detail.unwrap_or_default();
     assert!(
@@ -1072,7 +1218,7 @@ async fn a_stalled_fetch_does_not_hold_up_stopping_the_daemon() {
         .spawn()
         .unwrap();
     wait_until_stalled_times(&stall, 1);
-    wait_for_verdict(&fx.job_dir(1));
+    wait_for_verdict(&fx.job(1));
     // Job 2's round has had its chance to take the freed slot.
     std::thread::sleep(std::time::Duration::from_secs(1));
 
@@ -1093,6 +1239,63 @@ async fn a_stalled_fetch_does_not_hold_up_stopping_the_daemon() {
         ),
         "{:?}",
         fx.events_of(2)
+    );
+}
+
+/// A round is admitted again when it is dispatched, so a request the
+/// config at its base does not admit fails with every reason, and never
+/// launches without the settings it should run under. A request written
+/// to the log by hand stands in for one a stricter daemon would refuse.
+#[tokio::test]
+async fn a_round_its_config_does_not_admit_at_dispatch_fails_saying_why() {
+    let mut fx = Fixture::running("fake-agent.sh", &[], &[]).await;
+    fx.assembly()
+        .args(["submit", "--prompt", "first"])
+        .assert()
+        .success();
+    assert_eq!(wait_for_verdict(&fx.job(1)).state, JobState::Passed);
+    assert!(fx.daemon.take().unwrap().stop().success());
+    let Some(EventKind::RoundRequested {
+        remote_url, base, ..
+    }) = fx.events_of(1).into_iter().next()
+    else {
+        panic!("{:?}", fx.events_of(1));
+    };
+    EventLog::open_append(fx.job_dir(1).join("events.jsonl"))
+        .unwrap()
+        .append(EventKind::RoundRequested {
+            remote_url,
+            base,
+            prompt: "second".into(),
+            provider: "ghost".into(),
+        })
+        .unwrap();
+
+    let fx = fx.with_daemon(&[], &[]);
+    let report = wait_for_verdict(&fx.job(1));
+
+    assert_eq!(report.state, JobState::Failed);
+    assert_eq!(
+        report.detail.as_deref(),
+        Some(
+            format!(
+                "{REPO_CONFIG_PATH} is not runnable: provider 'ghost' is not declared in \
+                 [providers] — add a block for it"
+            )
+            .as_str()
+        ),
+        "{:?}",
+        fx.events_of(1)
+    );
+    assert!(
+        !fx.events_of(1)
+            .iter()
+            .skip_while(
+                |e| !matches!(e, EventKind::RoundRequested { provider, .. } if provider == "ghost")
+            )
+            .any(|e| matches!(e, EventKind::RoundLaunched { .. })),
+        "{:?}",
+        fx.events_of(1)
     );
 }
 
@@ -1117,7 +1320,7 @@ async fn a_round_whose_config_cannot_be_read_at_dispatch_fails_saying_why() {
         .success();
     std::fs::remove_dir_all(fx.root().join("repos")).unwrap();
 
-    let report = wait_for_verdict(&fx.job_dir(2));
+    let report = wait_for_verdict(&fx.job(2));
 
     assert_eq!(report.state, JobState::Failed);
     let detail = report.detail.unwrap_or_default();
@@ -1145,13 +1348,6 @@ const FETCH_INTO_THE_CACHE: GitCall = GitCall {
 const CONFIG_READ_IN_THE_CACHE: GitCall = GitCall {
     in_dir: "*/root/repos/*",
     when: "[ \"$1\" = cat-file ]",
-};
-
-/// `run` asking whether the branch it pushed carries work worth delivering —
-/// after the round's verdict. Committing asks the same of `..HEAD`, before.
-const DELIVERY_CHECK_IN_A_CLONE: GitCall = GitCall {
-    in_dir: "*/scratch/*",
-    when: "[ \"$1\" = rev-list ] && [ \"${3%..HEAD}\" = \"$3\" ]",
 };
 
 /// A `PATH` whose `git`, while `stall` exists, holds up every `call` until
@@ -1186,14 +1382,42 @@ fn path_where_git_stalls(fakes: &Path, stall: &Path, call: GitCall) -> String {
     format!("{}:{}", fakes.display(), support::path_where_gh_refuses())
 }
 
-/// Wait until `times` git calls have stalled on `stall`.
+/// A `PATH` whose `gh` finds no pull request open and opens one when asked,
+/// adding each call to `<stall>.calls`. While `stall` exists, `gh pr
+/// {subcommand}` waits until it is removed, adding a line to
+/// `<stall>.reached` as it begins to.
+fn path_where_gh_stalls(fakes: &Path, stall: &Path, subcommand: &str) -> String {
+    support::fake_cli(
+        fakes,
+        "gh",
+        &format!(
+            "echo \"$1 $2\" >> '{stall}.calls'\n\
+             if [ \"$1 $2\" = 'pr {subcommand}' ] && [ -e '{stall}' ]; then\n  \
+               echo stalled >> '{stall}.reached'\n  \
+               while [ -e '{stall}' ]; do sleep 0.1; done\n\
+             fi\n\
+             case \"$1 $2\" in\n  \
+               'pr view') exit 1 ;;\n  \
+               'pr create') echo https://example.invalid/pr/1 ;;\n\
+             esac\n",
+            stall = stall.display(),
+        ),
+    );
+    format!(
+        "{}:{}",
+        fakes.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+/// Wait until `times` calls have stalled on `stall`.
 fn wait_until_stalled_times(stall: &Path, times: usize) {
     let reached = stall.with_extension("reached");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while std::fs::read_to_string(&reached).map_or(0, |log| log.lines().count()) < times {
         assert!(
             std::time::Instant::now() < deadline,
-            "fewer than {times} git calls ever stalled on {}",
+            "fewer than {times} calls ever stalled on {}",
             stall.display()
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1229,7 +1453,7 @@ async fn the_local_runner_keeps_the_hosts_credentials_even_with_a_token_exported
         .args(["submit", "--prompt", "x"])
         .assert()
         .success();
-    wait_for_verdict(&fx.job_dir(1));
+    wait_for_verdict(&fx.job(1));
 
     fx.assembly()
         .args(["logs", "1"])
@@ -1253,7 +1477,7 @@ async fn unpushed_local_work_is_pointed_out_and_the_remotes_ref_is_used() {
         .assert()
         .success()
         .stdout(contains("push first"));
-    wait_for_verdict(&fx.job_dir(1));
+    wait_for_verdict(&fx.job(1));
 
     assert_eq!(fx.on_origin(&["rev-parse", "al/job-1^"]), remotes);
 }
@@ -1276,7 +1500,7 @@ async fn a_job_submitted_elsewhere_is_found_by_pointing_the_read_commands_at_it(
         .args(["submit", "--repo", at, "--prompt", "x"])
         .assert()
         .success();
-    wait_for_verdict(&fx.job_dir(1));
+    wait_for_verdict(&fx.job(1));
 
     from_elsewhere()
         .arg("status")
@@ -1298,7 +1522,7 @@ async fn a_job_submitted_elsewhere_is_found_by_pointing_the_read_commands_at_it(
         .assert()
         .success()
         .stdout(contains("job 1 queued"));
-    assert_eq!(wait_for_verdict(&fx.job_dir(1)).rounds, 2);
+    assert_eq!(wait_for_verdict(&fx.job(1)).rounds, 2);
     assert!(!standing_in.path().join(".assembly").exists());
 }
 

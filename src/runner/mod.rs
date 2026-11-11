@@ -6,9 +6,12 @@ pub mod kubernetes;
 pub mod local;
 pub mod tail;
 
+use crate::config::JobSettings;
 use crate::git::PinnedRef;
 use crate::paths::JobPaths;
-use crate::payload::{FORGE_TOKEN_VAR, GIT_TOKEN_VAR, https_equivalent, is_path_on_this_machine};
+use crate::payload::{FORGE_TOKEN_VAR, GIT_TOKEN_VAR};
+use crate::remote::Remote;
+use crate::report::{JobRequests, RoundRequest};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -35,34 +38,26 @@ pub struct LaunchSpec {
 }
 
 impl LaunchSpec {
-    /// Round `round` of the job at `job`, fitted to where `R` runs it: a
-    /// container has neither the host's toolchain nor its SSH keys, so it
-    /// provisions the one and reaches the remote over HTTPS, with a token,
-    /// in place of the other. Every value is attached with `=`, so none can
-    /// be read as a flag.
-    ///
-    /// An absolute path is passed as a `file://` URL: `run --repo` reads a
-    /// path holding `.git` as a checkout and clones that checkout's own
-    /// remote, and a remote that is a non-bare repository holds one.
+    /// Round `round` of the job at `job`, from the job's first request's
+    /// remote and its latest request's prompt and provider, at the base and
+    /// under the settings admission gave it. Fitted to `R::ENVIRONMENT`: its
+    /// `reaches_remotes` picks the form of the remote's URL, and its
+    /// `toolchain` decides whether the round provisions one. Every value is
+    /// attached with `=`, so none can be read as a flag.
     #[must_use]
     pub fn for_round<R: Runner>(
         job: &JobPaths,
         round: u32,
-        remote_url: &str,
+        requests: &JobRequests,
         base: &PinnedRef,
-        prompt: &str,
-        provider: &str,
-        command_limit_secs: Option<u64>,
+        settings: &JobSettings,
     ) -> LaunchSpec {
         let (frames_file, job) = (job.frames(round), job.id);
-        let remote_url = match (
-            R::RUNS_IN_A_CONTAINER,
-            std::path::Path::new(remote_url).is_absolute(),
-        ) {
-            (true, _) => https_equivalent(remote_url),
-            (false, true) => format!("file://{remote_url}"),
-            (false, false) => remote_url.to_string(),
-        };
+        let remote_url = Remote::from_url(requests.first.remote_url.as_str())
+            .url_for_launch(R::ENVIRONMENT.reaches_remotes);
+        let RoundRequest {
+            prompt, provider, ..
+        } = &requests.latest;
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -72,16 +67,19 @@ impl LaunchSpec {
             args: [
                 "run".to_string(),
                 format!("--repo={remote_url}"),
-                format!("--ref={}@{}", base.name, base.sha),
+                format!("--ref={base}"),
                 format!("--job={job}"),
                 format!("--prompt={prompt}"),
                 format!("--provider={provider}"),
                 "--frames".to_string(),
             ]
             .into_iter()
-            .chain(R::RUNS_IN_A_CONTAINER.then(|| "--provision-toolchain".to_string()))
+            .chain(
+                (R::ENVIRONMENT.toolchain == Toolchain::Provisioned)
+                    .then(|| "--provision-toolchain".to_string()),
+            )
             .collect(),
-            command_limit_secs,
+            command_limit_secs: settings.max_duration.map(|limit| limit.as_secs()),
             frames_file,
         }
     }
@@ -140,14 +138,71 @@ pub fn published_image() -> String {
     format!("{PUBLISHED_IMAGE_REPOSITORY}:{}", env!("CARGO_PKG_VERSION"))
 }
 
+/// What the place a runner's rounds run in needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoundEnvironment {
+    pub reaches_remotes: Reach,
+    pub credentials: Credentials,
+    pub toolchain: Toolchain,
+}
+
+/// Which remotes a round can clone and push to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// Every remote this machine reaches, a path on it included.
+    ThisMachine,
+    /// Only a remote on the network: the round cannot see this machine's
+    /// paths.
+    FromAnywhere,
+}
+
+impl Reach {
+    /// What a repository asks for that a round with this reach cannot give
+    /// it: a remote that is only a path on the host.
+    #[must_use]
+    pub fn reasons_it_cannot_reach(self, remote: &Remote) -> Vec<RunnerProblem> {
+        match self {
+            Reach::ThisMachine => Vec::new(),
+            Reach::FromAnywhere => remote
+                .is_path_on_this_machine()
+                .then(|| RunnerProblem::RemoteIsLocalPath {
+                    url: remote.url().to_string(),
+                })
+                .into_iter()
+                .collect(),
+        }
+    }
+}
+
+/// Where a round's git and forge credentials come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Credentials {
+    /// The host's own, which the round inherits.
+    OfTheHost,
+    /// The daemon's [`JobSecrets`], sent with each round. `run` authenticates
+    /// with the git token when it finds [`GIT_TOKEN_VAR`] set.
+    PassedIn,
+}
+
+/// Where a round's toolchain comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Toolchain {
+    /// The host's, as it is.
+    OfTheHost,
+    /// The repository's, installed with mise by `run` before the agent starts.
+    Provisioned,
+}
+
 /// One way of running `assembly run` somewhere.
 pub trait Runner {
     type Running: RunningRound + Send;
 
-    /// Whether rounds run somewhere sharing nothing with the host. What that
-    /// implies is decided in [`crate::daemon::Daemon::prepare`],
-    /// [`crate::daemon::submit::accept`] and [`LaunchSpec::for_round`].
-    const RUNS_IN_A_CONTAINER: bool;
+    /// What the place this runner's rounds run in needs. `reaches_remotes`
+    /// decides which remotes a submit is refused for and the form of the
+    /// `--repo` a round is launched with; `credentials` decides whether the
+    /// daemon collects secrets to send each round; `toolchain` decides
+    /// whether a round is launched with `--provision-toolchain`.
+    const ENVIRONMENT: RoundEnvironment;
 
     /// Every reason this runner cannot launch a round right now, checked
     /// once, before the daemon listens.
@@ -332,16 +387,4 @@ impl JobSecrets {
     pub fn vars(&self) -> &BTreeMap<String, String> {
         &self.vars
     }
-}
-
-/// What a repository asks for that no container can give it: a remote that
-/// is only a path on the host.
-#[must_use]
-pub fn reasons_a_container_cannot_run(remote_url: &str) -> Vec<RunnerProblem> {
-    is_path_on_this_machine(remote_url)
-        .then(|| RunnerProblem::RemoteIsLocalPath {
-            url: remote_url.to_string(),
-        })
-        .into_iter()
-        .collect()
 }

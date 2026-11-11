@@ -2,7 +2,8 @@
 
 use super::child::ChildLines;
 use super::{
-    JobSecrets, LaunchSpec, RoundHandle, Runner, RunnerProblem, RunningRound, Termination,
+    Credentials, JobSecrets, LaunchSpec, Reach, RoundEnvironment, RoundHandle, Runner,
+    RunnerProblem, RunningRound, Termination, Toolchain,
 };
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
@@ -58,7 +59,11 @@ pub fn docker_create_args(
 
 impl Runner for DockerRunner {
     type Running = DockerRound;
-    const RUNS_IN_A_CONTAINER: bool = true;
+    const ENVIRONMENT: RoundEnvironment = RoundEnvironment {
+        reaches_remotes: Reach::FromAnywhere,
+        credentials: Credentials::PassedIn,
+        toolchain: Toolchain::Provisioned,
+    };
 
     async fn reasons_it_cannot_run(&self) -> Vec<RunnerProblem> {
         match Command::new(&self.program)

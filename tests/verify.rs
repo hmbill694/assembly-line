@@ -2,6 +2,7 @@ mod support;
 
 use assembly_line::event::EventKind;
 use assembly_line::git;
+use std::path::Path;
 use support::{Harness, config_running};
 
 /// A `verify` line that can only pass in the job's own checkout, *after* the
@@ -55,7 +56,7 @@ async fn a_round_whose_verify_fails_is_a_failed_round() {
         outcome.has(|e| matches!(
             e,
             EventKind::BranchPushed { branch: b, pushed_to }
-                if *b == branch && pushed_to == "origin"
+                if *b == branch && Path::new(pushed_to) == h.origin
         )),
         "the branch survives a failed verify — that is what makes it inspectable"
     );
@@ -73,6 +74,31 @@ async fn a_round_whose_verify_fails_is_a_failed_round() {
         on_remote.stdout.contains("agent-output.txt"),
         "the rejected work never reached the remote: {}",
         on_remote.stdout
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_round_records_its_work_then_the_rejection_then_its_verdict() {
+    let h = Harness::with_config(&format!(
+        "verify = \"{VERIFY_REJECTS_THE_COMMITTED_WORK}\"\n{}",
+        config_running("fake-agent.sh")
+    ))
+    .await;
+
+    let outcome = h.run_job("write a file").await;
+
+    assert!(
+        matches!(
+            outcome.events.as_slice(),
+            [
+                EventKind::RoundCommitted { .. },
+                EventKind::BranchPushed { .. },
+                EventKind::VerifyRejected { reason: rejected },
+                EventKind::RoundFailed { reason: failed },
+            ] if rejected == "exit 1" && failed == "verify rejected the work: exit 1"
+        ),
+        "{:?}",
+        outcome.events
     );
 }
 

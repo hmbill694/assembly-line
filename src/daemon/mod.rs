@@ -9,11 +9,11 @@ pub mod fleet;
 pub mod root;
 pub mod submit;
 
-use crate::event::{EventKind, EventLog};
+use crate::event::EventKind;
+use crate::paths::JobPlace;
 use crate::report::JobReport;
-use crate::runner::{JobSecrets, Runner, RunnerProblem};
+use crate::runner::{Credentials, JobSecrets, Runner, RunnerProblem};
 use anyhow::Context;
-use dispatch::JobAddress;
 use fleet::Resumption;
 use root::{RootLock, socket_path};
 use std::path::PathBuf;
@@ -45,9 +45,9 @@ impl<R: Runner> Daemon<R> {
         pass_env: &[String],
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<Daemon<R>, Vec<RunnerProblem>> {
-        let (secrets, unsendable) = match R::RUNS_IN_A_CONTAINER {
-            true => JobSecrets::from_lookup(pass_env, env),
-            false => (JobSecrets::default(), Vec::new()),
+        let (secrets, unsendable) = match R::ENVIRONMENT.credentials {
+            Credentials::PassedIn => JobSecrets::from_lookup(pass_env, env),
+            Credentials::OfTheHost => (JobSecrets::default(), Vec::new()),
         };
         let problems: Vec<RunnerProblem> = runner
             .reasons_it_cannot_run()
@@ -128,10 +128,11 @@ pub async fn serve<R: Runner + Send + Sync + 'static>(
 fn resume_jobs_under_root<R: Runner + Send + Sync + 'static>(
     serving: &Arc<Serving<R>>,
 ) -> anyhow::Result<()> {
-    let owed: Vec<(JobAddress, JobReport, Resumption)> = fleet::jobs_under(&serving.daemon.root)?
+    let root = &serving.daemon.root;
+    let owed: Vec<(JobPlace, JobReport, Resumption)> = fleet::jobs_under(root)?
         .into_iter()
-        .filter_map(|(address, report)| {
-            Resumption::for_report(&report).map(|owed| (address, report, owed))
+        .filter_map(|(place, report)| {
+            Resumption::for_report(&report).map(|owed| (place, report, owed))
         })
         .collect();
     let (mut requeued, others): (Vec<_>, Vec<_>) = owed
@@ -140,25 +141,30 @@ fn resume_jobs_under_root<R: Runner + Send + Sync + 'static>(
 
     others
         .into_iter()
-        .try_for_each(|(address, _, owed)| match owed {
+        .try_for_each(|(place, _, owed)| match owed {
             Resumption::Reattach { round, handle } => {
-                dispatch::spawn_reattached(serving, address, round, handle);
+                dispatch::spawn_reattached(serving, place, round, handle);
                 Ok(())
             }
             Resumption::LostWhileLaunching { .. } => {
-                let reason = fleet::lost_while_launching(address.id);
-                EventLog::open_append(address.paths().events())
-                    .and_then(|mut log| log.append(EventKind::RoundFailed { reason }))
-                    .map(|_| ())
-                    .with_context(|| format!("closing job {} in {}", address.id, address.key))
+                let reason = fleet::lost_while_launching(place.id);
+                place
+                    .paths(root)
+                    .append(EventKind::RoundFailed { reason })
+                    .with_context(|| format!("closing job {} in {}", place.id, place.key))
             }
             Resumption::Requeue => Ok(()),
         })?;
 
-    requeued.sort_by_key(|(_, report, _)| report.requested_at);
+    requeued.sort_by_key(|(_, report, _)| {
+        report
+            .requests
+            .as_ref()
+            .map(|requests| requests.latest.requested_at)
+    });
     requeued
         .into_iter()
-        .for_each(|(address, _, _)| serving.queue.enqueue(address));
+        .for_each(|(place, _, _)| serving.queue.enqueue(place));
     Ok(())
 }
 

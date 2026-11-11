@@ -204,11 +204,11 @@ opening it. Bare verbs (`check`, `handle`, `process`, `absorb`, `skip`) and
 bare nouns (`data`, `info`, `result`, `entry`) fail that test.
 
 - **Predicates read as claims:** `git::remote_lacks_ref`, not `check_ref`.
-- **Filters name what they select:** `RepoConfig::settings_worth_flagging`,
+- **Filters name what they select:** `JobSettings::settings_worth_flagging`,
   not `warnings` — it names which settings it picks out (`src/config.rs`).
-- **Error producers name the fault:** `RepoConfig::reasons_it_cannot_run`,
-  `unparseable_max_duration` — not `problems`, `duration_error`
-  (`src/config.rs`).
+- **Error producers name the fault:** `Runner::reasons_it_cannot_run`,
+  `Reach::reasons_it_cannot_reach` — not `problems`, `runner_errors`
+  (`src/runner/mod.rs`).
 - **Mutators name the transition, including its scope:** `EventLog::append`,
   not `write` — the log is append-only, so the half of the name that rules out
   rewriting is the half that earns its place (`src/event.rs`).

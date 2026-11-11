@@ -1,4 +1,6 @@
 use assembly_line::git::{self, PinnedRef, head_sha};
+use assembly_line::job::JobId;
+use assembly_line::remote::Remote;
 use assembly_line::workspace;
 use std::path::PathBuf;
 
@@ -22,8 +24,8 @@ impl Fixture {
         Fixture { tmp, repo, origin }
     }
 
-    fn url(&self) -> &str {
-        self.origin.to_str().unwrap()
+    fn remote(&self) -> Remote {
+        Remote::from_url(self.origin.to_str().unwrap())
     }
 
     fn scratch(&self) -> PathBuf {
@@ -41,8 +43,8 @@ impl Fixture {
     /// A scratch clone with `al/job-1` checked out at `start`, as `run`
     /// builds one.
     async fn workspace_at(&self, start: &PinnedRef) -> anyhow::Result<workspace::RoundWorkspace> {
-        let clone = workspace::clone_scratch(self.url(), self.scratch(), None).await?;
-        workspace::start_round(clone, start, "al/job-1").await
+        let clone = workspace::clone_scratch(&self.remote(), self.scratch(), None).await?;
+        workspace::start_round(clone, start, JobId::from(1)).await
     }
 }
 
@@ -105,7 +107,7 @@ async fn discarding_a_workspace_removes_it_and_the_published_branch_survives() {
     let on_remote = git::run_allowing_failure(&fx.origin, &["rev-parse", "al/job-1"])
         .await
         .unwrap();
-    assert_eq!(on_remote.stdout.trim(), sha);
+    assert_eq!(on_remote.stdout.trim(), sha.as_str());
 }
 
 /// What a revise round does: the checkout from the last round is long gone,
@@ -158,7 +160,7 @@ async fn publishing_runs_no_hook_from_the_clone() {
     let on_remote = git::run_allowing_failure(&fx.origin, &["rev-parse", "al/job-1"])
         .await
         .unwrap();
-    assert_eq!(on_remote.stdout.trim(), sha);
+    assert_eq!(on_remote.stdout.trim(), sha.as_str());
 }
 
 #[tokio::test]
@@ -172,7 +174,7 @@ async fn a_pinned_commit_is_used_even_after_its_ref_moves() {
         .unwrap();
     support::publish_main(&fx.repo).await;
 
-    let clone = workspace::clone_scratch(fx.url(), fx.scratch(), None)
+    let clone = workspace::clone_scratch(&fx.remote(), fx.scratch(), None)
         .await
         .unwrap();
     let base = workspace::pin_in_clone(&clone, "main", Some(&pinned.sha))
@@ -185,26 +187,53 @@ async fn a_pinned_commit_is_used_even_after_its_ref_moves() {
 #[tokio::test]
 async fn a_pin_the_remote_cannot_supply_is_an_error() {
     let fx = Fixture::new().await;
-    let clone = workspace::clone_scratch(fx.url(), fx.scratch(), None)
+    let clone = workspace::clone_scratch(&fx.remote(), fx.scratch(), None)
         .await
         .unwrap();
 
-    let err = workspace::pin_in_clone(&clone, "main", Some(&"0".repeat(40)))
+    let err = workspace::pin_in_clone(&clone, "main", Some(&"0".repeat(40).parse().unwrap()))
         .await
         .unwrap_err()
         .to_string();
-    assert!(err.contains("not a commit"), "{err}");
+    assert_eq!(
+        err,
+        format!(
+            "'{}' is not a commit {} can supply for 'main'",
+            "0".repeat(40),
+            fx.origin.display()
+        )
+    );
+}
+
+/// The person never sees the clone's own name for its remote.
+#[tokio::test]
+async fn a_ref_the_remote_lacks_is_refused_by_the_remotes_url() {
+    let fx = Fixture::new().await;
+    let clone = workspace::clone_scratch(&fx.remote(), fx.scratch(), None)
+        .await
+        .unwrap();
+
+    let err = workspace::pin_in_clone(&clone, "never-pushed", None)
+        .await
+        .unwrap_err()
+        .to_string();
+    let expected = format!(
+        "'never-pushed' is not on {} — a job starts from a clone of the remote, so push it \
+         first: ",
+        fx.origin.display()
+    );
+    assert!(err.starts_with(&expected), "{err}");
 }
 
 #[tokio::test]
 async fn a_job_branch_the_remote_lacks_is_none_not_an_error() {
     let fx = Fixture::new().await;
-    let clone = workspace::clone_scratch(fx.url(), fx.scratch(), None)
+    let clone = workspace::clone_scratch(&fx.remote(), fx.scratch(), None)
         .await
         .unwrap();
 
     assert_eq!(
-        workspace::job_branch_in_clone(&clone, "al/job-9")
+        workspace::job_branch_in_clone(&clone, JobId::from(9))
             .await
             .unwrap(),
         None

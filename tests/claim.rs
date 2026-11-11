@@ -1,54 +1,56 @@
 //! Claiming a job's id by creating its branch on the remote.
 
+use assembly_line::admission::{Admitted, admit};
 use assembly_line::claim::claim_job;
 use assembly_line::git;
 use assembly_line::job::JobId;
+use support::Harness;
 
 mod support;
 
-/// A repository with `main` published to a bare origin, and its sha.
-async fn published() -> (tempfile::TempDir, std::path::PathBuf, String) {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("repo");
-    support::init_git_repo(&repo).await;
-    support::add_origin(&repo, &tmp.path().join("origin.git")).await;
-    support::publish_main(&repo).await;
-    let sha = git::head_sha(&repo).await.unwrap();
-    (tmp, repo, sha)
+/// An opted-in repository with `main` published to a bare origin, admitted
+/// to run a job from `main`.
+async fn admitted() -> (Harness, Admitted) {
+    let h = Harness::new().await;
+    let base = git::pinned(&h.repo, "origin", "main").await.unwrap();
+    let admitted = admit(&h.repo, base, None).await.unwrap();
+    (h, admitted)
 }
 
 #[tokio::test]
 async fn the_first_claim_on_a_remote_is_job_1_at_the_base() {
-    let (tmp, repo, sha) = published().await;
+    let (h, admitted) = admitted().await;
 
-    let id = claim_job(&repo, "origin", &sha).await.unwrap();
+    let id = claim_job(&h.repo, "origin", &admitted).await.unwrap();
 
     assert_eq!(id, JobId::from(1));
-    let origin = tmp.path().join("origin.git");
-    assert_eq!(git::sha_at_ref(&origin, "al/job-1").await.unwrap(), sha);
+    assert_eq!(
+        git::sha_at_ref(&h.origin, "al/job-1").await.unwrap(),
+        admitted.base().sha
+    );
 }
 
 #[tokio::test]
 async fn a_second_claim_from_the_same_base_gets_the_next_id() {
-    let (_tmp, repo, sha) = published().await;
+    let (h, admitted) = admitted().await;
     assert_eq!(
-        claim_job(&repo, "origin", &sha).await.unwrap(),
+        claim_job(&h.repo, "origin", &admitted).await.unwrap(),
         JobId::from(1)
     );
 
     assert_eq!(
-        claim_job(&repo, "origin", &sha).await.unwrap(),
+        claim_job(&h.repo, "origin", &admitted).await.unwrap(),
         JobId::from(2)
     );
 }
 
 #[tokio::test]
 async fn claims_racing_on_one_remote_all_get_different_ids() {
-    let (_tmp, repo, sha) = published().await;
+    let (h, admitted) = admitted().await;
 
     let claims = join_all((0..6).map(|_| {
-        let (repo, sha) = (repo.clone(), sha.clone());
-        tokio::spawn(async move { claim_job(&repo, "origin", &sha).await.unwrap() })
+        let (repo, admitted) = (h.repo.clone(), admitted.clone());
+        tokio::spawn(async move { claim_job(&repo, "origin", &admitted).await.unwrap() })
     }))
     .await;
 
@@ -69,31 +71,31 @@ async fn join_all(handles: impl IntoIterator<Item = tokio::task::JoinHandle<JobI
 
 #[tokio::test]
 async fn somebody_elses_higher_job_branch_is_claimed_past() {
-    let (_tmp, repo, sha) = published().await;
-    git::push_head_as(&repo, "origin", "al/job-41")
+    let (h, admitted) = admitted().await;
+    git::push_head_as(&h.repo, "origin", "al/job-41")
         .await
         .unwrap();
 
     assert_eq!(
-        claim_job(&repo, "origin", &sha).await.unwrap(),
+        claim_job(&h.repo, "origin", &admitted).await.unwrap(),
         JobId::from(42)
     );
 }
 
 #[tokio::test]
 async fn a_branch_at_the_last_id_is_named_in_the_refusal() {
-    let (_tmp, repo, sha) = published().await;
+    let (h, admitted) = admitted().await;
     let last = JobId::from(u64::MAX).branch_name();
-    git::push_head_as(&repo, "origin", &last).await.unwrap();
+    git::push_head_as(&h.repo, "origin", &last).await.unwrap();
 
-    let err = claim_job(&repo, "origin", &sha).await.unwrap_err();
+    let err = claim_job(&h.repo, "origin", &admitted).await.unwrap_err();
     assert!(err.to_string().contains(&last), "{err}");
 }
 
 #[tokio::test]
 async fn an_unreachable_remote_is_an_error_not_a_lost_race() {
-    let (tmp, repo, sha) = published().await;
-    std::fs::remove_dir_all(tmp.path().join("origin.git")).unwrap();
+    let (h, admitted) = admitted().await;
+    std::fs::remove_dir_all(&h.origin).unwrap();
 
-    assert!(claim_job(&repo, "origin", &sha).await.is_err());
+    assert!(claim_job(&h.repo, "origin", &admitted).await.is_err());
 }

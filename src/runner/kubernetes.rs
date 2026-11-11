@@ -253,6 +253,83 @@ impl LogReadPosition {
     }
 }
 
+/// What to read next once a pod's `kubectl logs -f` has ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamAction {
+    /// Follow the log again from the last timestamp read.
+    Reconnect,
+    /// Read the finished pod's log once more, for what the follow missed.
+    Drain,
+    End,
+    /// Give up on a stream that cannot be read while the pod runs.
+    Abandon,
+}
+
+/// When a dropped log follow is reconnected and when it is given up on: a
+/// running pod's follow that keeps ending with nothing new is a stream that
+/// cannot be read, not a connection that dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconnectPolicy {
+    /// Reconnects since the last line not read before, or since a follow
+    /// that held for `live_connection`.
+    fruitless_reconnects: u32,
+    /// [`KubernetesRunner::live_connection`].
+    live_connection: Duration,
+}
+
+impl ReconnectPolicy {
+    #[must_use]
+    pub fn with_live_connection(live_connection: Duration) -> Self {
+        ReconnectPolicy {
+            fruitless_reconnects: 0,
+            live_connection,
+        }
+    }
+
+    /// The policy once a line not read before has arrived.
+    #[must_use]
+    pub fn after_new_line(self) -> Self {
+        ReconnectPolicy {
+            fruitless_reconnects: 0,
+            ..self
+        }
+    }
+
+    /// The policy once a follow that held for `held_for` has ended with the
+    /// pod at `progress`, and what to read next.
+    #[must_use]
+    pub fn after_follow_ended(
+        self,
+        progress: &PodProgress,
+        held_for: Duration,
+    ) -> (Self, StreamAction) {
+        let policy = if held_for >= self.live_connection {
+            ReconnectPolicy {
+                fruitless_reconnects: 0,
+                ..self
+            }
+        } else {
+            self
+        };
+        match progress {
+            PodProgress::Running { .. }
+                if policy.fruitless_reconnects >= FRUITLESS_RECONNECTS_ALLOWED =>
+            {
+                (policy, StreamAction::Abandon)
+            }
+            PodProgress::Running { .. } => (
+                ReconnectPolicy {
+                    fruitless_reconnects: policy.fruitless_reconnects + 1,
+                    ..policy
+                },
+                StreamAction::Reconnect,
+            ),
+            PodProgress::Finished { .. } => (policy, StreamAction::Drain),
+            PodProgress::Waiting { .. } | PodProgress::Gone => (policy, StreamAction::End),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct KubernetesRunner {
     /// `kubectl`, or a stand-in a test wrote.
@@ -355,7 +432,11 @@ async fn output_of(mut command: Command, stdin: Option<String>) -> anyhow::Resul
 
 impl Runner for KubernetesRunner {
     type Running = KubernetesRound;
-    const RUNS_IN_A_CONTAINER: bool = true;
+    const ENVIRONMENT: super::RoundEnvironment = super::RoundEnvironment {
+        reaches_remotes: super::Reach::FromAnywhere,
+        credentials: super::Credentials::PassedIn,
+        toolchain: super::Toolchain::Provisioned,
+    };
 
     /// Every permission a round uses, asked up front: one found missing
     /// mid-round would leave a Job running that nothing can follow or delete.
@@ -451,9 +532,7 @@ pub struct KubernetesRound {
     pod: String,
     stream: LogStream,
     position: LogReadPosition,
-    /// Reconnects since the last line not read before, or since a follow
-    /// that held for [`KubernetesRunner::live_connection`].
-    fruitless_reconnects: u32,
+    reconnects: ReconnectPolicy,
     /// When the current `kubectl logs -f` connected.
     following_since: Option<std::time::Instant>,
     /// The last line with no timestamp — `kubectl`'s own complaint, when a
@@ -467,12 +546,12 @@ impl KubernetesRound {
     /// The Job `name`'s round, before its pod is found or its log followed.
     fn named(runner: KubernetesRunner, name: String) -> Self {
         KubernetesRound {
+            reconnects: ReconnectPolicy::with_live_connection(runner.live_connection),
             runner,
             name,
             pod: String::new(),
             stream: LogStream::Ended,
             position: LogReadPosition::default(),
-            fruitless_reconnects: 0,
             following_since: None,
             last_unstamped_line: None,
             stream_abandoned_because: None,
@@ -624,7 +703,7 @@ impl KubernetesRound {
                 let (position, unread) = std::mem::take(&mut self.position).after_line(stamp);
                 self.position = position;
                 if unread {
-                    self.fruitless_reconnects = 0;
+                    self.reconnects = self.reconnects.after_new_line();
                 }
                 unread.then(|| text.to_string())
             }
@@ -635,32 +714,33 @@ impl KubernetesRound {
         }
     }
 
-    /// What to read next once `kubectl logs -f` has ended: a reconnect if
-    /// the pod still runs, a last drain if it finished, nothing if it is
-    /// gone. `Err` is why the stream has to be abandoned instead.
-    async fn stream_after_follow_ended(&self) -> Result<LogStream, String> {
-        match self.progress_despite_blips().await {
-            Ok(PodProgress::Running { .. })
-                if self.fruitless_reconnects >= FRUITLESS_RECONNECTS_ALLOWED =>
-            {
-                Err(format!(
-                    "`kubectl logs` kept ending with no output while the pod ran{}",
-                    self.last_unstamped_line
-                        .as_deref()
-                        .map_or(String::new(), |complaint| format!(": {complaint}"))
-                ))
-            }
-            Ok(PodProgress::Running { .. }) => {
+    /// The stream that follows a `kubectl logs -f` that held for `held_for`,
+    /// as [`ReconnectPolicy`] decides it. `Err` is why the stream has to be
+    /// abandoned instead.
+    async fn stream_after_follow_ended(&mut self, held_for: Duration) -> Result<LogStream, String> {
+        let progress = self
+            .progress_despite_blips()
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        let (reconnects, action) = self.reconnects.after_follow_ended(&progress, held_for);
+        self.reconnects = reconnects;
+        match action {
+            StreamAction::Reconnect => {
                 tokio::time::sleep(self.runner.poll_interval).await;
                 self.logs(true)
                     .map(LogStream::Following)
                     .map_err(|e| format!("{e:#}"))
             }
-            Ok(PodProgress::Finished { .. }) => Ok(self
+            StreamAction::Drain => Ok(self
                 .logs(false)
                 .map_or(LogStream::Ended, LogStream::Draining)),
-            Ok(PodProgress::Waiting { .. } | PodProgress::Gone) => Ok(LogStream::Ended),
-            Err(e) => Err(format!("{e:#}")),
+            StreamAction::End => Ok(LogStream::Ended),
+            StreamAction::Abandon => Err(format!(
+                "`kubectl logs` kept ending with no output while the pod ran{}",
+                self.last_unstamped_line
+                    .as_deref()
+                    .map_or(String::new(), |complaint| format!(": {complaint}"))
+            )),
         }
     }
 
@@ -714,15 +794,11 @@ impl RunningRound for KubernetesRound {
                 self.stream = LogStream::Ended;
                 return None;
             }
-            if self
+            let held_for = self
                 .following_since
-                .is_some_and(|since| since.elapsed() >= self.runner.live_connection)
-            {
-                self.fruitless_reconnects = 0;
-            }
-            self.stream = match self.stream_after_follow_ended().await {
+                .map_or(Duration::ZERO, |since| since.elapsed());
+            self.stream = match self.stream_after_follow_ended(held_for).await {
                 Ok(stream @ LogStream::Following(_)) => {
-                    self.fruitless_reconnects += 1;
                     self.following_since = Some(std::time::Instant::now());
                     stream
                 }

@@ -1,6 +1,7 @@
 use assembly_line::event::{Event, EventKind};
-use assembly_line::git::PinnedRef;
-use assembly_line::report::JobReport;
+use assembly_line::git::{CommitId, PinnedRef};
+use assembly_line::job::JobId;
+use assembly_line::report::{JobReport, JobRequests, RoundRequest};
 use assembly_line::state::JobState;
 use chrono::{DateTime, TimeDelta, Utc};
 
@@ -27,7 +28,12 @@ fn committed(files: usize, insertions: usize, deletions: usize) -> EventKind {
 
 fn state_after(kinds: Vec<EventKind>) -> JobState {
     let events = timeline(kinds.into_iter().map(|kind| (0, kind)).collect());
-    JobReport::from_events(1, &events).state
+    JobReport::from_events(JobId::from(1), &events).state
+}
+
+/// A commit id of `pair`, two hex digits, repeated to full length.
+fn commit(pair: &str) -> CommitId {
+    pair.repeat(20).parse().unwrap()
 }
 
 fn requested(prompt: &str, sha: &str) -> EventKind {
@@ -35,7 +41,7 @@ fn requested(prompt: &str, sha: &str) -> EventKind {
         remote_url: "git@github.com:o/r.git".into(),
         base: PinnedRef {
             name: "main".into(),
-            sha: sha.into(),
+            sha: commit(sha),
         },
         prompt: prompt.into(),
         provider: "claude".into(),
@@ -129,9 +135,78 @@ fn a_queued_revise_does_not_wear_the_previous_rounds_failure() {
     ]);
 
     assert_eq!(
-        JobReport::from_events(1, &events).to_status_lines(),
-        ["job 1: queued (round 1)", "id: 1", "logs: assembly logs 1"]
+        JobReport::from_events(JobId::from(1), &events).to_status_lines(),
+        ["job 1: queued (round 2)", "id: 1", "logs: assembly logs 1"]
     );
+}
+
+#[test]
+fn a_round_cancelled_before_it_started_is_named_in_the_summary() {
+    let events = timeline(vec![
+        (0, requested("x", "a1")),
+        (
+            1,
+            EventKind::RoundFailed {
+                reason: "cancelled before it started".into(),
+            },
+        ),
+    ]);
+
+    assert_eq!(
+        JobReport::from_events(JobId::from(1), &events).to_summary_line(),
+        "job 1: failed (round 1) — cancelled before it started"
+    );
+}
+
+#[test]
+fn a_revise_cancelled_before_it_started_is_named_as_the_next_round() {
+    let events = timeline(vec![
+        (0, requested("x", "a1")),
+        (0, EventKind::RoundStarted { round: 1 }),
+        (4, EventKind::RoundPassed),
+        (60, requested("more", "b2")),
+        (
+            61,
+            EventKind::RoundFailed {
+                reason: "cancelled before it started".into(),
+            },
+        ),
+    ]);
+
+    assert_eq!(
+        JobReport::from_events(JobId::from(1), &events).to_summary_line(),
+        "job 1: failed (round 2) — cancelled before it started"
+    );
+}
+
+#[test]
+fn the_round_after_a_cancelled_one_takes_the_next_number() {
+    let events = timeline(vec![
+        (0, requested("x", "a1")),
+        (
+            1,
+            EventKind::RoundFailed {
+                reason: "cancelled before it started".into(),
+            },
+        ),
+        (2, requested("again", "a1")),
+    ]);
+
+    assert_eq!(JobReport::from_events(JobId::from(1), &events).rounds, 2);
+}
+
+/// A start recorded past the requests that survive a torn log keeps the next
+/// request from reusing its number.
+#[test]
+fn a_request_is_numbered_past_the_highest_round_started() {
+    let events = timeline(vec![
+        (0, requested("x", "a1")),
+        (0, EventKind::RoundStarted { round: 3 }),
+        (1, EventKind::RoundPassed),
+        (2, requested("more", "b2")),
+    ]);
+
+    assert_eq!(JobReport::from_events(JobId::from(1), &events).rounds, 4);
 }
 
 #[test]
@@ -149,7 +224,7 @@ fn a_revise_cancelled_before_it_started_took_no_time() {
         ),
     ]);
 
-    let report = JobReport::from_events(1, &events);
+    let report = JobReport::from_events(JobId::from(1), &events);
     assert_eq!(report.state, JobState::Failed);
     assert_eq!(report.duration, None);
 }
@@ -198,9 +273,9 @@ fn summarizes_state_rounds_duration_and_detail() {
         ),
     ]);
 
-    let report = JobReport::from_events(7, &events);
+    let report = JobReport::from_events(JobId::from(7), &events);
 
-    assert_eq!(report.id, 7);
+    assert_eq!(report.id, JobId::from(7));
     assert_eq!(report.state, JobState::Failed);
     assert_eq!(report.rounds, 1);
     assert_eq!(report.duration.unwrap().as_secs(), 9);
@@ -209,7 +284,7 @@ fn summarizes_state_rounds_duration_and_detail() {
 
 #[test]
 fn a_job_with_no_events_is_pending() {
-    let report = JobReport::from_events(1, &[]);
+    let report = JobReport::from_events(JobId::from(1), &[]);
 
     assert_eq!(report.state, JobState::Pending);
     assert_eq!(report.rounds, 0);
@@ -227,7 +302,7 @@ fn a_revised_job_reports_its_last_round() {
         (13, EventKind::RoundPassed),
     ]);
 
-    let report = JobReport::from_events(1, &events);
+    let report = JobReport::from_events(JobId::from(1), &events);
 
     assert_eq!(report.rounds, 2);
     assert_eq!(report.duration.unwrap().as_secs(), 3);
@@ -243,7 +318,7 @@ fn a_missing_round_start_does_not_lower_the_round_count() {
         (2, EventKind::RoundStarted { round: 3 }),
     ]);
 
-    assert_eq!(JobReport::from_events(1, &events).rounds, 3);
+    assert_eq!(JobReport::from_events(JobId::from(1), &events).rounds, 3);
 }
 
 #[test]
@@ -253,7 +328,7 @@ fn a_round_started_twice_is_counted_once() {
         (1, EventKind::RoundStarted { round: 2 }),
     ]);
 
-    assert_eq!(JobReport::from_events(1, &events).rounds, 2);
+    assert_eq!(JobReport::from_events(JobId::from(1), &events).rounds, 2);
 }
 
 #[test]
@@ -270,7 +345,7 @@ fn a_new_round_clears_the_previous_rounds_failure_reason() {
         (3, EventKind::RoundPassed),
     ]);
 
-    let report = JobReport::from_events(1, &events);
+    let report = JobReport::from_events(JobId::from(1), &events);
 
     assert_eq!(report.state, JobState::Passed);
     assert!(report.detail.is_none(), "stale reason survived");
@@ -290,7 +365,7 @@ fn a_rejected_rounds_reason_comes_from_its_verdict_alone() {
             },
         ),
     ]);
-    let report = JobReport::from_events(1, &ruled);
+    let report = JobReport::from_events(JobId::from(1), &ruled);
     assert_eq!(report.state, JobState::Running);
     assert!(report.detail.is_none(), "{:?}", report.detail);
 
@@ -305,7 +380,9 @@ fn a_rejected_rounds_reason_comes_from_its_verdict_alone() {
     ]
     .concat();
     assert_eq!(
-        JobReport::from_events(1, &failed).detail.as_deref(),
+        JobReport::from_events(JobId::from(1), &failed)
+            .detail
+            .as_deref(),
         Some("verify rejected the work: tests failed")
     );
 }
@@ -318,7 +395,9 @@ fn a_job_reports_the_diff_it_committed() {
         (2, EventKind::RoundPassed),
     ]);
 
-    let diff = JobReport::from_events(1, &events).diff.expect("a diff");
+    let diff = JobReport::from_events(JobId::from(1), &events)
+        .diff
+        .expect("a diff");
 
     assert_eq!((diff.files, diff.insertions, diff.deletions), (3, 120, 4));
     assert_eq!(diff.to_string(), "3 files +120/-4");
@@ -327,7 +406,9 @@ fn a_job_reports_the_diff_it_committed() {
 #[test]
 fn one_changed_file_is_not_pluralised() {
     let events = timeline(vec![(0, committed(1, 2, 0))]);
-    let diff = JobReport::from_events(1, &events).diff.unwrap();
+    let diff = JobReport::from_events(JobId::from(1), &events)
+        .diff
+        .unwrap();
 
     assert_eq!(diff.to_string(), "1 file +2/-0");
 }
@@ -354,7 +435,7 @@ fn the_branch_is_reported_even_for_a_failed_job() {
         ),
     ]);
 
-    let report = JobReport::from_events(4, &events);
+    let report = JobReport::from_events(JobId::from(4), &events);
 
     assert_eq!(report.state, JobState::Failed);
     assert_eq!(report.branch.as_deref(), Some("al/job-4"));
@@ -376,7 +457,7 @@ fn the_summary_line_names_the_round_the_diff_and_the_reason() {
     ]);
 
     assert_eq!(
-        JobReport::from_events(7, &events).to_summary_line(),
+        JobReport::from_events(JobId::from(7), &events).to_summary_line(),
         "job 7: failed (round 2, 3 files +40/-2) — verify failed"
     );
 }
@@ -384,7 +465,7 @@ fn the_summary_line_names_the_round_the_diff_and_the_reason() {
 #[test]
 fn the_summary_line_of_an_untouched_job_says_pending() {
     assert_eq!(
-        JobReport::from_events(1, &[]).to_summary_line(),
+        JobReport::from_events(JobId::from(1), &[]).to_summary_line(),
         "job 1: pending"
     );
 }
@@ -396,7 +477,7 @@ fn a_report_that_saw_no_round_start_names_no_round() {
     let events = timeline(vec![(0, EventKind::RoundPassed)]);
 
     assert_eq!(
-        JobReport::from_events(3, &events).to_summary_line(),
+        JobReport::from_events(JobId::from(3), &events).to_summary_line(),
         "job 3: passed"
     );
 }
@@ -410,7 +491,7 @@ fn a_job_reports_the_pull_request_it_opened() {
         },
     )]);
 
-    let report = JobReport::from_events(7, &events);
+    let report = JobReport::from_events(JobId::from(7), &events);
 
     assert_eq!(
         report.pull_request.as_deref(),
@@ -439,7 +520,7 @@ fn status_of_a_finished_job_names_its_timing_id_branch_and_logs_command() {
     ]);
 
     assert_eq!(
-        JobReport::from_events(4, &events).to_status_lines(),
+        JobReport::from_events(JobId::from(4), &events).to_status_lines(),
         [
             "job 4: passed (round 1, 1 file +1/-0)",
             "took 3.0s",
@@ -453,32 +534,34 @@ fn status_of_a_finished_job_names_its_timing_id_branch_and_logs_command() {
 #[test]
 fn status_of_a_job_whose_first_round_has_not_started_names_no_logs_command() {
     assert_eq!(
-        JobReport::from_events(1, &[]).to_status_lines(),
+        JobReport::from_events(JobId::from(1), &[]).to_status_lines(),
         ["job 1: pending", "id: 1"]
     );
     assert_eq!(
-        JobReport::from_events(1, &timeline(vec![(0, requested("x", "a1"))])).to_status_lines(),
-        ["job 1: queued", "id: 1"]
+        JobReport::from_events(JobId::from(1), &timeline(vec![(0, requested("x", "a1"))]))
+            .to_status_lines(),
+        ["job 1: queued (round 1)", "id: 1"]
     );
 }
 
 #[test]
-fn a_conclusion_names_no_logs_command() {
+fn status_of_a_job_cancelled_before_its_first_round_names_no_logs_command() {
     let events = timeline(vec![
-        (0, EventKind::RoundStarted { round: 1 }),
+        (0, requested("x", "a1")),
         (
             1,
-            EventKind::BranchPushed {
-                branch: "al/job-4".into(),
-                pushed_to: "origin".into(),
+            EventKind::RoundFailed {
+                reason: "cancelled before it started".into(),
             },
         ),
-        (3, EventKind::RoundPassed),
     ]);
 
     assert_eq!(
-        JobReport::from_events(4, &events).to_conclusion_lines(),
-        ["job 4: passed (round 1)", "took 3.0s", "branch: al/job-4"]
+        JobReport::from_events(JobId::from(2), &events).to_status_lines(),
+        [
+            "job 2: failed (round 1) — cancelled before it started",
+            "id: 2"
+        ]
     );
 }
 
@@ -486,7 +569,7 @@ fn a_conclusion_names_no_logs_command() {
 fn timing_is_reported_only_once_a_round_has_ended() {
     let running = timeline(vec![(0, EventKind::RoundStarted { round: 1 })]);
     assert!(
-        JobReport::from_events(1, &running)
+        JobReport::from_events(JobId::from(1), &running)
             .to_duration_line()
             .is_none()
     );
@@ -496,25 +579,73 @@ fn timing_is_reported_only_once_a_round_has_ended() {
         (2, EventKind::RoundPassed),
     ]);
     assert_eq!(
-        JobReport::from_events(1, &ended)
+        JobReport::from_events(JobId::from(1), &ended)
             .to_duration_line()
             .unwrap(),
         "took 2.0s"
     );
 }
 
+/// A revise can spell the remote another way and name another provider; the
+/// first request still says what the job is.
 #[test]
-fn a_jobs_identity_is_its_first_requested_round() {
+fn a_jobs_identity_is_its_first_requested_round_and_a_revise_replaces_the_latest() {
     let events = timeline(vec![
         (0, requested("add auth", "a1")),
-        (1, requested("use sessions", "b2")),
+        (
+            1,
+            EventKind::RoundRequested {
+                remote_url: "ssh://git@github.com/o/r".into(),
+                base: PinnedRef {
+                    name: "develop".into(),
+                    sha: commit("b2"),
+                },
+                prompt: "use sessions".into(),
+                provider: "codex".into(),
+            },
+        ),
     ]);
 
-    let report = JobReport::from_events(1, &events);
+    let report = JobReport::from_events(JobId::from(1), &events);
 
-    assert_eq!(report.remote_url.as_deref(), Some("git@github.com:o/r.git"));
-    assert_eq!(report.first_prompt.as_deref(), Some("add auth"));
-    assert_eq!(report.latest_prompt.as_deref(), Some("use sessions"));
-    assert_eq!(report.base.map(|base| base.sha).as_deref(), Some("b2"));
-    assert_eq!(report.provider.as_deref(), Some("claude"));
+    assert_eq!(
+        report.requests,
+        Some(JobRequests {
+            first: RoundRequest {
+                remote_url: "git@github.com:o/r.git".into(),
+                base: PinnedRef {
+                    name: "main".into(),
+                    sha: commit("a1"),
+                },
+                prompt: "add auth".into(),
+                provider: "claude".into(),
+                requested_at: events[0].at,
+            },
+            latest: RoundRequest {
+                remote_url: "ssh://git@github.com/o/r".into(),
+                base: PinnedRef {
+                    name: "develop".into(),
+                    sha: commit("b2"),
+                },
+                prompt: "use sessions".into(),
+                provider: "codex".into(),
+                requested_at: events[1].at,
+            },
+        })
+    );
+}
+
+/// A log whose request line was torn away has nothing to run or revise
+/// from.
+#[test]
+fn a_log_with_no_request_has_no_requests() {
+    let events = timeline(vec![
+        (0, EventKind::RoundStarted { round: 1 }),
+        (1, EventKind::RoundFailed { reason: "x".into() }),
+    ]);
+
+    assert_eq!(
+        JobReport::from_events(JobId::from(1), &events).requests,
+        None
+    );
 }

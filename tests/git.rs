@@ -1,6 +1,6 @@
 use assembly_line::git::{
-    self, DiffStat, check_out_new_branch, clone_into, commit_as_assembly_line, diff_stat_against,
-    head_sha,
+    self, CommitId, DiffStat, check_out_new_branch, clone_into, commit_as_assembly_line,
+    diff_stat_against, head_sha,
 };
 use std::path::{Path, PathBuf};
 use support::commit_all;
@@ -29,7 +29,7 @@ impl Fixture {
         }
     }
 
-    async fn base(&self) -> String {
+    async fn base(&self) -> CommitId {
         head_sha(&self.repo).await.unwrap()
     }
 
@@ -55,7 +55,7 @@ async fn clone_checked_out(
     into: &Path,
     name: &str,
     branch: &str,
-    at: &str,
+    at: &CommitId,
 ) -> PathBuf {
     let path = into.join(name);
     std::fs::create_dir_all(&path).unwrap();
@@ -67,7 +67,7 @@ async fn clone_checked_out(
     path
 }
 
-async fn write_and_commit(clone: &Path, name: &str, body: &str, message: &str) -> String {
+async fn write_and_commit(clone: &Path, name: &str, body: &str, message: &str) -> CommitId {
     std::fs::write(clone.join(name), body).unwrap();
     commit_all(clone, message)
         .await
@@ -79,7 +79,7 @@ async fn write_and_commit(clone: &Path, name: &str, body: &str, message: &str) -
 async fn reports_head_and_current_branch() {
     let fx = Fixture::new().await;
 
-    assert_eq!(head_sha(&fx.repo).await.unwrap().len(), 40);
+    assert_eq!(head_sha(&fx.repo).await.unwrap().as_str().len(), 40);
     assert_eq!(
         git::current_branch(&fx.repo).await.unwrap().as_deref(),
         Some("main")
@@ -193,7 +193,7 @@ async fn pushing_a_branch_again_after_another_commit_fast_forwards() {
     let on_remote = git::run_allowing_failure(&origin, &["rev-parse", "al/job-1"])
         .await
         .unwrap();
-    assert_eq!(on_remote.stdout.trim(), second);
+    assert_eq!(on_remote.stdout.trim(), second.as_str());
 }
 
 /// Pushing the commit a branch already points at exits 0 as "up to date",
@@ -205,12 +205,12 @@ async fn a_branch_already_at_the_commit_is_not_created_again() {
     let base = fx.base().await;
 
     assert!(
-        git::create_branch_if_absent(&fx.repo, "origin", &base, "al/job-1")
+        git::create_branch_if_absent(&fx.repo, "origin", "al/job-1", &base)
             .await
             .unwrap()
     );
     assert!(
-        !git::create_branch_if_absent(&fx.repo, "origin", &base, "al/job-1")
+        !git::create_branch_if_absent(&fx.repo, "origin", "al/job-1", &base)
             .await
             .unwrap()
     );
@@ -229,7 +229,7 @@ async fn a_branch_at_an_ancestor_is_taken_not_fast_forwarded() {
     let descendant = write_and_commit(&fx.repo, "more.txt", "more\n", "more").await;
 
     assert!(
-        !git::create_branch_if_absent(&fx.repo, "origin", &descendant, "al/job-1")
+        !git::create_branch_if_absent(&fx.repo, "origin", "al/job-1", &descendant)
             .await
             .unwrap()
     );
@@ -251,7 +251,7 @@ async fn of_pushes_racing_to_create_one_branch_exactly_one_creates_it() {
         .map(|_| {
             let (repo, base) = (fx.repo.clone(), base.clone());
             tokio::spawn(async move {
-                git::create_branch_if_absent(&repo, "origin", &base, "al/job-1").await
+                git::create_branch_if_absent(&repo, "origin", "al/job-1", &base).await
             })
         })
         .collect();
@@ -268,7 +268,7 @@ async fn creating_a_branch_on_a_missing_remote_is_an_error() {
     let fx = Fixture::new().await;
     let base = fx.base().await;
 
-    let err = git::create_branch_if_absent(&fx.repo, "origin", &base, "al/job-1")
+    let err = git::create_branch_if_absent(&fx.repo, "origin", "al/job-1", &base)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("al/job-1"), "{err}");
@@ -338,46 +338,6 @@ async fn a_remotes_url_is_read_back_and_a_missing_remote_is_none() {
         git::remote_url(&repo, "origin").await.unwrap().as_deref(),
         Some(origin.to_str().unwrap())
     );
-}
-
-/// Git reads a relative remote path from the repository; a job's clone runs
-/// from a scratch directory, where the same path names nothing.
-#[tokio::test]
-async fn a_relative_remote_path_is_resolved_against_the_repository() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("repo");
-    support::init_git_repo(&repo).await;
-    git::run_allowing_failure(&repo, &["remote", "add", "origin", "../origin.git"])
-        .await
-        .unwrap();
-
-    assert_eq!(
-        git::remote_url(&repo, "origin").await.unwrap(),
-        Some(repo.join("../origin.git").to_string_lossy().into_owned())
-    );
-}
-
-#[tokio::test]
-async fn remote_urls_that_name_a_host_are_left_alone() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("repo");
-    support::init_git_repo(&repo).await;
-
-    for url in [
-        "git@example.com:team/repo.git",
-        "https://example.com/team/repo.git",
-    ] {
-        git::run_allowing_failure(&repo, &["remote", "add", "origin", url])
-            .await
-            .unwrap();
-        assert_eq!(
-            git::remote_url(&repo, "origin").await.unwrap().as_deref(),
-            Some(url)
-        );
-        git::run_allowing_failure(&repo, &["remote", "remove", "origin"])
-            .await
-            .unwrap();
-    }
 }
 
 /// A job's clone pushes back to where it cloned from, so a remote that
@@ -462,8 +422,13 @@ async fn a_ref_the_remote_does_not_have_cannot_be_pinned() {
     let err = git::pinned(&repo, "origin", "never-pushed")
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("never-pushed"), "{err}");
-    assert!(err.to_string().contains("push it first"), "{err}");
+    assert!(
+        err.to_string().starts_with(
+            "'never-pushed' is not on origin — a job starts from a clone of the remote, so push \
+             it first: "
+        ),
+        "{err}"
+    );
 }
 
 /// The daemon's cache: pinning into a bare repository fetches the ref's
@@ -508,10 +473,12 @@ async fn a_refs_commit_on_the_remote_is_read_without_fetching() {
         git::sha_on_remote(&repo, "origin", "main").await.unwrap(),
         Some(published.clone())
     );
-    let tagged =
-        git::run_allowing_failure(&repo, &["tag", "-a", "v1", "-m", "a release", &published])
-            .await
-            .unwrap();
+    let tagged = git::run_allowing_failure(
+        &repo,
+        &["tag", "-a", "v1", "-m", "a release", published.as_str()],
+    )
+    .await
+    .unwrap();
     assert!(tagged.succeeded(), "{}", tagged.stderr);
     git::run_allowing_failure(&repo, &["push", "--quiet", "origin", "v1"])
         .await

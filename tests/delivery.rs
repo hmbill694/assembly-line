@@ -1,11 +1,18 @@
 use assembly_line::config::{Delivery, DeliveryMode, RepoConfig};
-use assembly_line::delivery::{Delivered, PullRequestText, deliver};
-use assembly_line::git;
+use assembly_line::delivery::{
+    BaseDiffers, Delivered, DeliveryPlan, PullRequestText, deliver, delivery_plan,
+};
+use assembly_line::event::EventKind;
+use assembly_line::frame::{Frame, FrameBody};
+use assembly_line::git::{self, CommitId, PinnedRef};
+use assembly_line::job::JobId;
+use assembly_line::round::Verdict;
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use std::path::{Path, PathBuf};
 use support::commit_all;
+use tokio_util::sync::CancellationToken;
 
 mod support;
 
@@ -35,12 +42,13 @@ async fn delivery_is_skipped_when_it_is_turned_off() {
     let outcome = deliver(
         &fx.repo,
         &mode(DeliveryMode::None),
-        "al/job-1",
+        JobId::from(1),
         "main",
         PullRequestText {
             title: "job 1: x",
             body: "x",
         },
+        &CancellationToken::new(),
     )
     .await;
     assert!(matches!(outcome, Delivered::Skipped(_)), "{outcome:?}");
@@ -62,6 +70,76 @@ fn delivery_is_configurable_from_the_repositorys_own_config() {
     let config = RepoConfig::parse("base = \"develop\"\n[delivery]\nmode = \"none\"\n").unwrap();
 
     assert_eq!(config.delivery.mode, DeliveryMode::None);
+}
+
+fn commit(sha: &str) -> CommitId {
+    sha.parse().unwrap()
+}
+
+fn main_at(sha: &str) -> PinnedRef {
+    PinnedRef {
+        name: "main".to_string(),
+        sha: commit(sha),
+    }
+}
+
+const BASE_SHA: &str = "1111111111111111111111111111111111111111";
+const ROUND_SHA: &str = "2222222222222222222222222222222222222222";
+
+#[test]
+fn a_failed_round_has_nothing_to_deliver() {
+    assert_eq!(
+        delivery_plan(
+            Verdict::Failed,
+            &commit(ROUND_SHA),
+            &main_at(BASE_SHA),
+            None
+        ),
+        DeliveryPlan::NothingToDeliver
+    );
+}
+
+#[test]
+fn a_branch_left_at_its_base_has_nothing_to_deliver() {
+    assert_eq!(
+        delivery_plan(Verdict::Passed, &commit(BASE_SHA), &main_at(BASE_SHA), None),
+        DeliveryPlan::NothingToDeliver
+    );
+}
+
+#[test]
+fn a_configured_target_other_than_the_base_is_targeted_and_noted() {
+    assert_eq!(
+        delivery_plan(
+            Verdict::Passed,
+            &commit(ROUND_SHA),
+            &main_at(BASE_SHA),
+            Some("release")
+        ),
+        DeliveryPlan::OpenPullRequest {
+            target: "release".to_string(),
+            base_differs: Some(BaseDiffers {
+                base: "release".to_string(),
+                base_ref: "main".to_string(),
+            }),
+        }
+    );
+}
+
+#[test]
+fn with_no_configured_target_the_pull_request_targets_the_base() {
+    assert_eq!(
+        delivery_plan(
+            Verdict::Passed,
+            &commit(ROUND_SHA),
+            &main_at(BASE_SHA),
+            None
+        ),
+        DeliveryPlan::OpenPullRequest {
+            target: "main".to_string(),
+            base_differs: None,
+        }
+    );
 }
 
 // The tests below assert on what a finished job prints, so they drive the
@@ -242,7 +320,7 @@ async fn a_passing_revise_round_is_delivered() {
     discard_outside_state(&tmp);
 }
 
-/// `config.base` is consulted at exactly one place — `run::deliver`
+/// `config.base` is consulted at exactly one place — `delivery_plan`
 /// choosing the pull request's base. This drives the real binary with a fake
 /// `gh` standing in for the real one, so the `--base` a pull request would
 /// open with is captured directly instead of inferred from which `Delivered`
@@ -376,6 +454,47 @@ async fn a_revise_whose_pull_request_was_merged_opens_another() {
     discard_outside_state(&tmp);
 }
 
+/// The verdict is the last thing a round reports, so a collector that has
+/// seen it has seen the pull request too.
+#[tokio::test]
+async fn a_passing_round_reports_its_pull_request_before_its_verdict() {
+    let tmp = repo_running("fake-agent.sh", "true").await;
+    let (gh_dir, _) = fake_gh_capturing_args(&tmp);
+
+    let out = assembly(&tmp)
+        .env("PATH", path_with(&gh_dir))
+        .args(["run", "--prompt", "x", "--frames"])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "{out:?}");
+    let events: Vec<EventKind> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(
+            |line| match serde_json::from_str::<Frame>(line).unwrap().body {
+                FrameBody::Event(event) => Some(event.kind),
+                FrameBody::Output(_) => None,
+            },
+        )
+        .collect();
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                ..,
+                EventKind::RoundCommitted { .. },
+                EventKind::BranchPushed { .. },
+                EventKind::PullRequestOpened { .. },
+                EventKind::RoundPassed,
+            ]
+        ),
+        "{events:?}"
+    );
+
+    discard_outside_state(&tmp);
+}
+
 /// An earlier round pushed work that `verify` rejected; this round changes
 /// nothing and passes. The branch still holds work its base does not, so it
 /// is delivered.
@@ -417,6 +536,34 @@ async fn a_revise_that_passes_without_new_commits_delivers_the_earlier_work() {
         args.contains("pr create --base main --head al/job-1"),
         "{args}"
     );
+
+    discard_outside_state(&tmp);
+}
+
+/// A branch that never got a commit sits behind a base that has moved on.
+/// Its tip is not the base's, so `gh` is asked, and its refusal is printed.
+#[tokio::test]
+async fn a_revise_that_changes_nothing_after_its_base_moved_reports_why_gh_refused() {
+    let tmp = repo_running("noop-agent.sh", "true").await;
+    assembly(&tmp)
+        .args(["run", "--prompt", "x"])
+        .assert()
+        .success()
+        .stdout(contains("no pull request opened").not());
+    std::fs::write(tmp.path().join("later.txt"), "later\n").unwrap();
+    commit_all(tmp.path(), "main moves on")
+        .await
+        .unwrap()
+        .unwrap();
+    support::publish_main(tmp.path()).await;
+
+    assembly(&tmp)
+        .args(["run", "--job", "1", "--prompt", "x"])
+        .assert()
+        .success()
+        .stdout(contains(
+            "pushed al/job-1 — no pull request opened: gh is not available to tests",
+        ));
 
     discard_outside_state(&tmp);
 }

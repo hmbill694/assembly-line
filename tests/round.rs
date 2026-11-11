@@ -1,11 +1,14 @@
+use assembly_line::admission::{self, AdmissionRefused};
 use assembly_line::config::{ConfigError, REPO_CONFIG_PATH};
 use assembly_line::event::EventKind;
+use assembly_line::frame::{Frame, FrameBody};
 use assembly_line::git::{self, head_sha};
-use assembly_line::payload;
+use assembly_line::report::RoundRequest;
 use assembly_line::run::RunRefused;
 use assembly_line::runner::LaunchSpec;
 use assembly_line::runner::local::LocalRunner;
 use assembly_line::state::JobState;
+use std::path::Path;
 use support::{Harness, commit_all, config_running, provider_block};
 
 mod support;
@@ -65,7 +68,7 @@ async fn a_job_is_cut_from_the_ref_it_names_not_from_head() {
         .unwrap();
     assert_eq!(
         parent.stdout.trim(),
-        earlier,
+        earlier.as_str(),
         "the job ignored the ref it was given"
     );
 
@@ -191,7 +194,7 @@ async fn a_failing_agent_preserves_its_work_on_a_branch_and_leaves_no_checkout()
     let branch = outcome.job_id.branch_name();
     assert!(
         outcome
-            .has(|k| matches!(k, EventKind::BranchPushed { branch: b, pushed_to } if *b == branch && pushed_to == "origin"))
+            .has(|k| matches!(k, EventKind::BranchPushed { branch: b, pushed_to } if *b == branch && Path::new(pushed_to) == h.origin))
     );
     assert!(
         h.scratch_is_empty(),
@@ -204,6 +207,26 @@ async fn a_failing_agent_preserves_its_work_on_a_branch_and_leaves_no_checkout()
     assert!(
         on_branch.contains("partial.txt"),
         "the agent's partial work is not on the branch: {on_branch}"
+    );
+}
+
+#[tokio::test]
+async fn a_failing_agent_has_its_work_recorded_before_its_verdict() {
+    let h = Harness::with_config(&config_running("failing-agent.sh")).await;
+
+    let outcome = h.run_job("x").await;
+
+    assert!(
+        matches!(
+            outcome.events.as_slice(),
+            [
+                EventKind::RoundCommitted { .. },
+                EventKind::BranchPushed { .. },
+                EventKind::RoundFailed { reason },
+            ] if reason == "exit 3"
+        ),
+        "{:?}",
+        outcome.events
     );
 }
 
@@ -406,23 +429,9 @@ async fn a_refused_push_fails_the_round_and_says_the_work_is_lost() {
         .unwrap();
     assert_eq!(
         on_remote.stdout.trim(),
-        base,
+        base.as_str(),
         "the push was not refused, so this test proves nothing"
     );
-}
-
-#[tokio::test]
-async fn a_repository_with_no_remote_has_nothing_to_clone() {
-    let h = Harness::new().await;
-    git::run_allowing_failure(&h.repo, &["remote", "remove", "origin"])
-        .await
-        .unwrap();
-
-    let err = payload::remote_to_clone(&h.repo, "origin")
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("no 'origin' remote"), "{err}");
 }
 
 #[tokio::test]
@@ -505,10 +514,49 @@ async fn a_provider_the_repository_never_declared_stops_the_job_before_it_starts
     assert!(
         matches!(
             &refusal,
-            RunRefused::ConfigNotRunnable(errors)
+            RunRefused::NotAdmitted(AdmissionRefused::NotRunnable(errors))
                 if errors == &[ConfigError::UnknownProvider("ghost".into())]
         ),
         "{refusal:?}"
+    );
+}
+
+/// A collector reads a round's verdict from its frames, so a refusal under
+/// `--frames` is one: the reason reaches the job's log, not just stderr.
+#[tokio::test]
+async fn a_refusal_under_frames_is_the_rounds_failed_verdict() {
+    let h = Harness::new().await;
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_assembly"))
+        .args(["run", "--frames", "--prompt", "x", "--provider", "ghost"])
+        .args(["--repo", h.repo.to_str().unwrap(), "--ref", "main"])
+        .env("TMPDIR", h.scratch_root())
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let events: Vec<EventKind> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(
+            |line| match serde_json::from_str::<Frame>(line).unwrap().body {
+                FrameBody::Event(event) => event.kind,
+                FrameBody::Output(text) => panic!("a refusal printed output: {text}"),
+            },
+        )
+        .collect();
+    let [EventKind::RoundFailed { reason }] = events.as_slice() else {
+        panic!("{events:?}");
+    };
+    assert_eq!(
+        reason,
+        &format!(
+            "{REPO_CONFIG_PATH} is not runnable: {}",
+            ConfigError::UnknownProvider("ghost".into())
+        )
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("error: provider 'ghost'"),
+        "{out:?}"
     );
 }
 
@@ -525,7 +573,7 @@ async fn an_unparseable_max_duration_stops_the_job_before_it_starts() {
     assert!(
         matches!(
             &refusal,
-            RunRefused::ConfigNotRunnable(errors)
+            RunRefused::NotAdmitted(AdmissionRefused::NotRunnable(errors))
                 if errors == &[ConfigError::UnparseableMaxDuration("soon".into())]
         ),
         "{refusal:?}"
@@ -573,14 +621,20 @@ async fn cancelling_a_round_stops_a_clone_in_progress() {
         "git-remote-hang",
         &format!("touch {}\nsleep 60\n", cloning.display()),
     );
+    let base = git::pinned(&h.repo, "origin", "main").await.unwrap();
+    let admitted = admission::admit(&h.repo, base.clone(), None).await.unwrap();
     let spec = LaunchSpec::for_round::<LocalRunner>(
         &h.job_paths(),
         1,
-        "hang::nowhere",
-        &git::pinned(&h.repo, "origin", "main").await.unwrap(),
-        "x",
-        "fake",
-        None,
+        &support::requested_once(RoundRequest {
+            remote_url: "hang::nowhere".into(),
+            base,
+            prompt: "x".into(),
+            provider: "fake".into(),
+            requested_at: chrono::Utc::now(),
+        }),
+        admitted.base(),
+        admitted.settings(),
     );
 
     let mut run = std::process::Command::new(assert_cmd::cargo::cargo_bin("assembly"))

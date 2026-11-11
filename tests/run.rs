@@ -1,8 +1,14 @@
-//! `assembly run`: one whole job in this process, as a person types it and
-//! as a runner launches it.
+//! `assembly run`: one round in this process, as a person types it and as a
+//! runner launches it.
 
 use assembly_line::config::REPO_CONFIG_PATH;
+use assembly_line::delivery::BaseDiffers;
+use assembly_line::event::{Event, EventKind};
 use assembly_line::frame::Frame;
+use assembly_line::job::JobId;
+use assembly_line::report::JobReport;
+use assembly_line::round::Verdict;
+use assembly_line::run::RoundConclusion;
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
@@ -75,14 +81,14 @@ fn git_in(dir: &Path, args: &[&str]) -> String {
 }
 
 #[tokio::test]
-async fn run_does_a_whole_job_and_keeps_no_state() {
+async fn run_does_one_round_and_keeps_no_state() {
     let fx = Fixture::running("fake-agent.sh").await;
 
     fx.assembly()
         .args(["run", "--prompt", "do the thing"])
         .assert()
         .success()
-        .stdout(contains("job 1: passed").and(contains("branch: al/job-1")));
+        .stdout(contains("job 1: round passed").and(contains("branch: al/job-1")));
 
     assert!(
         fx.on_origin(&["show", "al/job-1:agent-output.txt"])
@@ -187,11 +193,65 @@ async fn run_on_a_job_continues_its_branch_with_only_the_new_prompt() {
         .args(["run", "--job", "1", "--prompt", "add error handling"])
         .assert()
         .success()
-        .stdout(contains("job 1: passed"));
+        .stdout(contains("\njob 1: round passed (1 file +1/-0)\n"));
 
     assert_eq!(fx.on_origin(&["rev-list", "--count", "al/job-1"]), "4");
     let rounds = fx.on_origin(&["show", "al/job-1:rounds.txt"]);
     assert_eq!(rounds, "hi\nadd error handling", "{rounds}");
+}
+
+/// The round pushes by URL, not by the clone's remote name, and still
+/// authenticates with the token helper the clone was made with. A global
+/// `pushInsteadOf` sends the push to a fake transport, which asks git for
+/// the credential as `git-remote-https` would, records it and refuses the
+/// push — so no network is touched.
+#[tokio::test]
+async fn a_push_by_url_authenticates_with_the_token_helper_the_clone_holds() {
+    let fx = Fixture::running("fake-agent.sh").await;
+    fx.on_origin(&["branch", "al/job-1", "main"]);
+    let asked = fx.tmp.path().join("credential-asked");
+    let transport = fx.tmp.path().join("transport");
+    support::fake_cli(
+        &transport,
+        "git-remote-credential-probe",
+        &format!(
+            "printf 'protocol=https\\nhost=example.invalid\\n\\n' \
+             | GIT_TERMINAL_PROMPT=0 git credential fill > '{}' || true\nexit 1\n",
+            asked.display()
+        ),
+    );
+    let global_config = fx.tmp.path().join("gitconfig");
+    std::fs::write(
+        &global_config,
+        format!(
+            "[url \"credential-probe::{origin}\"]\n\tpushInsteadOf = {origin}\n",
+            origin = fx.origin.display()
+        ),
+    )
+    .unwrap();
+
+    fx.assembly()
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                transport.display(),
+                support::path_where_gh_refuses()
+            ),
+        )
+        .env("GIT_CONFIG_GLOBAL", &global_config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("ASSEMBLY_GIT_TOKEN", "t0ken")
+        .args(["run", "--job", "1", "--prompt", "x"])
+        .assert()
+        .failure()
+        .stdout(contains("could not publish al/job-1"));
+
+    let answered = std::fs::read_to_string(&asked).expect("the push never asked for a credential");
+    assert!(
+        answered.lines().any(|line| line == "password=t0ken"),
+        "{answered:?}"
+    );
 }
 
 #[tokio::test]
@@ -202,7 +262,11 @@ async fn run_on_a_job_with_no_branch_is_refused() {
         .args(["run", "--job", "9", "--prompt", "x"])
         .assert()
         .code(2)
-        .stderr(contains("job 9 has no branch"));
+        .stderr(contains(format!(
+            "job 9 has no branch on {} — it was deleted, or the job never pushed one, so there \
+             is nothing to continue; run without --job to start a new job",
+            fx.origin.display()
+        )));
 }
 
 /// Refused before the claim: a broken config costs no id and leaves no
@@ -252,5 +316,52 @@ async fn the_agent_never_sees_the_forge_token() {
     assert_eq!(
         fx.on_origin(&["show", "al/job-1:forge-token.txt"]),
         "absent"
+    );
+}
+
+#[test]
+fn a_rounds_conclusion_names_no_logs_command() {
+    let events: Vec<Event> = [
+        EventKind::RoundCommitted {
+            sha: "abc".into(),
+            files: 1,
+            insertions: 1,
+            deletions: 0,
+        },
+        EventKind::BranchPushed {
+            branch: "al/job-4".into(),
+            pushed_to: "origin".into(),
+        },
+        EventKind::PullRequestOpened {
+            url: "https://example.com/o/r/pull/1".into(),
+        },
+        EventKind::RoundPassed,
+    ]
+    .into_iter()
+    .map(|kind| Event {
+        at: chrono::Utc::now(),
+        kind,
+    })
+    .collect();
+    let conclusion = RoundConclusion {
+        job: JobId::from(4),
+        verdict: Verdict::Passed,
+        this_rounds_report: JobReport::from_events(JobId::from(4), &events),
+        base_differs: Some(BaseDiffers {
+            base: "release".into(),
+            base_ref: "main".into(),
+        }),
+    };
+
+    let lines = conclusion.to_lines();
+
+    assert!(lines[0].starts_with("note: "), "{lines:?}");
+    assert_eq!(
+        lines[1..],
+        [
+            "job 4: round passed (1 file +1/-0)",
+            "branch: al/job-4",
+            "pull request: https://example.com/o/r/pull/1",
+        ]
     );
 }
