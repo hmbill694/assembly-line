@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+# syntax=docker/dockerfile:1@sha256:572cebbc2b15e6f84c077742952674889cb63cd5e9b80abdffcbe587b6f19183
 
 # The job image: everything a round needs except the repository's own
 # toolchain, which `assembly run` provisions with mise at the start of the round.
@@ -10,7 +10,7 @@ WORKDIR /src
 COPY . .
 RUN cargo build --release --locked --bin assembly
 
-FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 
 # Every `curl | sh` below fails the build when curl does, rather than piping
 # an empty script into a shell that exits 0.
